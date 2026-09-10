@@ -41,7 +41,11 @@ has no Kotlin implementation yet. Both answer to the same TypeScript surface.
 
 [`docs/architecture.md`](docs/architecture.md) is the long version: why Expo
 Modules rather than Nitro, what the buffer-marshaling constraint is and how it is
-resolved, and which platform differences are real.
+resolved, which platform differences are real, and the three Expo Modules 2.0
+limits that only showed up against a real toolchain and a real phone.
+
+**Status:** iOS is verified end to end on an iPhone 16 (iOS 26.3.1). Android
+compiles but has not been run -- no device was available.
 
 ## Requirements
 

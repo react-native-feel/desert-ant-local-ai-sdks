@@ -13,11 +13,12 @@
     "@desert-ant-labs/react-native-clear": "0.1.0",
     "expo": "^57.0.0",
     "expo-audio": "~57.0.0",
-    "react": "19.2.0",
-    "react-native": "0.83.0"
+    "expo-dev-client": "~57.0.18",
+    "react": "19.2.3",
+    "react-native": "0.86.3"
   },
   "devDependencies": {
     "@types/react": "~19.2.0",
-    "typescript": "~5.9.2"
+    "typescript": "~6.0.3"
   }
 }

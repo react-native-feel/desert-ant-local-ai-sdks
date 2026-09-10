@@ -68,7 +68,7 @@ export class Clear {
   static create(options: ClearLoadOptions = {}): Clear {
     try {
       return new Clear(
-        new NativeClear.ClearModel({
+        NativeClear.createModel({
           variant: options.variant ?? 'clear-studio',
           directory: options.directory,
         })
@@ -95,7 +95,7 @@ export class Clear {
   /** Fetch the weights ahead of time. A no-op once `isDownloaded()` is true. */
   async download(onProgress?: (event: ProgressEvent) => void): Promise<void> {
     this.assertAlive();
-    await this.run(onProgress, (jobId) => this.native.download(jobId));
+    await this.run(onProgress, (jobId) => NativeClear.download(this.native, jobId));
   }
 
   /**
@@ -106,7 +106,7 @@ export class Clear {
    */
   async warm(onProgress?: (event: ProgressEvent) => void): Promise<void> {
     this.assertAlive();
-    await this.run(onProgress, (jobId) => this.native.load(jobId));
+    await this.run(onProgress, (jobId) => NativeClear.load(this.native, jobId));
   }
 
   /**
@@ -122,7 +122,7 @@ export class Clear {
     const inputPath = toPath(options.uri);
     const outputPath = options.outputUri ? toPath(options.outputUri) : defaultOutputPath(inputPath);
     const metrics = await this.run(options.onProgress, (jobId) =>
-      this.native.enhanceFile(inputPath, outputPath, toNativeOptions(options), jobId)
+      NativeClear.enhanceFile(this.native, inputPath, outputPath, toNativeOptions(options), jobId)
     );
     return { ...metrics, uri: toUri(outputPath) };
   }
@@ -165,13 +165,17 @@ export class Clear {
 
     let input: NativeClearAudio | undefined;
     let output: NativeClearAudio | undefined;
+    let lastJobId = '';
     try {
-      input = new NativeClear.ClearAudio(channels.length, frameCount, sampleRate);
+      input = NativeClear.createAudio(channels.length, frameCount, sampleRate);
       channels.forEach((channel, index) => input!.write(index, channel));
 
-      output = await this.run(options.onProgress, (jobId) =>
-        this.native.enhanceBuffer(input!, toNativeOptions(options), jobId)
-      );
+      const metrics = await this.run(options.onProgress, (jobId) => {
+        lastJobId = jobId;
+        return NativeClear.enhanceBuffer(this.native, input!, toNativeOptions(options), jobId);
+      });
+      // Collected separately, and synchronously -- see `native.ts`.
+      output = NativeClear.takeEnhancedAudio(this.native, lastJobId);
 
       const out: Float32Array[] = [];
       for (let index = 0; index < output.channelCount; index += 1) {
@@ -179,7 +183,7 @@ export class Clear {
         output.read(index, channel);
         out.push(channel);
       }
-      return { ...output.metrics, channels: out, samples: out[0] ?? new Float32Array(0) };
+      return { ...metrics, channels: out, samples: out[0] ?? new Float32Array(0) };
     } catch (error) {
       throw toDesertAntError(error, MODEL);
     } finally {

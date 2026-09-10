@@ -69,11 +69,88 @@ Three ways out, and this SDK takes the first two:
    direction, every typed-array touch on the JS thread where it is safe, and the
    same shape on both platforms. ~11 MB each way per minute of 48 kHz mono, which
    is exactly why it is the secondary API.
+
+   Collecting that object takes a **second, synchronous call**
+   (`takeEnhancedAudio`) rather than being the async call's return value. That is
+   forced -- see the runtime limit below.
 3. Mixing a 1.0 `AsyncFunction` returning `NativeArrayBuffer` into the same
    module — supported, since `@ExpoModule` merges its synthesized definition into
    `definition()`. Rejected: it would be zero-copy on Apple and would have no
    Android counterpart, so the two platforms would diverge in exactly the place
    an app is most likely to be measuring.
+
+## What compiling and running it actually changed
+
+Everything above was true on paper. Four things only showed up against a real
+toolchain and a real phone, and each one moved the design.
+
+### Expo Modules 2.0 limits (expo-modules-core 57)
+
+1. **`@JS async` works on an `@ExpoModule` class but not on a `@SharedObject`.**
+   The `@SharedObject` macro binds members onto the JS prototype through a
+   synchronous function type, so an async member fails to compile:
+   *"cannot pass function of type `... async throws -> JavaScriptValue` to
+   parameter expecting synchronous function type"*. Every asynchronous entry
+   point therefore lives on the module and takes the object as its first
+   argument.
+
+2. **A `@JS init` cannot throw.** The generated `_constructSharedObject` calls it
+   without `try` ("call can throw but is not marked with 'try'"). Construction
+   that validates its arguments is a module function returning the object --
+   `createModel`, `createAudio` -- not a JS constructor.
+
+3. **Returning a `SharedObject` from a `@JS async` function kills the process.**
+   No catchable JS error, no Swift trap: SIGSEGV on device, a silent hang on the
+   simulator. The same object returned from a *synchronous* `@JS` function is
+   fine. Measured deliberately, with a throwaway `enhanceBufferDirect` probe run
+   last in the example's self-test: every step before it logged, the probe logged
+   neither success nor failure, and the app was gone. This is why `enhanceBuffer`
+   returns metrics and `takeEnhancedAudio` hands over the audio.
+
+Limits 1 and 2 are compile-time and self-announcing. Limit 3 is not, and it cost
+most of the debugging: the first fix appeared not to work because the phone was
+locked, so `expo run:ios` silently kept running a stale build.
+
+### Read the tag, not the branch
+
+`Clear.Result.modelRuntime` exists on `main` and **not** in tag `3.1.0`, which is
+what `upToNextMajorVersion` resolves. Metrics now report `modelRevision` (which
+3.1.0 does have) and derive the runtime from the platform. When checking an
+upstream API, read
+`~/Library/Developer/Xcode/DerivedData/<app>/SourcePackages/checkouts/`, which is
+the source actually being compiled.
+
+### The deployment target needs raising in two places
+
+Setting `ios.deploymentTarget` in **Podfile.properties.json is not enough**.
+React Native's post-install aligns every pod target to the *app project's*
+deployment target, so an untouched `.xcodeproj` at Expo's 16.4 default drags the
+pods back down and the build fails with *"module 'DesertAntClear' has a minimum
+deployment target of iOS 18.0"*. The config plugin does both.
+
+Separately, the podspec's guard must be `respond_to?(:spm_dependency, true)`:
+`spm_dependency` is a top-level `def` in `react_native_pods.rb`, which Ruby makes
+a *private* method on Object, so the public-only check reports false even when the
+helper is loaded.
+
+## Verified on device
+
+iPhone 16, iOS 26.3.1, Expo SDK 57, `desert-ant-core` 3.1.0, Debug build:
+
+```
+[clear] isSupported=true nativeCore=3.1.0
+[clear] enhance(file) ok in 6393ms — selftest-clear.wav exists=true bytes=196096
+        2.00s rtf=16.0x LUFS=-31.68 truePeak=-8.68
+        variant=clear-studio revision=v0.3.0 runtime=coreml
+[clear] enhanceSamples ok in 108ms — 1ch x 96000 @ 48000Hz rtf=18.7x peak=0.3692
+```
+
+The 6.4 s file run includes the first model load; the 108 ms in-memory run that
+follows it is the warm cost. Reproduce with the example app's **Run self-test**
+button, which needs no microphone and no permission dialog.
+
+The Android half has **not** been run: no Android device or emulator was
+available. It compiles as written but should be treated as unverified.
 
 ## Why not Nitro Modules
 
@@ -105,6 +182,7 @@ TypeScript types rather than papered over.
 | Audio decode/encode | AVFoundation, streaming | `MediaExtractor`/`MediaCodec` + a WAV and AAC writer in `AudioFiles.kt`, whole file in memory | The Kotlin SDK is samples-only, so this half is ours to write. |
 | `variant: 'clear-natural'` | Supported | Throws `ERR_INVALID_ARGUMENT` | `Clear(context, directory)` is the entire Kotlin constructor; there is no variant to pass. |
 | `warm()` | Downloads *and* builds the session | Downloads only | LiteRT session construction is lazy inside the first `enhance`. |
+| Verified | Yes, on an iPhone 16 | No -- compiles only | No Android hardware was available. |
 
 ## Constraints an app inherits
 

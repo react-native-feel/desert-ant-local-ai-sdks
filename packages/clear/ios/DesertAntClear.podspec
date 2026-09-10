@@ -34,7 +34,10 @@ Pod::Spec.new do |s|
   # scripts/react_native_pods.rb). `Clear` pulls DesertAnt, AudioIO and AudioDSP
   # transitively; naming only the product we use keeps the other models' Core ML
   # graphs out of the binary.
-  if respond_to?(:spm_dependency)
+  # `respond_to?` needs the private flag: `spm_dependency` is a top-level `def` in
+  # react_native_pods.rb, which Ruby makes a *private* instance method on Object,
+  # so the public-only check reports false even when the helper is right there.
+  if respond_to?(:spm_dependency, true)
     spm_dependency(s,
       url: 'https://github.com/Desert-Ant-Labs/desert-ant-core.git',
       requirement: { kind: 'upToNextMajorVersion', minimumVersion: DESERT_ANT_CORE_VERSION },

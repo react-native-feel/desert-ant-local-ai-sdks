@@ -100,7 +100,13 @@ struct ClearMetrics {
   var measuredTruePeakDBFS: Double?
   /// The variant that produced this output, so a benchmark is self-identifying.
   var modelVariant: String?
-  /// `coreml`, `coreai` or `litert`.
+  /// The published model revision this output came from, for a self-identifying
+  /// benchmark or telemetry event. Nil on Android: `ai.desertant.clear.Result`
+  /// carries no revision.
+  var modelRevision: String?
+  /// Which inference runtime ran it. Derived from the platform rather than read
+  /// off the result -- `Clear.Result` gained a `modelRuntime` field after 3.1.0,
+  /// and this SDK pins 3.1.0.
   var modelRuntime: String?
 }
 
@@ -108,7 +114,7 @@ struct ClearMetrics {
 /// memberwise `init` itself, and a hand-written one in the same type would race
 /// the macro for the same signature. Every field has a default, so the
 /// no-argument form is always available.
-func clearMetrics(from result: Clear.Result) -> ClearMetrics {
+func clearMetrics(from result: Clear.Result, variant: ModelVariant) -> ClearMetrics {
   var metrics = ClearMetrics()
   metrics.sampleRate = result.sampleRate
   metrics.durationSec = result.durationSec
@@ -117,8 +123,9 @@ func clearMetrics(from result: Clear.Result) -> ClearMetrics {
   metrics.realtimeFactor = result.realtimeFactor
   metrics.measuredLUFS = result.measuredLUFS
   metrics.measuredTruePeakDBFS = result.measuredTruePeakDBFS
-  metrics.modelVariant = result.modelVariant?.rawValue
-  metrics.modelRuntime = result.modelRuntime?.rawValue
+  metrics.modelVariant = result.modelVariant?.rawValue ?? variant.rawValue
+  metrics.modelRevision = result.modelRevision
+  metrics.modelRuntime = "coreml"
   return metrics
 }
 

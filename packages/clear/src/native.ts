@@ -42,21 +42,17 @@ export interface NativeClearAudio extends SharedObject {
   read(channel: number, into: Float32Array): void;
 }
 
+/**
+ * State and synchronous access to it -- nothing async, and no constructor.
+ *
+ * Both absences are the Expo Modules 2.0 macros talking: `@JS async` compiles on
+ * an `@ExpoModule` class but not on a `@SharedObject` (the prototype binding is a
+ * synchronous function type), and a `@JS init` is called without `try` so it
+ * cannot validate. The asynchronous work and the construction are therefore
+ * module functions taking the object, below. Android mirrors the same split.
+ */
 export interface NativeClearModel extends SharedObject<{ progress: (event: ProgressEvent) => void }> {
   isDownloaded(): boolean;
-  download(jobId: string): Promise<void>;
-  load(jobId: string): Promise<void>;
-  enhanceFile(
-    inputPath: string,
-    outputPath: string,
-    options: NativeEnhanceOptions,
-    jobId: string
-  ): Promise<ClearMetrics>;
-  enhanceBuffer(
-    input: NativeClearAudio,
-    options: NativeEnhanceOptions,
-    jobId: string
-  ): Promise<NativeClearAudio>;
 }
 
 interface DesertAntClearModule extends NativeModule {
@@ -65,12 +61,34 @@ interface DesertAntClearModule extends NativeModule {
   readonly isSupported: boolean;
   /** The desert-ant-core version this binary links against. */
   readonly nativeCoreVersion: string;
-  readonly ClearModel: new (options: { variant: string; directory?: string }) => NativeClearModel;
-  readonly ClearAudio: new (
-    channelCount: number,
-    frameCount: number,
-    sampleRate: number
-  ) => NativeClearAudio;
+
+  createModel(options: { variant: string; directory?: string }): NativeClearModel;
+  createAudio(channelCount: number, frameCount: number, sampleRate: number): NativeClearAudio;
+
+  download(model: NativeClearModel, jobId: string): Promise<void>;
+  load(model: NativeClearModel, jobId: string): Promise<void>;
+  enhanceFile(
+    model: NativeClearModel,
+    inputPath: string,
+    outputPath: string,
+    options: NativeEnhanceOptions,
+    jobId: string
+  ): Promise<ClearMetrics>;
+  /**
+   * Returns the metrics only. The audio is collected separately with
+   * `takeEnhancedAudio`, because returning a `SharedObject` from an async native
+   * function segfaults on iOS (expo-modules-core 57) while the same return from
+   * a synchronous one is fine. `Clear.enhanceSamples` makes both calls, so the
+   * public API is unaffected.
+   */
+  enhanceBuffer(
+    model: NativeClearModel,
+    input: NativeClearAudio,
+    options: NativeEnhanceOptions,
+    jobId: string
+  ): Promise<ClearMetrics>;
+  /** Collect the buffer `enhanceBuffer` produced for `jobId`. Once per job. */
+  takeEnhancedAudio(model: NativeClearModel, jobId: string): NativeClearAudio;
 }
 
 export default requireNativeModule<DesertAntClearModule>('DesertAntClear');

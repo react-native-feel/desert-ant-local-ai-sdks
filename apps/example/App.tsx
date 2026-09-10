@@ -1,4 +1,5 @@
 import { Clear, DesertAntError, type ClearMetrics, type ProgressEvent } from '@desert-ant-labs/react-native-clear';
+import { File, Paths } from 'expo-file-system';
 import {
   AudioModule,
   RecordingPresets,
@@ -37,6 +38,15 @@ export default function App() {
   const [originalUri, setOriginalUri] = useState<string | null>(null);
   const [enhancedUri, setEnhancedUri] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<ClearMetrics | null>(null);
+
+  // Logged before anything else touches the model: reading these two proves the
+  // native module resolved and its `@JS` properties are bound, which is the
+  // failure most likely to be silent.
+  useEffect(() => {
+    console.log(
+      `[clear] isSupported=${Clear.isSupported} nativeCore=${Clear.nativeCoreVersion}`
+    );
+  }, []);
 
   const originalPlayer = useAudioPlayer(originalUri ?? undefined);
   const enhancedPlayer = useAudioPlayer(enhancedUri ?? undefined);
@@ -121,6 +131,65 @@ export default function App() {
     }
   }, [recorder]);
 
+  /**
+   * Exercise both native paths on synthetic audio, without a microphone: write a
+   * WAV to the cache and run `enhance` on it (the primary, file-based API), then
+   * push the same samples through `enhanceSamples` (the in-memory one).
+   *
+   * Useful on its own as a smoke test after changing anything native, and it
+   * needs no permission dialog, so it can be driven from a terminal.
+   */
+  const selfTest = useCallback(async () => {
+    setError(null);
+    setBusy('Self-test');
+    try {
+      const model = clear.current ?? Clear.create();
+      const sampleRate = 48_000;
+      const noisy = syntheticSpeech(sampleRate, 2);
+
+      // --- the primary API: file in, file out
+      const input = new File(Paths.cache, 'selftest.wav');
+      input.create({ overwrite: true });
+      await input.write(encodeWav(noisy, sampleRate));
+
+      const t0 = Date.now();
+      const fileResult = await model.enhance({
+        uri: input.uri,
+        onProgress: (e) => console.log(`[clear] ${e.phase} ${e.fraction.toFixed(2)}`),
+      });
+      const output = new File(fileResult.uri);
+      console.log(
+        `[clear] enhance(file) ok in ${Date.now() - t0}ms — ` +
+          `${fileResult.uri.split('/').pop()} exists=${output.exists} bytes=${output.size} ` +
+          `${fileResult.durationSec.toFixed(2)}s rtf=${fileResult.realtimeFactor.toFixed(1)}x ` +
+          `LUFS=${fileResult.measuredLUFS} truePeak=${fileResult.measuredTruePeakDBFS} ` +
+          `variant=${fileResult.modelVariant} revision=${fileResult.modelRevision} ` +
+          `runtime=${fileResult.modelRuntime}`
+      );
+
+      // --- the in-memory API
+      const t1 = Date.now();
+      const bufferResult = await model.enhanceSamples(noisy, sampleRate);
+      console.log(
+        `[clear] enhanceSamples ok in ${Date.now() - t1}ms — ` +
+          `${bufferResult.channels.length}ch x ${bufferResult.samples.length} @ ` +
+          `${bufferResult.sampleRate}Hz rtf=${bufferResult.realtimeFactor.toFixed(1)}x ` +
+          `peak=${peakOf(bufferResult.samples).toFixed(4)}`
+      );
+
+      setMetrics(fileResult);
+      setOriginalUri(input.uri);
+      setEnhancedUri(fileResult.uri);
+      if (!clear.current) model.release();
+    } catch (e) {
+      console.log(`[clear] self-test FAILED: ${describe(e)}`);
+      setError(describe(e));
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  }, []);
+
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>Clear</Text>
@@ -148,6 +217,8 @@ export default function App() {
         </View>
       ) : null}
 
+      <Button label="Run self-test" onPress={selfTest} disabled={busy !== null} tone="ghost" />
+
       {originalUri ? (
         <Button label="Play original" onPress={() => replay(originalPlayer)} tone="ghost" />
       ) : null}
@@ -167,6 +238,49 @@ export default function App() {
       ) : null}
     </ScrollView>
   );
+}
+
+/** A 200 Hz tone standing in for voice, buried in broadband hiss. */
+function syntheticSpeech(sampleRate: number, seconds: number) {
+  const samples = new Float32Array(sampleRate * seconds);
+  for (let i = 0; i < samples.length; i += 1) {
+    samples[i] =
+      0.25 * Math.sin((2 * Math.PI * 200 * i) / sampleRate) + 0.05 * (Math.random() * 2 - 1);
+  }
+  return samples;
+}
+
+/** Minimal 16-bit PCM WAV, so the self-test has a real file to hand to `enhance`. */
+function encodeWav(samples: Float32Array, sampleRate: number): Uint8Array {
+  const bytes = new Uint8Array(44 + samples.length * 2);
+  const view = new DataView(bytes.buffer);
+  const ascii = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i += 1) view.setUint8(offset + i, text.charCodeAt(i));
+  };
+  ascii(0, 'RIFF');
+  view.setUint32(4, 36 + samples.length * 2, true);
+  ascii(8, 'WAVE');
+  ascii(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  ascii(36, 'data');
+  view.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i += 1) {
+    const clamped = Math.max(-1, Math.min(1, samples[i]!));
+    view.setInt16(44 + i * 2, Math.round(clamped * 32767), true);
+  }
+  return bytes;
+}
+
+function peakOf(samples: Float32Array) {
+  let peak = 0;
+  for (let i = 0; i < samples.length; i += 1) peak = Math.max(peak, Math.abs(samples[i]!));
+  return peak;
 }
 
 function replay(player: { seekTo: (s: number) => void; play: () => void }) {

@@ -9,3 +9,10 @@ android/.gradle/
 android/build/
 .DS_Store
 *.tsbuildinfo
+
+# The example app uses continuous native generation: `npx expo prebuild`
+# regenerates ios/ and android/ from app.json and the config plugin, so the
+# generated projects are build output, not source. The plugin's effect on them is
+# covered by tests in packages/clear/plugin.
+apps/*/ios/
+apps/*/android/

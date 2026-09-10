@@ -59,7 +59,6 @@ class ClearEnhanceOptions : Record {
  */
 fun metricsOf(
   result: ai.desertant.clear.Result,
-  runtime: String = "litert",
   variant: String? = null,
 ): Map<String, Any?> = mapOf(
   "sampleRate" to result.sampleRate,
@@ -70,7 +69,10 @@ fun metricsOf(
   "measuredLUFS" to result.measuredLufs,
   "measuredTruePeakDBFS" to result.measuredTruePeakDbfs,
   "modelVariant" to variant,
-  "modelRuntime" to runtime,
+  // `ai.desertant.clear.Result` carries no revision, unlike its Swift
+  // counterpart, so this is honestly null rather than guessed.
+  "modelRevision" to null,
+  "modelRuntime" to "litert",
 )
 
 /** The zeroed metrics a JavaScript-constructed buffer reports. */
@@ -83,5 +85,6 @@ fun emptyMetrics(): Map<String, Any?> = mapOf(
   "measuredLUFS" to null,
   "measuredTruePeakDBFS" to null,
   "modelVariant" to null,
+  "modelRevision" to null,
   "modelRuntime" to null,
 )

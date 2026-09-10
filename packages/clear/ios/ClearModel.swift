@@ -1,6 +1,11 @@
 // The model handle. One instance owns one loaded Core ML session pool, so an app
 // creates it once and reuses it: the first-ever load pays the ANE compile
 // (~3.4 s on an iPhone 16 Pro), every later one is ~62 ms from cache.
+//
+// Everything asynchronous is `internal`, not `@JS` -- the `@SharedObject` macro
+// can only bind synchronous members onto the JS prototype. `ClearModule` exposes
+// these as module-level `@JS async` functions; see the note at the top of
+// ClearModule.swift.
 
 import ExpoModulesCore
 import Clear
@@ -12,8 +17,12 @@ import Foundation
 // compiler just cannot see it through `SharedObject`.
 @SharedObject("ClearModel")
 final class ClearModelObject: SharedObject, @unchecked Sendable {
+  static let coreVersion = "3.1.0"
+
   private let clear: Clear
+  let variant: ModelVariant
   private let progressGate = ProgressGate()
+  private let pending = PendingOutputs()
 
   /// Emitted while `download`, `enhanceFile` and `enhanceBuffer` run. Throttled
   /// to ~20 Hz -- the model reports per chunk, which is far more often than a
@@ -21,12 +30,9 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
   @Event
   var onProgress: (ClearProgressEvent) -> Void
 
-  @JS
-  init(options: ClearLoadOptions) throws {
-    guard let variant = ModelVariant(rawValue: options.variant) else {
-      throw InvalidVariantException(options.variant)
-    }
-    self.clear = Clear(directory: options.directory, variant: variant)
+  init(directory: String?, variant: ModelVariant) {
+    self.clear = Clear(directory: directory, variant: variant)
+    self.variant = variant
     super.init()
   }
 
@@ -37,11 +43,9 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
     clear.isDownloaded()
   }
 
-  /// Fetch the weights ahead of time so the first enhance is not also a download.
-  /// A no-op once available.
-  @JS
-  @JavaScriptActor
-  func download(_ jobId: String) async throws {
+  // MARK: - Work (driven by ClearModule)
+
+  func download(jobId: String) async throws {
     do {
       try await clear.download { [weak self] fraction in
         self?.report(jobId, phase: "loadingModel", fraction: fraction)
@@ -51,12 +55,7 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
     }
   }
 
-  /// Build the session now, downloading first if needed, so the first enhance
-  /// pays neither. On the first-ever launch this is where the Core ML compile
-  /// happens; call it behind a splash screen or on a background screen.
-  @JS
-  @JavaScriptActor
-  func load(_ jobId: String) async throws {
+  func load(jobId: String) async throws {
     do {
       try await clear.load { [weak self] progress in
         self?.report(jobId, phase: "loadingModel", fraction: progress.fraction)
@@ -66,22 +65,11 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
     }
   }
 
-  /// Decode `inputPath`, enhance it, and write the result to `outputPath`.
-  ///
-  /// This is the primary API. It runs the Swift SDK's streaming path, so peak
-  /// memory stays flat instead of growing with the file, and no audio crosses the
-  /// JS boundary at all. The output encoding follows `outputPath`'s extension:
-  /// `.wav` is 16-bit PCM, `.m4a`/`.mp4`/`.aac` is AAC, `.caf`/`.aiff` is PCM,
-  /// anything else is WAV.
-  ///
-  /// The returned metrics carry no samples -- the audio is the file.
-  @JS
-  @JavaScriptActor
   func enhanceFile(
-    _ inputPath: String,
-    _ outputPath: String,
-    _ options: ClearEnhanceOptions,
-    _ jobId: String
+    inputPath: String,
+    outputPath: String,
+    options: ClearEnhanceOptions,
+    jobId: String
   ) async throws -> ClearMetrics {
     let resolved = try options.resolved()
     guard FileManager.default.fileExists(atPath: inputPath) else {
@@ -96,41 +84,55 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
           self?.report(jobId, phase: Self.name(of: progress.phase), fraction: progress.fraction)
         }
       )
-      return clearMetrics(from: result)
+      return clearMetrics(from: result, variant: variant)
     } catch {
       throw InferenceFailedException(String(describing: error))
     }
   }
 
-  /// Enhance samples already in memory, returning a new buffer to drain.
+  /// Returns a plain value type, not a `ClearAudioObject`.
   ///
-  /// Second-class next to `enhanceFile`: it exists for audio an app synthesized
-  /// or already holds, and it pays a copy in each direction. See ClearAudio.swift.
-  @JS
-  @JavaScriptActor
-  func enhanceBuffer(
-    _ input: ClearAudioObject,
-    _ options: ClearEnhanceOptions,
-    _ jobId: String
-  ) async throws -> ClearAudioObject {
+  /// Returning a `SharedObject` from a `@JS async` function segfaults the app on
+  /// device (expo-modules-core 57): the same object returned from a *synchronous*
+  /// `@JS` function -- `createAudio` -- converts fine, so the async return path
+  /// is the difference. `Clear.Result` is `Sendable`, so `ClearModule` builds and
+  /// stashes the shared object on the JavaScript actor and JS picks it up with a
+  /// second, synchronous call.
+  func enhance(
+    channels: [[Float]],
+    sampleRate: Double,
+    options: ClearEnhanceOptions,
+    jobId: String
+  ) async throws -> Clear.Result {
     let resolved = try options.resolved()
-    let channels = input.channels
     guard let first = channels.first, !first.isEmpty else {
       throw AudioDecodeFailedException("the input buffer is empty")
     }
     do {
-      let result = try await clear.enhance(
+      return try await clear.enhance(
         channels: channels,
-        sampleRate: input.sampleRate,
+        sampleRate: sampleRate,
         options: resolved,
         progress: { [weak self] progress in
           self?.report(jobId, phase: Self.name(of: progress.phase), fraction: progress.fraction)
         }
       )
-      return ClearAudioObject(result: result)
     } catch {
       throw InferenceFailedException(String(describing: error))
     }
+  }
+
+  /// Hold an enhanced buffer until JavaScript collects it, keyed by the job that
+  /// produced it so concurrent calls cannot take each other's output.
+  func stash(_ audio: ClearAudioObject, for jobId: String) {
+    pending.put(audio, for: jobId)
+  }
+
+  func takeStashed(_ jobId: String) throws -> ClearAudioObject {
+    guard let audio = pending.take(jobId) else {
+      throw MissingOutputException(jobId)
+    }
+    return audio
   }
 
   // MARK: - Progress
@@ -152,6 +154,25 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
     Task { @JavaScriptActor [weak self] in
       self?.onProgress(ClearProgressEvent(jobId: jobId, phase: phase, fraction: fraction))
     }
+  }
+}
+
+/// Enhanced buffers waiting to be collected. Lock-guarded rather than actor
+/// isolated so a synchronous `@JS` function can drain it without hopping.
+private final class PendingOutputs: @unchecked Sendable {
+  private let lock = NSLock()
+  private var outputs: [String: ClearAudioObject] = [:]
+
+  func put(_ audio: ClearAudioObject, for jobId: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    outputs[jobId] = audio
+  }
+
+  func take(_ jobId: String) -> ClearAudioObject? {
+    lock.lock()
+    defer { lock.unlock() }
+    return outputs.removeValue(forKey: jobId)
   }
 }
 

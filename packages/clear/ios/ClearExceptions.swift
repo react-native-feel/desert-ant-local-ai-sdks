@@ -55,3 +55,8 @@ internal final class ReleasedException: GenericException<String> {
   override var code: String { "ERR_RELEASED" }
   override var reason: String { "This \(param) was released and can no longer be used." }
 }
+
+internal final class MissingOutputException: GenericException<String> {
+  override var code: String { "ERR_INFERENCE_FAILED" }
+  override var reason: String { "No enhanced audio is waiting for job '\(param)'." }
+}

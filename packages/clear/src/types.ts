@@ -106,7 +106,10 @@ export interface ClearMetrics {
   measuredTruePeakDBFS: number | null;
   /** The variant that produced this output. */
   modelVariant: string | null;
-  /** `coreml`, `coreai` or `litert`. */
+  /** The published model revision this output came from. Null on Android, whose
+   *  `Result` carries no revision. */
+  modelRevision: string | null;
+  /** Which inference runtime ran it: `coreml` on Apple, `litert` on Android. */
   modelRuntime: string | null;
 }
 

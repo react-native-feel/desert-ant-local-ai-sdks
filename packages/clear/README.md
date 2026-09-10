@@ -90,6 +90,16 @@ Failures are `DesertAntError` with a stable `code`: `ERR_MODEL_UNAVAILABLE`,
 `ERR_AUDIO_ENCODE_FAILED`, `ERR_INVALID_ARGUMENT`, `ERR_RELEASED`,
 `ERR_UNSUPPORTED_PLATFORM`.
 
+## Verified
+
+iOS is verified on hardware -- an iPhone 16 on iOS 26.3.1, Expo SDK 57 -- for
+both APIs: `enhance` wrote a real WAV, `enhanceSamples` round-tripped 96,000
+samples. The example app's **Run self-test** button reproduces it without a
+microphone or a permission dialog.
+
+**Android is unverified.** It compiles as written, but no Android device or
+emulator was available to run it. Treat it as untested until you do.
+
 ## Platform notes
 
 - **`onProgress` fractions are iOS-only.** Android reports phase boundaries (`0`

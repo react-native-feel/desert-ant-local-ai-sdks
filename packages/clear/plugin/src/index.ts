@@ -2,6 +2,7 @@ import {
   createRunOncePlugin,
   withAppBuildGradle,
   withPodfileProperties,
+  withXcodeProject,
   type ConfigPlugin,
 } from '@expo/config-plugins';
 
@@ -37,12 +38,23 @@ export interface ClearPluginProps {
 const withClear: ConfigPlugin<ClearPluginProps | void> = (config, props) => {
   const restrictAbis = props?.restrictAbis ?? true;
 
+  // Both halves are required, and neither is sufficient. The Podfile reads the
+  // properties file to pick its `platform :ios`, but React Native's post-install
+  // then aligns every pod target to the *app project's* deployment target -- so
+  // leaving the .xcodeproj at Expo's 16.4 default makes the pods 16.4 too, and
+  // the build fails with "module 'DesertAntClear' has a minimum deployment
+  // target of iOS 18.0".
   config = withPodfileProperties(config, (podfileConfig) => {
     const current = podfileConfig.modResults['ios.deploymentTarget'];
     if (!current || parseFloat(current) < parseFloat(IOS_DEPLOYMENT_TARGET)) {
       podfileConfig.modResults['ios.deploymentTarget'] = IOS_DEPLOYMENT_TARGET;
     }
     return podfileConfig;
+  });
+
+  config = withXcodeProject(config, (xcodeConfig) => {
+    raiseDeploymentTarget(xcodeConfig.modResults);
+    return xcodeConfig;
   });
 
   if (restrictAbis) {
@@ -54,6 +66,24 @@ const withClear: ConfigPlugin<ClearPluginProps | void> = (config, props) => {
 
   return config;
 };
+
+/**
+ * Raise every build configuration that already names a deployment target, and
+ * leave alone any that does not -- a configuration inheriting the project-level
+ * value should keep inheriting it rather than acquire a hardcoded one.
+ */
+export function raiseDeploymentTarget(project: {
+  pbxXCBuildConfigurationSection(): Record<string, { buildSettings?: Record<string, unknown> }>;
+}): void {
+  const configurations = project.pbxXCBuildConfigurationSection();
+  for (const key of Object.keys(configurations)) {
+    const settings = configurations[key]?.buildSettings;
+    const current = settings?.IPHONEOS_DEPLOYMENT_TARGET;
+    if (typeof current === 'string' && parseFloat(current) < parseFloat(IOS_DEPLOYMENT_TARGET)) {
+      settings!.IPHONEOS_DEPLOYMENT_TARGET = IOS_DEPLOYMENT_TARGET;
+    }
+  }
+}
 
 /**
  * Insert an `ndk { abiFilters ... }` into the app's `defaultConfig`, once.

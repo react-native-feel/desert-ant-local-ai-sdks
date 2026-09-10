@@ -17,8 +17,13 @@
 import ExpoModulesCore
 import Clear
 
+// `@unchecked Sendable` because `ClearModule`'s `@JavaScriptActor` functions take
+// one of these as an argument. The mutable state is only ever touched from the
+// JS thread -- `write`/`read` are synchronous `@JS` members, and the two
+// initializers run before the object is visible to JavaScript -- so the
+// guarantee holds; the compiler cannot see it through `SharedObject`.
 @SharedObject("ClearAudio")
-final class ClearAudioObject: SharedObject {
+final class ClearAudioObject: SharedObject, @unchecked Sendable {
   /// One entry per channel, all the same length.
   ///
   /// There is deliberately no `release()` here: `SharedObject` already declares
@@ -31,21 +36,21 @@ final class ClearAudioObject: SharedObject {
   var enhancedMetrics = ClearMetrics()
 
   /// Allocate a silent buffer for JavaScript to fill with `write`.
-  @JS
-  init(channelCount: Int, frameCount: Int, sampleRate: Double) throws {
-    guard channelCount > 0, frameCount >= 0, sampleRate > 0 else {
-      throw InvalidBufferShapeException((channelCount, frameCount))
-    }
+  ///
+  /// Not a `@JS init`: the `@SharedObject` macro calls a JS constructor without
+  /// `try`, so a validating one fails to compile. `ClearModule.createAudio` does
+  /// the validation and calls this.
+  init(channelCount: Int, frameCount: Int, sampleRate: Double) {
     self.channels = Array(repeating: [Float](repeating: 0, count: frameCount), count: channelCount)
     self.rate = sampleRate
     super.init()
   }
 
   /// Wrap what the model produced.
-  init(result: Clear.Result) {
+  init(result: Clear.Result, variant: ModelVariant) {
     self.channels = result.channels
     self.rate = result.sampleRate
-    self.enhancedMetrics = clearMetrics(from: result)
+    self.enhancedMetrics = clearMetrics(from: result, variant: variant)
     super.init()
   }
 

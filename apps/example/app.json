@@ -15,11 +15,15 @@
     },
     "android": {
       "package": "com.desertant.clearexample",
-      "permissions": ["android.permission.RECORD_AUDIO", "android.permission.INTERNET"]
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.INTERNET"
+      ]
     },
     "plugins": [
       "expo-audio",
       "@desert-ant-labs/react-native-clear"
-    ]
+    ],
+    "scheme": "clearexample"
   }
 }
