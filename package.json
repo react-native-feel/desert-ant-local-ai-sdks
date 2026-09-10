@@ -1,0 +1,23 @@
+{
+  "name": "desert-ant-react-native",
+  "private": true,
+  "version": "0.1.0",
+  "description": "React Native / Expo SDKs for Desert Ant Labs on-device models.",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace @desert-ant-labs/react-native-core --workspace @desert-ant-labs/react-native-clear",
+    "clean": "npm run clean --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present"
+  },
+  "devDependencies": {
+    "expo-module-scripts": "^56.0.3",
+    "typescript": "~5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

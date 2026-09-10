@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Clear Example",
+    "slug": "desert-ant-clear-example",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "ios": {
+      "bundleIdentifier": "com.desertant.clearexample",
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Record a clip so Clear can clean it up on this device."
+      }
+    },
+    "android": {
+      "package": "com.desertant.clearexample",
+      "permissions": ["android.permission.RECORD_AUDIO", "android.permission.INTERNET"]
+    },
+    "plugins": [
+      "expo-audio",
+      "@desert-ant-labs/react-native-clear"
+    ]
+  }
+}

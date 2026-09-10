@@ -1,0 +1,11 @@
+node_modules/
+build/
+dist/
+*.tgz
+.expo/
+ios/Pods/
+ios/build/
+android/.gradle/
+android/build/
+.DS_Store
+*.tsbuildinfo

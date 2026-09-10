@@ -1,0 +1,6 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- The weights are fetched from Hugging Face on first use. Everything else is
+       on-device; no storage permission is needed because the SDK only ever reads
+       and writes paths the app already owns. -->
+  <uses-permission android:name="android.permission.INTERNET" />
+</manifest>

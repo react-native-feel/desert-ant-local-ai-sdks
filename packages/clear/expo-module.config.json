@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["ClearModule"]
+  },
+  "android": {
+    "modules": ["ai.desertant.rn.clear.ClearModule"]
+  }
+}

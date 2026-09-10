@@ -1,0 +1,23 @@
+{
+  "name": "desert-ant-clear-example",
+  "version": "0.1.0",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "start": "expo start --dev-client",
+    "prebuild": "expo prebuild --clean",
+    "ios": "expo run:ios",
+    "android": "expo run:android"
+  },
+  "dependencies": {
+    "@desert-ant-labs/react-native-clear": "0.1.0",
+    "expo": "^57.0.0",
+    "expo-audio": "~57.0.0",
+    "react": "19.2.0",
+    "react-native": "0.83.0"
+  },
+  "devDependencies": {
+    "@types/react": "~19.2.0",
+    "typescript": "~5.9.2"
+  }
+}

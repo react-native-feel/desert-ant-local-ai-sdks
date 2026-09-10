@@ -1,0 +1,29 @@
+{
+  "name": "@desert-ant-labs/react-native-core",
+  "version": "0.1.0",
+  "description": "Shared types, errors and model-lifecycle contracts for the Desert Ant Labs React Native SDKs.",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "build",
+    "src",
+    "README.md"
+  ],
+  "keywords": [
+    "react-native",
+    "expo",
+    "on-device",
+    "desert-ant-labs"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "expo-module build",
+    "clean": "expo-module clean",
+    "lint": "expo-module lint",
+    "test": "expo-module test --passWithNoTests"
+  },
+  "devDependencies": {
+    "expo-module-scripts": "^56.0.3"
+  }
+}
