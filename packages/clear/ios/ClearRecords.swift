@@ -108,6 +108,11 @@ struct ClearMetrics {
   /// off the result -- `Clear.Result` gained a `modelRuntime` field after 3.1.0,
   /// and this SDK pins 3.1.0.
   var modelRuntime: String?
+  /// Where the audio was actually written, for a file call. Nil for a buffer
+  /// call. Not always the path that was asked for: a non-WAV input is decoded in
+  /// memory and re-encoded as WAV, so the extension can change -- see
+  /// `ClearModelObject.enhanceFile`.
+  var outputPath: String?
 }
 
 /// Built by mutation rather than an initializer: `@Record` synthesizes the

@@ -60,3 +60,8 @@ internal final class MissingOutputException: GenericException<String> {
   override var code: String { "ERR_INFERENCE_FAILED" }
   override var reason: String { "No enhanced audio is waiting for job '\(param)'." }
 }
+
+internal final class AudioEncodeFailedException: GenericException<String> {
+  override var code: String { "ERR_AUDIO_ENCODE_FAILED" }
+  override var reason: String { "Could not write the enhanced audio: \(param)" }
+}

@@ -31,6 +31,13 @@ export interface NativeEnhanceOptions {
   balanceChannelsLUFS?: number;
 }
 
+/**
+ * What a file call returns. `outputPath` is where the audio *actually* landed,
+ * which is not always where it was asked to go: on iOS a non-WAV input is decoded
+ * in memory and re-encoded as WAV, so the extension can change.
+ */
+export type NativeFileMetrics = ClearMetrics & { outputPath?: string | null };
+
 export interface NativeClearAudio extends SharedObject {
   readonly channelCount: number;
   readonly frameCount: number;
@@ -73,7 +80,7 @@ interface DesertAntClearModule extends NativeModule {
     outputPath: string,
     options: NativeEnhanceOptions,
     jobId: string
-  ): Promise<ClearMetrics>;
+  ): Promise<NativeFileMetrics>;
   /**
    * Returns the metrics only. The audio is collected separately with
    * `takeEnhancedAudio`, because returning a `SharedObject` from an async native
@@ -86,7 +93,7 @@ interface DesertAntClearModule extends NativeModule {
     input: NativeClearAudio,
     options: NativeEnhanceOptions,
     jobId: string
-  ): Promise<ClearMetrics>;
+  ): Promise<NativeFileMetrics>;
   /** Collect the buffer `enhanceBuffer` produced for `jobId`. Once per job. */
   takeEnhancedAudio(model: NativeClearModel, jobId: string): NativeClearAudio;
 }

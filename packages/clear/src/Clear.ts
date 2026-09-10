@@ -121,10 +121,12 @@ export class Clear {
     this.assertAlive();
     const inputPath = toPath(options.uri);
     const outputPath = options.outputUri ? toPath(options.outputUri) : defaultOutputPath(inputPath);
-    const metrics = await this.run(options.onProgress, (jobId) =>
+    const { outputPath: written, ...metrics } = await this.run(options.onProgress, (jobId) =>
       NativeClear.enhanceFile(this.native, inputPath, outputPath, toNativeOptions(options), jobId)
     );
-    return { ...metrics, uri: toUri(outputPath) };
+    // Trust the native side over the request: iOS re-encodes a non-WAV input as
+    // WAV, so the extension it wrote may not be the one that was asked for.
+    return { ...metrics, uri: toUri(written || outputPath) };
   }
 
   /**

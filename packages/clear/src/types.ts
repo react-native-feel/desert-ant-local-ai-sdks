@@ -82,6 +82,11 @@ export interface EnhanceFileOptions extends EnhanceOptions {
    * The encoding follows this path's extension: `.wav` is 16-bit PCM,
    * `.m4a`/`.mp4`/`.aac` is AAC, and on Apple `.caf`/`.aiff` is PCM. Anything
    * else writes WAV.
+   *
+   * On iOS this is honoured only for a **WAV input**. Any other input is decoded
+   * in memory and written back as WAV regardless of what is asked for, to avoid
+   * a crash in the upstream SDK's streaming path. {@link EnhanceFileResult.uri}
+   * reports where the audio actually landed.
    */
   outputUri?: string;
 }
@@ -114,7 +119,14 @@ export interface ClearMetrics {
 }
 
 export interface EnhanceFileResult extends ClearMetrics {
-  /** A `file://` URI for the enhanced audio. */
+  /**
+   * A `file://` URI for the enhanced audio.
+   *
+   * Usually `outputUri`, but **not always**: on iOS anything that is not already
+   * a WAV is decoded in memory and re-encoded as WAV, so a `.m4a` request comes
+   * back as `.wav`. Always read the file from here rather than assuming the path
+   * you asked for.
+   */
   uri: string;
 }
 

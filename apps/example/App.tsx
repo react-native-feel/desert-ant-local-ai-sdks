@@ -48,8 +48,20 @@ export default function App() {
     );
   }, []);
 
-  const originalPlayer = useAudioPlayer(originalUri ?? undefined);
-  const enhancedPlayer = useAudioPlayer(enhancedUri ?? undefined);
+  // Created once with no source, then pointed at each new file with `replace`.
+  // Passing a changing `uri` to `useAudioPlayer` does not reload the player -- it
+  // keeps whatever it was constructed with, so every recording after the first
+  // plays the previous one.
+  const originalPlayer = useAudioPlayer();
+  const enhancedPlayer = useAudioPlayer();
+
+  useEffect(() => {
+    if (originalUri) originalPlayer.replace(originalUri);
+  }, [originalUri, originalPlayer]);
+
+  useEffect(() => {
+    if (enhancedUri) enhancedPlayer.replace(enhancedUri);
+  }, [enhancedUri, enhancedPlayer]);
 
   useEffect(() => {
     let cancelled = false;
@@ -98,12 +110,22 @@ export default function App() {
     setError(null);
     setEnhancedUri(null);
     setMetrics(null);
+    // Re-arm the session every time, not once at mount: `stopAndEnhance` hands it
+    // back to playback when it finishes, so by the second recording iOS would
+    // otherwise refuse with RecordingDisabledException.
+    await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: true });
     await recorder.prepareToRecordAsync();
     recorder.record();
   }, [recorder]);
 
   const stopAndEnhance = useCallback(async () => {
     await recorder.stop();
+    // Hand the audio session back to playback before doing anything else. While
+    // `allowsRecording` is true iOS keeps the session in PlayAndRecord, which
+    // both muffles playback through the receiver and leaves the session engaged
+    // while Clear reads the file.
+    await setAudioModeAsync({ playsInSilentMode: true, allowsRecording: false });
+
     const uri = recorder.uri;
     if (!uri) {
       setError('The recorder produced no file.');
@@ -114,6 +136,7 @@ export default function App() {
     const model = clear.current;
     if (!model) return;
 
+    console.log(`[rec] uri=${uri} bytes=${new File(uri).size}`);
     setBusy('Enhancing');
     try {
       const result = await model.enhance({
@@ -121,9 +144,15 @@ export default function App() {
         targetLUFS: 'applePodcasts',
         onProgress: setProgress,
       });
+      console.log(
+        `[rec] ok — ${result.uri.split('/').pop()} bytes=${new File(result.uri).size} ` +
+          `${result.durationSec.toFixed(2)}s rtf=${result.realtimeFactor.toFixed(1)}x ` +
+          `LUFS=${result.measuredLUFS} truePeak=${result.measuredTruePeakDBFS}`
+      );
       setEnhancedUri(result.uri);
       setMetrics(result);
     } catch (e) {
+      console.log(`[rec] FAILED: ${describe(e)}`);
       setError(describe(e));
     } finally {
       setBusy(null);
@@ -220,10 +249,10 @@ export default function App() {
       <Button label="Run self-test" onPress={selfTest} disabled={busy !== null} tone="ghost" />
 
       {originalUri ? (
-        <Button label="Play original" onPress={() => replay(originalPlayer)} tone="ghost" />
+        <Button label="Play original" onPress={() => void replay(originalPlayer)} tone="ghost" />
       ) : null}
       {enhancedUri ? (
-        <Button label="Play enhanced" onPress={() => replay(enhancedPlayer)} tone="ghost" />
+        <Button label="Play enhanced" onPress={() => void replay(enhancedPlayer)} tone="ghost" />
       ) : null}
 
       {metrics ? (
@@ -283,8 +312,14 @@ function peakOf(samples: Float32Array) {
   return peak;
 }
 
-function replay(player: { seekTo: (s: number) => void; play: () => void }) {
-  player.seekTo(0);
+async function replay(player: {
+  seekTo: (s: number) => Promise<void>;
+  play: () => void;
+}) {
+  // Seek first so a second tap restarts rather than resuming at the end, and
+  // await it: `seekTo` is asynchronous, and playing before it lands can drop the
+  // first fraction of a second.
+  await player.seekTo(0);
   player.play();
 }
 

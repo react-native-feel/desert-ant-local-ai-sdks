@@ -93,9 +93,10 @@ Failures are `DesertAntError` with a stable `code`: `ERR_MODEL_UNAVAILABLE`,
 ## Verified
 
 iOS is verified on hardware -- an iPhone 16 on iOS 26.3.1, Expo SDK 57 -- for
-both APIs: `enhance` wrote a real WAV, `enhanceSamples` round-tripped 96,000
-samples. The example app's **Run self-test** button reproduces it without a
-microphone or a permission dialog.
+both APIs and for the real path: `enhance` wrote a real WAV, `enhanceSamples`
+round-tripped 96,000 samples, and a live microphone recording (`.m4a`, 82 KB)
+came back enhanced at 15.4x realtime. The example app's **Run self-test** button
+reproduces the first two without a microphone or a permission dialog.
 
 **Android is unverified.** It compiles as written, but no Android device or
 emulator was available to run it. Treat it as untested until you do.
@@ -107,8 +108,15 @@ emulator was available to run it. Treat it as untested until you do.
   callback. Render a determinate bar on iOS and an indeterminate one on Android.
 - **`variant: 'clear-natural'` is Apple-only** and throws `ERR_INVALID_ARGUMENT`
   on Android, where the Kotlin SDK has no variant parameter.
-- **Android holds the whole file in memory** while enhancing; iOS streams. A
-  very long recording will be felt on Android first.
+- **The output extension can change.** On iOS only a WAV input keeps the
+  requested encoding; anything else (an `.m4a` from `expo-audio`, say) is decoded
+  in memory and written back as WAV, to route around a crash in the upstream
+  SDK's streaming path. Always read `result.uri` rather than assuming
+  `outputUri`.
+- **Memory grows with the file** for non-WAV input on iOS, and for *every* input
+  on Android. Only a WAV on iOS gets the bounded-memory streaming pass. A very
+  long recording will be felt first on Android, then on iOS with compressed
+  input.
 - Requires iOS 18+, Android API 24+, Expo SDK 57+, and Xcode 26 to build.
 
 ## License

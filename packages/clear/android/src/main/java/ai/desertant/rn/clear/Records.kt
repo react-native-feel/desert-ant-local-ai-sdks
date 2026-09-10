@@ -60,6 +60,7 @@ class ClearEnhanceOptions : Record {
 fun metricsOf(
   result: ai.desertant.clear.Result,
   variant: String? = null,
+  outputPath: String? = null,
 ): Map<String, Any?> = mapOf(
   "sampleRate" to result.sampleRate,
   "durationSec" to result.durationSec,
@@ -73,6 +74,10 @@ fun metricsOf(
   // counterpart, so this is honestly null rather than guessed.
   "modelRevision" to null,
   "modelRuntime" to "litert",
+  // Android writes exactly where it was asked to: the encoder is ours
+  // (AudioFiles.kt), so there is no upstream streaming path to route around and
+  // no extension surprise like the one iOS has.
+  "outputPath" to outputPath,
 )
 
 /** The zeroed metrics a JavaScript-constructed buffer reports. */
@@ -87,4 +92,5 @@ fun emptyMetrics(): Map<String, Any?> = mapOf(
   "modelVariant" to null,
   "modelRevision" to null,
   "modelRuntime" to null,
+  "outputPath" to null,
 )

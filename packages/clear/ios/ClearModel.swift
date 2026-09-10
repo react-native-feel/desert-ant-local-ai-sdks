@@ -65,6 +65,25 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
     }
   }
 
+  /// Decode `inputPath`, enhance it, and write the result.
+  ///
+  /// Two paths, and which one runs depends on the input's container:
+  ///
+  /// * **WAV** goes through `Clear.enhance(path:to:)`, the SDK's streaming pass.
+  ///   Peak memory stays flat instead of growing with the file, and the output
+  ///   encoding follows `outputPath`'s extension.
+  /// * **Anything else** is read into memory and put through
+  ///   `Clear.enhance(bytes:)`, which returns WAV bytes we write ourselves.
+  ///
+  /// The split is not an optimization, it is a workaround: handing an AAC file to
+  /// `enhance(path:to:)` kills the process (SIGSEGV, before the first progress
+  /// event) on desert-ant-core 3.1.0. The in-memory entry point decodes the same
+  /// container through a different route and survives it. Measured with an
+  /// `.m4a` straight out of expo-audio; a WAV through the identical call is fine.
+  ///
+  /// The cost is real and worth stating: the in-memory path holds the whole
+  /// programme at once, and its output is always WAV, so the returned
+  /// `outputPath` may not be the path that was requested.
   func enhanceFile(
     inputPath: String,
     outputPath: String,
@@ -75,19 +94,50 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
     guard FileManager.default.fileExists(atPath: inputPath) else {
       throw AudioDecodeFailedException("no file at \(inputPath)")
     }
+    let onProgress: Clear.ProgressHandler = { [weak self] progress in
+      self?.report(jobId, phase: Self.name(of: progress.phase), fraction: progress.fraction)
+    }
+
+    if inputPath.lowercased().hasSuffix(".wav") {
+      do {
+        let result = try await clear.enhance(
+          path: inputPath, to: outputPath, options: resolved, progress: onProgress)
+        var metrics = clearMetrics(from: result, variant: variant)
+        metrics.outputPath = outputPath
+        return metrics
+      } catch {
+        throw InferenceFailedException(String(describing: error))
+      }
+    }
+
+    let bytes: [UInt8]
     do {
-      let result = try await clear.enhance(
-        path: inputPath,
-        to: outputPath,
-        options: resolved,
-        progress: { [weak self] progress in
-          self?.report(jobId, phase: Self.name(of: progress.phase), fraction: progress.fraction)
-        }
-      )
-      return clearMetrics(from: result, variant: variant)
+      bytes = [UInt8](try Data(contentsOf: URL(fileURLWithPath: inputPath)))
+    } catch {
+      throw AudioDecodeFailedException("could not read \(inputPath): \(error)")
+    }
+    do {
+      let (result, wav) = try await clear.enhance(
+        bytes: bytes, options: resolved, progress: onProgress)
+      let wavPath = Self.wavPath(for: outputPath)
+      try Data(wav).write(to: URL(fileURLWithPath: wavPath))
+      var metrics = clearMetrics(from: result, variant: variant)
+      metrics.outputPath = wavPath
+      return metrics
+    } catch let error as AudioEncodeFailedException {
+      throw error
     } catch {
       throw InferenceFailedException(String(describing: error))
     }
+  }
+
+  /// `enhance(bytes:)` hands back WAV, so the file has to be named WAV whatever
+  /// the caller asked for. Renaming beats writing WAV under a `.m4a` extension.
+  private static func wavPath(for requested: String) -> String {
+    let url = URL(fileURLWithPath: requested)
+    return url.pathExtension.lowercased() == "wav"
+      ? requested
+      : url.deletingPathExtension().appendingPathExtension("wav").path
   }
 
   /// Returns a plain value type, not a `ClearAudioObject`.

@@ -63,7 +63,7 @@ class ClearModelObject(
     AudioFiles.encode(result.channels, result.sampleRate, outputPath)
     emit("enhancing", 1.0)
 
-    return metricsOf(result, variant = options.variant)
+    return metricsOf(result, variant = options.variant, outputPath = outputPath)
   }
 
   suspend fun enhanceBuffer(

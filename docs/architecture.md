@@ -111,6 +111,35 @@ Limits 1 and 2 are compile-time and self-announcing. Limit 3 is not, and it cost
 most of the debugging: the first fix appeared not to work because the phone was
 locked, so `expo run:ios` silently kept running a stale build.
 
+### AAC input crashes the upstream streaming path
+
+`Clear.enhance(path:to:)` -- the SDK's bounded-memory streaming pass -- **kills
+the process on an AAC input**. SIGSEGV, before the first progress event, with no
+catchable error. A WAV through the identical call is fine, so it is the container
+and not the call.
+
+Found the way it would be found in production: the self-test feeds `enhance` a
+WAV and passes, while `expo-audio`'s default recording preset produces `.m4a` --
+so the first real recording crashed the app and nothing before it did.
+
+`enhanceFile` therefore branches on the input's extension. WAV keeps the
+streaming pass. Anything else is read into memory and put through
+`Clear.enhance(bytes:)`, a different route into the same decoder that survives
+it, and the WAV bytes it returns are written out.
+
+Two consequences the API has to admit to, both documented on `EnhanceFileOptions`
+and `EnhanceFileResult`:
+
+- **Peak memory grows with the file** for non-WAV input, because the streaming
+  guarantee is exactly what is being given up.
+- **The output extension can change.** A `.m4a` request comes back `.wav`, so
+  `EnhanceFileResult.uri` reports where the audio actually landed rather than
+  echoing what was asked for.
+
+This is worth reporting to Desert Ant Labs: from the outside it looks like a bug
+in `Sources/Clear/Streaming.swift`, which has no public API and so cannot be
+worked around any more precisely than this.
+
 ### Read the tag, not the branch
 
 `Clear.Result.modelRuntime` exists on `main` and **not** in tag `3.1.0`, which is
@@ -143,6 +172,15 @@ iPhone 16, iOS 26.3.1, Expo SDK 57, `desert-ant-core` 3.1.0, Debug build:
         2.00s rtf=16.0x LUFS=-31.68 truePeak=-8.68
         variant=clear-studio revision=v0.3.0 runtime=coreml
 [clear] enhanceSamples ok in 108ms — 1ch x 96000 @ 48000Hz rtf=18.7x peak=0.3692
+```
+
+And the real thing -- microphone in, enhanced file out, an `.m4a` from
+`expo-audio` through the in-memory route:
+
+```
+[rec] uri=…/ExpoAudio/recording-81CDDEBA….m4a bytes=82354
+[rec] ok — recording-81CDDEBA…-clear.wav bytes=200524 2.09s rtf=15.4x
+      LUFS=-29.25 truePeak=-4.62
 ```
 
 The 6.4 s file run includes the first model load; the 108 ms in-memory run that
