@@ -64,6 +64,64 @@ Clear's ~9 MB — a 460 MB encoder, a 16 MB decoder and a 10 MB embedding table.
 That is a UX constraint more than a technical one, and it is why the example app
 loads Clear on mount and makes Voz an explicit, progress-reported step.
 
+## What Desert Ant ships for Clips (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Clips` in `desert-ant-core` | One MULTIFUNCTION `clips.mlmodelc` (selector + scorer over a shared trunk), 288 MB int8, plus a 4 MB tokenizer. |
+| Kotlin | — | LiteRT files are declared in `Catalog.swift`, but no `ai.desertant:clips` is published. "Coming soon". |
+| JavaScript | — | None, and deliberately: the wasm host contract holds one compiled model per module and selection needs two sessions. |
+
+So this SDK is iOS-only too, but for a different reason than Voz: Voz has no
+Android *artifact*, while Clips has files and no *package to bind to*. That
+distinction is why `Clips.unsupportedReason` exists as a separate string rather
+than a boolean — "no Android build yet" and "this OS is too old" are different
+sentences, and an app shows different UI for them.
+
+### Nobody enforces the OS floor, so this SDK does
+
+`clips.mlmodelc` is multifunction, which is an iOS 18 feature: the compiled
+artifact declares `specificationVersion` 9. `ClipModel` says so, as data:
+
+```swift
+public static let osFloor = OSFloor.multifunction
+```
+
+and `OSFloor` carries `isSatisfiedHere` and `unmetReason(_:)` to check it. But
+**grepping the package, nothing calls either.** `osFloor` is declared by `Clips`
+and `Title` and read by no one — the type's own doc says it exists so "the
+catalog can be checked against the artifact instead of against somebody's
+memory", not so the runtime refuses.
+
+Left alone, an iOS 17 device would download 288 MB and then fail inside Core ML
+with whatever that reports. So `ClipsModule.isSupported` evaluates
+`ClipModel.supports(.current) && ClipModel.osFloor.isSatisfiedHere`, and
+`createModel` throws `ERR_UNSUPPORTED_PLATFORM` carrying `unmetReason` before any
+of that happens. The podspec and config plugin pin 18.0 as well, so the honest
+answer arrives at three different times: at `pod install`, at build, and at
+runtime for anyone who bypassed both.
+
+### The input is text; the output has to be audio
+
+`Clips.clips(in:limit:)` takes `[String]` — sentence texts, nothing else. But a
+selected clip is only useful if you can play it, and turning selected sentences
+back into spans of a recording is real logic: `Clip.ranges(in:padding:)` splits a
+clip at pauses so silence is cut rather than played, pads each end into that
+silence only (never into a neighbouring word), and merges spans that overlap once
+padded.
+
+That could have lived in TypeScript, taking the sentence times the caller already
+has. It does not, and the reason is that it would be a *second definition of
+where a cut goes*, free to drift from upstream's. So `find` takes sentences with
+times, hands the model only the texts, and runs `ranges(in:padding:)` on this
+side — JavaScript gets `ranges` and `durationSec` already computed.
+
+The same argument applies to `Clips.toSentences`, which is
+`Transcript.Sentence.sentences(from:)`: a recognizer emits words, this model wants
+sentences, and where a sentence ends is something selection was trained on. A
+regex in TypeScript would be a guess at it. It is exposed as a synchronous,
+model-free module function, so it costs nothing and needs no download.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -119,7 +177,7 @@ Three ways out, and this SDK takes the first two:
 
 ## What compiling and running it actually changed
 
-Everything above was true on paper. Five things only showed up against a real
+Everything above was true on paper. Six things only showed up against a real
 toolchain and a real phone, and each one moved the design.
 
 ### Expo Modules 2.0 limits (expo-modules-core 57)
@@ -199,6 +257,22 @@ checkout and node_modules, or pushing every consumer onto dynamic frameworks —
 because it is the one that is explicit and fails loudly if forgotten. No weights
 are involved either way: every model here downloads its artifacts at runtime and
 the package bundles none, so this is code size, not hundreds of megabytes.
+
+### A product import does not bring its dependencies' types
+
+`ComputeUnits` is the one option `Clips` takes that is not a plain value, and it
+is declared in the `Inference` target, not in `Clips`. Importing the product the
+podspec names is not enough:
+
+```
+ClipsRecords.swift:27:41: error: cannot find type 'ComputeUnits' in scope
+```
+
+`DesertAnt` re-exports `Inference` (along with `ModelStore`, `ModelCatalog`,
+`Usage` and six others), so `import DesertAnt` alongside `import Clips` resolves
+it. Worth knowing before reaching for `@_spi` or redeclaring an enum: when a type
+from this package is missing, the answer is usually a second import rather than a
+missing API.
 
 ### AAC input crashes the upstream streaming path
 
@@ -304,6 +378,48 @@ single-flight `VozLoader`, and whether an `expo-audio` `.m4a` survives
 `FileAudioStream` the way the reading of that file says it should. The example
 app's **Run self-test** button exercises all of them in order; run it on hardware
 before trusting any of it.
+
+### Clips, end to end
+
+Release build, iOS 26.4 simulator, all three models installed. A twelve-sentence
+synthetic transcript through `Clips.toSentences` and `clips.find`:
+
+```
+Clips found 4
+#1  p1.00  11.4s  11.8-15.7, 15.8-19.6, 19.9-23.6
+    "The metrics looked fine in staging, which is exactly the problem. Staging
+     had a thousand users and production had two million. ..."
+#2  p0.67  11.4s  23.9-27.6, 27.9-31.6, 31.9-35.6
+#3  p0.33  11.4s  35.9-39.6, 39.9-43.6, 43.9-47.6
+#4  p0.00  11.3s  0.0-3.6, 3.9-7.7, 7.8-11.7
+    "So thanks everyone for joining, we can probably get started. ..."
+```
+
+That output exercises the whole bridge: an array of `@Record`s returned from a
+`@JS async` function, each holding a *nested* array of `@Record`s (`ranges`) plus
+an `[Int]`, all of which the conformance argument above says should work and none
+of which had been observed working until here. It also shows
+`Clip.ranges(in:padding:)` doing its job -- three spans per clip rather than one,
+because the sentences are separated by pauses the rule cuts rather than plays.
+
+The ranking is sane rather than arbitrary: the substance ranks p1.00 and the
+"thanks everyone for joining" opener ranks p0.00, percentiles span the full range,
+and no sentence appears in two clips.
+
+Two things about *how* this was verified are worth recording, because both cost
+time. A **dev-client build was the wrong harness**: the model load takes minutes
+on a simulator and Metro reconnects reload the JS runtime mid-load, which produces
+`Trying to send event 'progress' to ClipsModelObject, but the JS runtime has been
+lost` and loses the result. A Release build with an embedded bundle has no such
+reload. And in Release, **`console.log` does not reliably reach os_log**, so the
+rendered UI -- the actual returned objects, laid out -- is the evidence, not the
+log.
+
+The example's self-test was also restructured in the process. It was one `try`
+block covering all three models, so when Clear's in-memory path hung on the
+simulator the Clips leg never ran and reported nothing. Three independent legs
+now, each skipped if its model is not prepared: a smoke test that can only tell
+you about its first failure is most of a smoke test missing.
 
 ## Why not Nitro Modules
 

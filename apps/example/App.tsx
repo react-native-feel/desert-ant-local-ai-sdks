@@ -4,6 +4,7 @@ import {
   type ClearMetrics,
   type ProgressEvent,
 } from '@desert-ant-labs/react-native-clear';
+import { Clips, type Clip } from '@desert-ant-labs/react-native-clips';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
 import { File, Paths } from 'expo-file-system';
 import {
@@ -26,18 +27,21 @@ import {
 } from 'react-native';
 
 /**
- * One recording, both models: record a clip, enhance it on device with Clear,
- * then transcribe the enhanced audio with Voz and A/B the two.
+ * One recording, three models, in the order they compose: record, enhance it on
+ * device with Clear, transcribe the enhanced audio with Voz, then hand that
+ * transcript to Clips to find the moments worth cutting.
  *
- * The whole point of both file APIs is visible here: the recording never becomes
+ * The whole point of the file APIs is visible here: the recording never becomes
  * a JavaScript array. `recorder.uri` goes into Clear, an enhanced `uri` comes
- * out, that same `uri` goes into Voz, and text comes back.
+ * out, that same `uri` goes into Voz, and text comes back. Only then does
+ * anything cross as data -- words to sentences to ranked clips, which are small.
  *
- * The two models are deliberately loaded on different terms. Clear's weights are
- * ~9 MB, so it loads on mount. Voz's are ~490 MB, so it does not: the app checks
- * whether they are already on disk and otherwise waits for an explicit tap. That
- * asymmetry is the honest one to demonstrate -- an SDK that silently pulled half
- * a gigabyte on first launch would be a bug in the app, not a feature of the model.
+ * The three are deliberately loaded on different terms. Clear's weights are
+ * ~9 MB, so it loads on mount. Voz's are ~490 MB and Clips' ~288 MB, so they do
+ * not: the app checks whether each is already on disk and otherwise waits for an
+ * explicit tap. That asymmetry is the honest one to demonstrate -- an SDK that
+ * silently pulled three quarters of a gigabyte on first launch would be a bug in
+ * the app, not a feature of the models.
  */
 export default function App() {
   const recorder = useAudioRecorder(RecordingPresets.HIGH_QUALITY);
@@ -45,6 +49,7 @@ export default function App() {
 
   const clear = useRef<Clear | null>(null);
   const voz = useRef<Voz | null>(null);
+  const clips = useRef<Clips | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -55,10 +60,15 @@ export default function App() {
   const [enhancedUri, setEnhancedUri] = useState<string | null>(null);
   const [metrics, setMetrics] = useState<ClearMetrics | null>(null);
 
-  const [vozState, setVozState] = useState<'unsupported' | 'absent' | 'loading' | 'ready'>(
+  const [vozState, setVozState] = useState<ModelState>(
     Voz.isSupported ? 'absent' : 'unsupported'
   );
   const [transcript, setTranscript] = useState<Transcript | null>(null);
+
+  const [clipsState, setClipsState] = useState<ModelState>(
+    Clips.isSupported ? 'absent' : 'unsupported'
+  );
+  const [highlights, setHighlights] = useState<Clip[] | null>(null);
 
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
@@ -70,6 +80,11 @@ export default function App() {
     console.log(
       `[voz] isSupported=${Voz.isSupported} nativeCore=${Voz.nativeCoreVersion} ` +
         `revision=${Voz.modelRevision} languages=${Voz.supportedLanguages.length}`
+    );
+    console.log(
+      `[clips] isSupported=${Clips.isSupported} nativeCore=${Clips.nativeCoreVersion} ` +
+        `revision=${Clips.modelRevision} defaultLimit=${Clips.defaultLimit}` +
+        `${Clips.unsupportedReason ? ` reason=${Clips.unsupportedReason}` : ''}`
     );
   }, []);
 
@@ -133,6 +148,15 @@ export default function App() {
       if (downloaded && !cancelled) {
         void prepareVoz(false);
       }
+
+      if (cancelled || !Clips.isSupported) return;
+      const clipsProbe = Clips.create();
+      const clipsDownloaded = clipsProbe.isDownloaded();
+      clipsProbe.release();
+      console.log(`[clips] isDownloaded=${clipsDownloaded}`);
+      if (clipsDownloaded && !cancelled) {
+        void prepareClips(false);
+      }
     })();
 
     return () => {
@@ -141,6 +165,8 @@ export default function App() {
       clear.current = null;
       voz.current?.release();
       voz.current = null;
+      clips.current?.release();
+      clips.current = null;
     };
   }, []);
 
@@ -176,11 +202,38 @@ export default function App() {
     }
   }, []);
 
+  /**
+   * Get Clips ready: ~288 MB, then roughly 41 s of Neural Engine specialization
+   * on the first load. One call does both -- upstream's `download` also builds
+   * the session, so this SDK's `warm` and `download` are the same operation.
+   */
+  const prepareClips = useCallback(async (announce = true) => {
+    if (clips.current) return;
+    setError(null);
+    setClipsState('loading');
+    if (announce) setBusy('Preparing Clips');
+    try {
+      const t0 = Date.now();
+      const model = await Clips.load({ onProgress: setProgress });
+      clips.current = model;
+      setClipsState('ready');
+      console.log(`[clips] ready in ${Date.now() - t0}ms`);
+    } catch (e) {
+      console.log(`[clips] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setClipsState('absent');
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  }, []);
+
   const record = useCallback(async () => {
     setError(null);
     setEnhancedUri(null);
     setMetrics(null);
     setTranscript(null);
+    setHighlights(null);
     // Re-arm the session every time, not once at mount: `stopAndEnhance` hands it
     // back to playback when it finishes, so by the second recording iOS would
     // otherwise refuse with RecordingDisabledException.
@@ -240,9 +293,50 @@ export default function App() {
     }
 
     if (enhanced && voz.current) {
-      await runTranscribe(enhanced);
+      const spoken = await runTranscribe(enhanced);
+      if (spoken && clips.current) {
+        await runFindClips(spoken);
+      }
     }
   }, [recorder]);
+
+  /**
+   * Rank the transcript's best moments.
+   *
+   * `Clips.toSentences` is the join between the two models, and it is upstream's
+   * own sentence splitter rather than a regex here: Voz hands back words, Clips
+   * wants sentences, and where a sentence ends is something clip selection was
+   * trained on.
+   */
+  const runFindClips = useCallback(async (source: Transcript) => {
+    const model = clips.current;
+    if (!model) return;
+    setError(null);
+    setBusy('Finding highlights');
+    try {
+      const sentences = Clips.toSentences(source.words);
+      console.log(`[clips] ${source.words.length} words -> ${sentences.length} sentences`);
+      const t0 = Date.now();
+      const found = await model.find({ sentences });
+      console.log(
+        `[clips] find ok in ${Date.now() - t0}ms — ${found.length} clips from ` +
+          `${sentences.length} sentences`
+      );
+      found.forEach((c) =>
+        console.log(
+          `[clips]   #${c.rank} p=${c.percentile.toFixed(2)} score=${c.score.toFixed(2)} ` +
+            `${c.durationSec.toFixed(1)}s ranges=${JSON.stringify(c.ranges)} "${c.text.slice(0, 60)}"`
+        )
+      );
+      setHighlights(found);
+    } catch (e) {
+      console.log(`[clips] find FAILED: ${describe(e)}`);
+      setError(describe(e));
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  }, []);
 
   /** Transcribe a file that is already on disk. */
   const runTranscribe = useCallback(async (uri: string) => {
@@ -260,9 +354,11 @@ export default function App() {
       );
       console.log(`[voz] "${result.text}"`);
       setTranscript(result);
+      return result;
     } catch (e) {
       console.log(`[voz] transcribe FAILED: ${describe(e)}`);
       setError(describe(e));
+      return null;
     } finally {
       setBusy(null);
       setProgress(null);
@@ -284,90 +380,170 @@ export default function App() {
    * Useful on its own as a smoke test after changing anything native, and it
    * needs no permission dialog, so it can be driven from a terminal.
    */
+  /**
+   * Exercise every native path on synthetic input, without a microphone.
+   *
+   * Three independent legs, each with its own try/catch and each skipped if its
+   * model is not prepared. Independent on purpose: they were one block until a
+   * hang inside Clear's in-memory path on the simulator meant the Clips leg --
+   * which shares nothing with it -- never ran and reported nothing. A smoke test
+   * that can only tell you about its first failure is most of a smoke test
+   * missing.
+   *
+   * Useful after changing anything native, and it needs no permission dialog, so
+   * it can be driven from a terminal.
+   */
   const selfTest = useCallback(async () => {
     setError(null);
     setBusy('Self-test');
+    const failures: string[] = [];
+    const sampleRate = 48_000;
+    const noisy = syntheticSpeech(sampleRate, 2);
+    let enhancedForVoz: string | null = null;
+
+    // --- Clear: file in, file out (the primary API), then the in-memory one.
     try {
       const model = clear.current ?? Clear.create();
-      const sampleRate = 48_000;
-      const noisy = syntheticSpeech(sampleRate, 2);
-
-      // --- Clear: the primary API, file in, file out
       const input = new File(Paths.cache, 'selftest.wav');
       input.create({ overwrite: true });
       await input.write(encodeWav(noisy, sampleRate));
 
       const t0 = Date.now();
-      const fileResult = await model.enhance({
-        uri: input.uri,
-        onProgress: (e) => console.log(`[clear] ${e.phase} ${e.fraction.toFixed(2)}`),
-      });
+      const fileResult = await model.enhance({ uri: input.uri });
       const output = new File(fileResult.uri);
       console.log(
         `[clear] enhance(file) ok in ${Date.now() - t0}ms — ` +
           `${fileResult.uri.split('/').pop()} exists=${output.exists} bytes=${output.size} ` +
           `${fileResult.durationSec.toFixed(2)}s rtf=${fileResult.realtimeFactor.toFixed(1)}x ` +
-          `LUFS=${fileResult.measuredLUFS} truePeak=${fileResult.measuredTruePeakDBFS} ` +
-          `variant=${fileResult.modelVariant} revision=${fileResult.modelRevision} ` +
-          `runtime=${fileResult.modelRuntime}`
+          `variant=${fileResult.modelVariant} revision=${fileResult.modelRevision}`
       );
+      enhancedForVoz = fileResult.uri;
+      setMetrics(fileResult);
+      setOriginalUri(input.uri);
+      setEnhancedUri(fileResult.uri);
 
-      // --- Clear: the in-memory API
       const t1 = Date.now();
       const bufferResult = await model.enhanceSamples(noisy, sampleRate);
       console.log(
         `[clear] enhanceSamples ok in ${Date.now() - t1}ms — ` +
           `${bufferResult.channels.length}ch x ${bufferResult.samples.length} @ ` +
-          `${bufferResult.sampleRate}Hz rtf=${bufferResult.realtimeFactor.toFixed(1)}x ` +
-          `peak=${peakOf(bufferResult.samples).toFixed(4)}`
+          `${bufferResult.sampleRate}Hz peak=${peakOf(bufferResult.samples).toFixed(4)}`
       );
-
-      setMetrics(fileResult);
-      setOriginalUri(input.uri);
-      setEnhancedUri(fileResult.uri);
       if (!clear.current) model.release();
+    } catch (e) {
+      failures.push(`clear: ${describe(e)}`);
+      console.log(`[clear] self-test FAILED: ${describe(e)}`);
+    }
 
-      // --- Voz, if its weights are here. Skipped rather than downloaded: a
-      //     smoke test should not pull 490 MB behind the user's back.
+    // --- Voz. A plumbing check, not an accuracy check: a 200 Hz tone under hiss
+    //     is not speech, so an empty transcript is the expected result. What is
+    //     asserted is that the model loads, runs, and returns a well-formed
+    //     result with timings in range.
+    try {
       const speech = voz.current;
       if (!speech) {
         console.log('[voz] self-test skipped — model not prepared');
-        return;
+      } else {
+        const t2 = Date.now();
+        const fromFile = await speech.transcribe({ uri: enhancedForVoz ?? '' });
+        console.log(
+          `[voz] transcribe(file) ok in ${Date.now() - t2}ms — ${fromFile.words.length} words ` +
+            `${fromFile.durationSec.toFixed(2)}s rtf=${fromFile.realtimeFactor.toFixed(1)}x ` +
+            `revision=${fromFile.modelRevision} text="${fromFile.text}"`
+        );
+        // Voz runs at 16 kHz; passing 48 kHz proves the native resample path.
+        const t3 = Date.now();
+        const fromSamples = await speech.transcribeSamples(noisy, sampleRate);
+        console.log(
+          `[voz] transcribeSamples ok in ${Date.now() - t3}ms — ` +
+            `${fromSamples.words.length} words text="${fromSamples.text}"`
+        );
+        const ordered = fromFile.words.every(
+          (w, i) => w.end >= w.start && (i === 0 || w.start >= fromFile.words[i - 1]!.start)
+        );
+        console.log(`[voz] word timings monotonic and non-negative: ${ordered}`);
+        setTranscript(fromFile);
       }
-
-      const t2 = Date.now();
-      const fromFile = await speech.transcribe({
-        uri: fileResult.uri,
-        onProgress: (e) => console.log(`[voz] ${e.phase} ${e.fraction.toFixed(2)}`),
-      });
-      console.log(
-        `[voz] transcribe(file) ok in ${Date.now() - t2}ms — ` +
-          `${fromFile.words.length} words ${fromFile.durationSec.toFixed(2)}s ` +
-          `rtf=${fromFile.realtimeFactor.toFixed(1)}x revision=${fromFile.modelRevision} ` +
-          `runtime=${fromFile.modelRuntime} text="${fromFile.text}"`
-      );
-
-      // Voz runs at 16 kHz; passing 48 kHz here proves the native resample path.
-      const t3 = Date.now();
-      const fromSamples = await speech.transcribeSamples(noisy, sampleRate);
-      console.log(
-        `[voz] transcribeSamples ok in ${Date.now() - t3}ms — ` +
-          `${fromSamples.words.length} words ${fromSamples.durationSec.toFixed(2)}s ` +
-          `rtf=${fromSamples.realtimeFactor.toFixed(1)}x text="${fromSamples.text}"`
-      );
-
-      const ordered = fromFile.words.every(
-        (word, i) => word.end >= word.start && (i === 0 || word.start >= fromFile.words[i - 1]!.start)
-      );
-      console.log(`[voz] word timings monotonic and non-negative: ${ordered}`);
-      setTranscript(fromFile);
     } catch (e) {
-      console.log(`[selftest] FAILED: ${describe(e)}`);
-      setError(describe(e));
-    } finally {
-      setBusy(null);
-      setProgress(null);
+      failures.push(`voz: ${describe(e)}`);
+      console.log(`[voz] self-test FAILED: ${describe(e)}`);
     }
+
+    // --- Clips. Unlike the other two this needs no audio at all: its input is
+    //     text plus times, so a synthetic transcript exercises the real model on
+    //     a real workload without a microphone or a recording.
+    try {
+      const cutter = clips.current;
+      if (!cutter) {
+        console.log('[clips] self-test skipped — model not prepared');
+      } else {
+        // `toSentences` first, on synthetic words, so the splitter is covered
+        // even though the lines below are already sentence-shaped.
+        const words = SAMPLE_TRANSCRIPT.flatMap((line, index) =>
+          line.split(' ').map((token, position, all) => ({
+            text: position === 0 ? token : ` ${token}`,
+            start: index * 4 + (position / all.length) * 3.5,
+            end: index * 4 + ((position + 1) / all.length) * 3.5,
+          }))
+        );
+        const built = Clips.toSentences(words);
+        console.log(`[clips] toSentences: ${words.length} words -> ${built.length} sentences`);
+
+        const t4 = Date.now();
+        const found = await cutter.find({ sentences: built });
+        console.log(
+          `[clips] find ok in ${Date.now() - t4}ms — ${found.length} clips ` +
+            `(default limit ${Clips.defaultLimit}, revision ${Clips.modelRevision})`
+        );
+        found.forEach((c) =>
+          console.log(
+            `[clips]   #${c.rank} p=${c.percentile.toFixed(2)} s=${c.score.toFixed(2)} ` +
+              `${c.durationSec.toFixed(1)}s ids=${JSON.stringify(c.sentenceIds)} ` +
+              `ranges=${JSON.stringify(c.ranges.map((r) => [+r.start.toFixed(2), +r.end.toFixed(2)]))} ` +
+              `"${c.text.slice(0, 60)}"`
+          )
+        );
+
+        // The invariants worth asserting: ranked best-first, non-overlapping, and
+        // every clip resolving to a playable span inside the recording.
+        const ranked = found.every((c, i) => i === 0 || c.score <= found[i - 1]!.score);
+        const seen = new Set<number>();
+        const disjoint = found.every((c) =>
+          c.sentenceIds.every((id) => (seen.has(id) ? false : (seen.add(id), true)))
+        );
+        const playable = found.every(
+          (c) => c.ranges.length > 0 && c.ranges.every((r) => r.end > r.start && r.start >= 0)
+        );
+        const bounded = found.every((c) => c.percentile >= 0 && c.percentile <= 1);
+        console.log(
+          `[clips] ranked=${ranked} nonOverlapping=${disjoint} playableRanges=${playable} ` +
+            `percentilesInRange=${bounded}`
+        );
+
+        // A short transcript is upstream's documented empty case.
+        const tooShort = await cutter.find({ sentences: built.slice(0, 2) });
+        console.log(`[clips] two sentences -> ${tooShort.length} clips (expected 0)`);
+
+        // A smaller limit sizes the work as well as the answer.
+        const t5 = Date.now();
+        const three = await cutter.find({ sentences: built, limit: 3 });
+        console.log(`[clips] limit 3 -> ${three.length} clips in ${Date.now() - t5}ms`);
+
+        setHighlights(found);
+      }
+    } catch (e) {
+      failures.push(`clips: ${describe(e)}`);
+      console.log(`[clips] self-test FAILED: ${describe(e)}`);
+    }
+
+    console.log(
+      failures.length === 0
+        ? '[selftest] all prepared models passed'
+        : `[selftest] ${failures.length} failed: ${failures.join(' | ')}`
+    );
+    if (failures.length > 0) setError(failures.join('\n'));
+    setBusy(null);
+    setProgress(null);
   }, []);
 
   const audioToTranscribe = enhancedUri ?? originalUri;
@@ -375,7 +551,7 @@ export default function App() {
   return (
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>Desert Ant</Text>
-      <Text style={styles.subtitle}>Clear enhances it, Voz reads it back</Text>
+      <Text style={styles.subtitle}>Clear cleans it, Voz reads it, Clips cuts it</Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
 
@@ -485,9 +661,104 @@ export default function App() {
           </>
         ) : null}
       </View>
+
+      <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Clips</Text>
+
+        {clipsState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Clips.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {clipsState === 'absent' ? (
+          <>
+            <Text style={styles.note}>
+              About 288 MB, and not on this device yet. Clips needs no audio — it
+              works from the transcript — so the self-test can exercise it once the
+              weights are here.
+            </Text>
+            <Button
+              label="Download and prepare Clips (~288 MB)"
+              onPress={() => void prepareClips()}
+              disabled={busy !== null}
+              tone="ghost"
+            />
+          </>
+        ) : null}
+
+        {clipsState === 'loading' && busy === null ? (
+          <Text style={styles.note}>Preparing…</Text>
+        ) : null}
+
+        {clipsState === 'ready' && transcript ? (
+          <Button
+            label="Find the highlights"
+            onPress={() => void runFindClips(transcript)}
+            disabled={busy !== null}
+            tone="ghost"
+          />
+        ) : null}
+
+        {clipsState === 'ready' && !transcript ? (
+          <Text style={styles.note}>Ready. Transcribe something to rank it.</Text>
+        ) : null}
+
+        {highlights ? (
+          highlights.length === 0 ? (
+            <Text style={styles.note}>
+              No clips — a transcript under three sentences has nothing to choose
+              between.
+            </Text>
+          ) : (
+            <>
+              <Row label="Clips found" value={`${highlights.length}`} />
+              {highlights.map((clip) => (
+                <View key={clip.rank} style={styles.clip}>
+                  <View style={styles.clipHeader}>
+                    <Text style={styles.clipRank}>#{clip.rank + 1}</Text>
+                    <Text style={styles.clipMeta}>
+                      {`p${clip.percentile.toFixed(2)} · ${clip.durationSec.toFixed(1)}s · ` +
+                        clip.ranges
+                          .map((r) => `${r.start.toFixed(1)}–${r.end.toFixed(1)}`)
+                          .join(', ')}
+                    </Text>
+                  </View>
+                  <Text style={styles.clipText}>{clip.text}</Text>
+                </View>
+              ))}
+            </>
+          )
+        ) : null}
+      </View>
     </ScrollView>
   );
 }
+
+/** How far along a model is. Shared by the two that download on demand. */
+type ModelState = 'unsupported' | 'absent' | 'loading' | 'ready';
+
+/**
+ * A transcript to rank when there is no microphone in the loop.
+ *
+ * Written as something a clip selector has a real opinion about -- a few lines
+ * that carry a point, and a few that are throat-clearing around them -- so the
+ * self-test shows ranking rather than an arbitrary ordering of equals.
+ */
+const SAMPLE_TRANSCRIPT = [
+  'So thanks everyone for joining, we can probably get started.',
+  'I want to talk about why the first version failed.',
+  'We spent four months building a recommendation engine nobody asked for.',
+  'The metrics looked fine in staging, which is exactly the problem.',
+  'Staging had a thousand users and production had two million.',
+  'Every assumption we made about cache locality was wrong at that scale.',
+  'Anyway, that is the background.',
+  'The rewrite took six weeks and it is a third of the code.',
+  'The single biggest lesson is that we should have shipped a fake version first.',
+  'A button that did nothing would have told us in two days what took four months.',
+  'I think that is the thing I would tell anyone starting out.',
+  'Right, any questions before we move on to the roadmap?',
+];
 
 /** A 200 Hz tone standing in for voice, buried in broadband hiss. */
 function syntheticSpeech(sampleRate: number, seconds: number) {
@@ -615,6 +886,18 @@ const styles = StyleSheet.create({
   rowLabel: { opacity: 0.6 },
   rowValue: { fontVariant: ['tabular-nums'], fontWeight: '600' },
   transcript: { marginTop: 10, fontSize: 17, lineHeight: 24 },
+  clip: {
+    borderLeftWidth: 3,
+    borderLeftColor: '#1f6feb',
+    paddingLeft: 10,
+    paddingVertical: 6,
+    marginTop: 8,
+    gap: 3,
+  },
+  clipHeader: { flexDirection: 'row', alignItems: 'baseline', gap: 8 },
+  clipRank: { fontWeight: '700', fontSize: 15 },
+  clipMeta: { fontSize: 12, opacity: 0.55, fontVariant: ['tabular-nums'] },
+  clipText: { fontSize: 15, lineHeight: 21 },
   words: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 12 },
   word: {
     borderWidth: 1,
