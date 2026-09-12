@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Clear Example",
+    "name": "Desert Ant Example",
     "slug": "desert-ant-clear-example",
     "version": "0.1.0",
     "orientation": "portrait",
@@ -10,7 +10,7 @@
       "bundleIdentifier": "com.desertant.clearexample",
       "supportsTablet": true,
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "Record a clip so Clear can clean it up on this device."
+        "NSMicrophoneUsageDescription": "Record a clip so Clear can clean it up and Voz can transcribe it, on this device."
       }
     },
     "android": {
@@ -22,7 +22,8 @@
     },
     "plugins": [
       "expo-audio",
-      "@desert-ant-labs/react-native-clear"
+      "@desert-ant-labs/react-native-clear",
+      "@desert-ant-labs/react-native-voz"
     ],
     "scheme": "clearexample"
   }

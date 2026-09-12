@@ -13,6 +13,6 @@ android/build/
 # The example app uses continuous native generation: `npx expo prebuild`
 # regenerates ios/ and android/ from app.json and the config plugin, so the
 # generated projects are build output, not source. The plugin's effect on them is
-# covered by tests in packages/clear/plugin.
+# covered by tests in packages/clear/plugin and packages/voz/plugin.
 apps/*/ios/
 apps/*/android/

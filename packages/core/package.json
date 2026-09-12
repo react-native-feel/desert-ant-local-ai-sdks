@@ -1,13 +1,15 @@
 {
   "name": "@desert-ant-labs/react-native-core",
   "version": "0.1.0",
-  "description": "Shared types, errors and model-lifecycle contracts for the Desert Ant Labs React Native SDKs.",
+  "description": "Shared types, errors, model-lifecycle contracts and the single desert-ant-core native bridge for the Desert Ant Labs React Native SDKs.",
   "main": "build/index.js",
   "types": "build/index.d.ts",
   "sideEffects": false,
   "files": [
     "build",
     "src",
+    "ios",
+    "expo-module.config.json",
     "README.md"
   ],
   "keywords": [

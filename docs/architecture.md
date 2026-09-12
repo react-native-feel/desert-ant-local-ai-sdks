@@ -26,6 +26,44 @@ The two Swift/Kotlin SDKs are also not symmetric, which shapes the whole design:
   `enhance(channels: List<FloatArray>, sampleRate, options)`. `LoadedModel.download()`
   takes no callback either.
 
+## What Desert Ant ships for Voz (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Voz` in `desert-ant-core` | Core ML only. No `@available` of its own, so its floor is the package's `iOS 17`. |
+| Kotlin | — | **Nothing.** `Sources/Voz/Catalog.swift` declares `files` for `.apple` and no other platform. |
+| JavaScript | — | Nothing. |
+
+Voz is Apple-only by construction, not by omission, and the package says why: it
+drives Core ML directly rather than going through the shared `InferenceSession`,
+because preallocated buffers, `outputBackings` and a lane-batched decode loop are
+not expressible through a generic `run(inputs:outputs:)` — and dropping them costs
+"roughly 127x on load and about a third of decode throughput".
+
+So this SDK is iOS-only too, and `Voz.isSupported` answers `false` elsewhere via
+`requireOptionalNativeModule`, which resolves to `null` off iOS instead of
+throwing at import. One bundle still ships everywhere.
+
+Two consequences for the design, both pleasant:
+
+- **No buffer-marshaling problem.** The constraint that shaped Clear's API — that
+  `expo-modules-core` 57 cannot return a Swift-allocated buffer through `@JS` —
+  only bites when audio has to travel *back*. Voz takes audio and returns text,
+  so there is no `VozAudio` shared object and no two-call `takeEnhancedAudio`
+  dance. `transcribeSamples` takes a `Float32Array` straight in.
+- **`[VozWord]` returns fine.** A word list is an array of `@Record`s, and
+  `Array: JavaScriptEncodable where Element: JavaScriptEncodable` in
+  `expo-modules-jsi` plus `Record: JavaScriptEncodable` in `expo-modules-core`
+  covers it. (The note further down that the conformances are "TypedArray,
+  Record, SharedObject and Enumerable — and that is all" is about
+  `expo-modules-core`; the container and primitive conformances live in
+  `expo-modules-jsi`. `ArrayBuffer` is genuinely in neither.)
+
+The one thing Voz costs that Clear does not is **~490 MB of weights** against
+Clear's ~9 MB — a 460 MB encoder, a 16 MB decoder and a 10 MB embedding table.
+That is a UX constraint more than a technical one, and it is why the example app
+loads Clear on mount and makes Voz an explicit, progress-reported step.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -40,7 +78,7 @@ be written in the same style. So: 2.0 macros on Swift, classic DSL on Kotlin,
 one `src/native.ts` holding both to the same shape. When the Kotlin macros land,
 only `android/` changes.
 
-Views are also unsupported in 2.0 — irrelevant, Clear is headless.
+Views are also unsupported in 2.0 — irrelevant, both models are headless.
 
 ## The one real constraint: getting audio back out
 
@@ -81,7 +119,7 @@ Three ways out, and this SDK takes the first two:
 
 ## What compiling and running it actually changed
 
-Everything above was true on paper. Four things only showed up against a real
+Everything above was true on paper. Five things only showed up against a real
 toolchain and a real phone, and each one moved the design.
 
 ### Expo Modules 2.0 limits (expo-modules-core 57)
@@ -110,6 +148,57 @@ toolchain and a real phone, and each one moved the design.
 Limits 1 and 2 are compile-time and self-announcing. Limit 3 is not, and it cost
 most of the debugging: the first fix appeared not to work because the phone was
 locked, so `expo run:ios` silently kept running a stale build.
+
+### Two pods cannot each bridge the same Swift package
+
+Adding a second model was where this stopped being a copy of the first. Both
+podspecs declared their own `spm_dependency` on `desert-ant-core`, each naming
+only its own product — which reads like careful scoping and is in fact the bug.
+
+Xcode links a package product's static library *into* the linking pod's own
+archive, and every model product drags the same shared targets with it. So both
+archives ended up holding the same thirteen objects:
+
+```
+$ ar -t libDesertAntClear.a
+ClearAudio.o ClearModule.o ... Clear.o Regex.o JSON.o TextNormalization.o
+PlatformSupport.o Usage.o JSHost.o ModelStore.o FFIBuffer.o ModelCatalog.o
+Inference.o HostBridge.o DesertAnt.o NativeBindings.o AudioIO.o AudioDSP.o
+$ ar -t libDesertAntVoz.a
+VozModule.o ... Voz.o Regex.o JSON.o TextNormalization.o PlatformSupport.o
+Usage.o JSHost.o ModelStore.o FFIBuffer.o ModelCatalog.o Inference.o
+HostBridge.o DesertAnt.o AudioIO.o
+```
+
+and an app with both failed to link with **1,071 duplicate symbols**. Clear alone
+had linked cleanly for months, because one copy is not a duplicate — the failure
+mode simply did not exist until there were two models.
+
+`use_frameworks! :linkage => :dynamic`, which React Native's own SPM helper
+suggests in the warning it prints for exactly this situation, does **not** fix it:
+both podspecs set `static_framework = true`, so they stay static frameworks and
+keep their embedded copies. Measured — same 1,071.
+
+The fix is to bridge the package exactly once. `packages/core` gains an
+Apple-only `DesertAntCore` pod whose only job is to declare the one
+`spm_dependency`, listing every model product the family ships; the model pods
+`s.dependency 'DesertAntCore'` and add a `SWIFT_INCLUDE_PATHS` entry so their
+Swift can still `import Clear` / `import Voz`. Only the linking moved.
+
+```
+libDesertAntCore.a    3.7 MB   the package, once
+libDesertAntClear.a   808 KB   was 3.6 MB
+libDesertAntVoz.a     588 KB   was 3.4 MB
+```
+
+The cost is the coupling: `DESERT_ANT_PRODUCTS` in that podspec names every
+model, so an app installing one model still links the other's Swift, and adding a
+model to this SDK means editing core. That was chosen over the alternatives —
+discovering installed siblings from a podspec, which differs between a monorepo
+checkout and node_modules, or pushing every consumer onto dynamic frameworks —
+because it is the one that is explicit and fails loudly if forgotten. No weights
+are involved either way: every model here downloads its artifacts at runtime and
+the package bundles none, so this is code size, not hundreds of megabytes.
 
 ### AAC input crashes the upstream streaming path
 
@@ -190,6 +279,32 @@ button, which needs no microphone and no permission dialog.
 The Android half has **not** been run: no Android device or emulator was
 available. It compiles as written but should be treated as unverified.
 
+### Voz, as far as it has been taken
+
+Voz compiles, links alongside Clear, and binds. On an iOS 26.4 simulator the
+example app logs, before anything touches a model:
+
+```
+[clear] isSupported=true nativeCore=3.1.0
+[voz] isSupported=true nativeCore=3.1.0 revision=v0.1.0 languages=25
+[voz] isDownloaded=false
+```
+
+which exercises the `@ExpoModule` registration, every `@JS` property including
+the `[String]` return, `createModel` returning a `@SharedObject`, the object's
+synchronous `isDownloaded()`, and `release()`. Tapping the prepare button starts
+the real download and reports true `0..1` fractions through the `@Event`.
+
+**A transcription has not been run end to end.** It needs the ~490 MB of weights
+and a Neural Engine — which a simulator does not have, the model having no CPU or
+GPU fallback — and no such device was available. Specifically unverified:
+`transcribeFile`, `transcribeSamples`, the `[VozWord]` array crossing the bridge
+(sound by construction, per the conformances above, but not observed), the
+single-flight `VozLoader`, and whether an `expo-audio` `.m4a` survives
+`FileAudioStream` the way the reading of that file says it should. The example
+app's **Run self-test** button exercises all of them in order; run it on hardware
+before trusting any of it.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -214,6 +329,8 @@ and no `@Record`/`@SharedObject` to lean on.
 These are consequences of the upstream SDKs. They are documented in the
 TypeScript types rather than papered over.
 
+These are Clear's; Voz has no Android half to differ from.
+
 | | iOS | Android | Why |
 | --- | --- | --- | --- |
 | `ProgressEvent.fraction` | A real fraction | `0` entering a phase, `1` leaving it | Kotlin `Clear.enhance()` takes no progress handler. |
@@ -230,6 +347,10 @@ TypeScript types rather than papered over.
 - **`arm64-v8a` + `x86_64` only.** The config plugin narrows `abiFilters`;
   `Clear.isSupported` answers honestly if something slips through.
 - **Not Expo Go.** Dev build or bust.
+- **One `desert-ant-core` bridge.** Adding a model package to an app is free;
+  adding one to *this SDK* means naming its product in `DESERT_ANT_PRODUCTS` in
+  `packages/core/ios/DesertAntCore.podspec`, and an app that installs one model
+  links every listed model's Swift.
 - **Expo Modules 2.0 is experimental in SDK 57**, beta in 58. The macros are
   additive, so any function can fall back to the 1.0 DSL individually if an
   upgrade breaks it.
@@ -240,8 +361,9 @@ TypeScript types rather than papered over.
 
 ## Version coupling
 
-`DESERT_ANT_CORE_VERSION` in `ios/DesertAntClear.podspec`, the
-`ai.desertant:clear` coordinate in `android/build.gradle`, and
-`NATIVE_CORE_VERSION` in both module files must move together. The Apple and
+`DESERT_ANT_CORE_VERSION` in `packages/core/ios/DesertAntCore.podspec` — now
+the only place the Swift package's version is named — the `ai.desertant:clear`
+coordinate in `android/build.gradle`, and the `coreVersion` constants in each
+model's Swift and Kotlin module files must move together. The Apple and
 Android native cores share an FFI payload schema (see the comments in Desert
 Ant's own `Clear.kt`), so a mismatched pair is a wire bug that builds cleanly.

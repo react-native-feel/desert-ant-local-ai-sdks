@@ -1,31 +1,11 @@
 /**
- * React Native hands out `file://` URIs; both native SDKs take filesystem paths.
- * Converting in one place -- here -- keeps the platform code free of URI
- * parsing, and keeps the two halves from disagreeing about percent-encoding.
+ * `toPath` / `toUri` live in `@desert-ant-labs/react-native-core` -- every model
+ * package converts between React Native's `file://` URIs and the filesystem
+ * paths the native SDKs take, and two copies would be two chances to disagree
+ * about percent-encoding for the same file. Re-exported here so the rest of this
+ * package (and its tests) keep importing them from one place.
  */
-
-/** `file:///a/b%20c.m4a` -> `/a/b c.m4a`. A plain path passes through. */
-export function toPath(uri: string): string {
-  if (!uri.startsWith('file://')) {
-    return uri;
-  }
-  const withoutScheme = uri.slice('file://'.length);
-  try {
-    return decodeURIComponent(withoutScheme);
-  } catch {
-    // A stray `%` that is not an escape. Better to try the raw path than to fail
-    // before we have even looked for the file.
-    return withoutScheme;
-  }
-}
-
-/** `/a/b c.wav` -> `file:///a/b%20c.wav`. An existing URI passes through. */
-export function toUri(path: string): string {
-  if (path.includes('://')) {
-    return path;
-  }
-  return `file://${path.split('/').map(encodeURIComponent).join('/')}`;
-}
+export { toPath, toUri } from '@desert-ant-labs/react-native-core';
 
 /**
  * Where an enhanced file lands when the caller did not say: alongside the input,
@@ -35,6 +15,8 @@ export function toUri(path: string): string {
  * somewhere the app can write -- a recording in the cache or document directory
  * -- and this package deliberately does not depend on expo-file-system just to
  * ask where that is.
+ *
+ * Clear-specific, so it stays here: Voz reads a file and writes nothing.
  */
 export function defaultOutputPath(inputPath: string, suffix = '-clear'): string {
   const slash = inputPath.lastIndexOf('/');

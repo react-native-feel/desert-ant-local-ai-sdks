@@ -1,8 +1,11 @@
 /**
  * Where a model is in the work of producing a result.
  *
- * These mirror `Clear.Phase` in the Swift SDK, which is the only platform that
- * reports a real fraction today -- see {@link ProgressEvent.fraction}.
+ * The union spans every model SDK in this repo, so a given model emits only the
+ * subset that means something for it: Clear reports `loadingModel`, `analyzing`
+ * and `enhancing`; Voz reports `loadingModel` and `transcribing`. Switching on a
+ * phase a model never emits is dead code, not a bug -- but narrow the type at
+ * the call site rather than assuming, because the set grows with the catalog.
  */
 export type ModelPhase =
   /** Resolving the model: downloading or adopting files, then building the
@@ -13,7 +16,10 @@ export type ModelPhase =
   | 'analyzing'
   /** The model itself, chunk by chunk, plus everything that follows it. The
    *  long phase. */
-  | 'enhancing';
+  | 'enhancing'
+  /** Speech recognition: mel front end, encoder and decode loop, reported as one
+   *  fraction over the whole recording. Voz's only working phase. */
+  | 'transcribing';
 
 export interface ProgressEvent {
   /** Which call this belongs to. Every `enhance*` call takes a job id, so
@@ -23,12 +29,13 @@ export interface ProgressEvent {
   /**
    * How far into `phase`, in `0..1`.
    *
-   * iOS reports a true fraction. **Android reports only `0` on entering a phase
-   * and `1` on leaving it**, because the Kotlin SDK (`ai.desertant:clear`)
-   * exposes no progress callback to forward -- see `LoadedModel.download()` and
-   * `Clear.enhance()`, neither of which takes a handler. Drive a determinate
-   * bar off this on iOS and an indeterminate one on Android, or treat the phase
-   * alone as the signal on both.
+   * iOS reports a true fraction. **Clear on Android reports only `0` on entering
+   * a phase and `1` on leaving it**, because the Kotlin SDK
+   * (`ai.desertant:clear`) exposes no progress callback to forward -- see
+   * `LoadedModel.download()` and `Clear.enhance()`, neither of which takes a
+   * handler. Drive a determinate bar off this on iOS and an indeterminate one on
+   * Android, or treat the phase alone as the signal on both. Voz is Apple-only,
+   * so its fractions are always real.
    */
   fraction: number;
 }

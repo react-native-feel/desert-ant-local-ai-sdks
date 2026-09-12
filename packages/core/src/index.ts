@@ -5,6 +5,7 @@ export {
   type ProgressEvent,
   type Releasable,
 } from './model';
+export { toPath, toUri } from './uri';
 
 /**
  * The license every Desert Ant model ships under. Free below 100,000 monthly

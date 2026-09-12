@@ -3,20 +3,21 @@ require 'json'
 package = JSON.parse(File.read(File.join(__dir__, '..', 'package.json')))
 
 Pod::Spec.new do |s|
-  s.name           = 'DesertAntClear'
+  s.name           = 'DesertAntVoz'
   s.version        = package['version']
   s.summary        = package['description']
   s.description    = package['description']
   s.license        = package['license']
   s.author         = package['author'] || 'Desert Ant Labs'
-  s.homepage       = package['homepage'] || 'https://desertant.com/models/clear/'
+  s.homepage       = package['homepage'] || 'https://desertant.com/models/voz/'
 
-  # iOS 18 is the Core ML artifact's floor, not ours: clear-studio.mlmodelc is
-  # built for that deployment target and an older OS refuses to load it. This is
-  # above Expo's own 16.4 default, so a consuming app has to raise
-  # `ios.deploymentTarget` -- which is exactly what the bundled config plugin
-  # (app.plugin.js) does.
-  s.platforms      = { :ios => '18.0' }
+  # iOS 17 is the desert-ant-core package floor (`platforms:` in its
+  # Package.swift), not Voz's own: `Sources/Voz` carries no `@available` and its
+  # catalog entry inherits the default `OSFloor.packageFloor` (iOS 16), so the
+  # artifact would load lower -- SwiftPM simply will not resolve the package into
+  # a consumer below 17. Above Expo's 16.4 default either way, which is what the
+  # bundled config plugin (app.plugin.js) raises.
+  s.platforms      = { :ios => '17.0' }
   s.swift_version  = '6.0'
   s.source         = { git: 'https://github.com/Desert-Ant-Labs/desert-ant-react-native.git' }
   s.static_framework = true
@@ -28,13 +29,13 @@ Pod::Spec.new do |s|
   #
   # That is not tidiness. Xcode links a package product's static library *into*
   # the linking pod's archive, so a second `spm_dependency` here would give
-  # `libDesertAntClear.a` its own copy of the thirteen shared desert-ant-core
-  # objects that `libDesertAntVoz.a` already has, and an app using both models
+  # `libDesertAntVoz.a` its own copy of the thirteen shared desert-ant-core
+  # objects that `libDesertAntClear.a` already has, and an app using both models
   # would fail to link with ~1,071 duplicate symbols. Measured; see the note in
   # packages/core/ios/DesertAntCore.podspec.
   #
-  # `import Clear` below still works: DesertAntCore names `Clear` among its
-  # products, and the search path added here finds the swiftmodule it built.
+  # `import Voz` below still works: DesertAntCore names `Voz` among its products,
+  # and the search path added here finds the swiftmodule it built.
   s.dependency 'DesertAntCore'
 
   s.source_files = '**/*.{h,m,mm,swift}'

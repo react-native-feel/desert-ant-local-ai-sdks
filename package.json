@@ -8,7 +8,7 @@
     "apps/*"
   ],
   "scripts": {
-    "build": "npm run build --workspace @desert-ant-labs/react-native-core --workspace @desert-ant-labs/react-native-clear",
+    "build": "npm run build --workspace @desert-ant-labs/react-native-core --workspace @desert-ant-labs/react-native-clear --workspace @desert-ant-labs/react-native-voz",
     "clean": "npm run clean --workspaces --if-present",
     "lint": "npm run lint --workspaces --if-present",
     "test": "npm run test --workspaces --if-present"
