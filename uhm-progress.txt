@@ -6,16 +6,13 @@ Date:   2026-09-13
 
 SHORT VERSION
 -------------
-The Uhm SDK is implemented and the model itself is verified working end to end
-on an iOS 26.4 simulator: it downloads, loads, and finds real filler words in
-real speech with correct spans, types, confidences and timings.
+Done. The Uhm SDK is implemented and verified working end to end on an iOS 26.4
+simulator, driven with agent-device: it downloads, loads, finds real filler words
+in real speech with correct spans, types, confidences and timings, and the
+example app's own record -> clean -> detect flow produces them through the UI.
 
-One thing is NOT verified, and it is glue rather than model: the example app's
-record-flow step that calls `runDetectFillers` after Clear finishes. Every attempt
-to reach it ended with the app being killed by the OS (jetsam) during Clear's
-enhance pass, on this machine, under current memory pressure. That code path is
-the same `uhm.analyze(...)` call the self-test verifies; only the ~30 lines of
-app glue around it are unexercised.
+Two things remain unexercised, both narrow, both listed under NOT VERIFIED below:
+the error path of the load-before-analyze fix, and a physical device.
 
 
 WHAT WAS BUILT
@@ -100,30 +97,49 @@ Also verified:
 The Uhm UI card renders the real results (fillers, realtime factor, inference and
 labelling times, reconciled word count, typed chips). Screenshot captured.
 
+The app's own flow, end to end, driven entirely through the UI by agent-device --
+tap Record, tap Stop and process, tap Find the fillers -- on audio recorded
+through the app's microphone and cleaned by Clear:
+
+  [rec] enhanced — recording-2CF9EB61…-clear.wav 4.34s rtf=7.7x LUFS=-47.1
+  [uhm] analyze ok in 1281ms — 2 fillers in 4.34s rtf=3x
+        decode=11ms inference=1074ms labeling=145ms revision=612592c runtime=coreml
+  [uhm]   um     1.22–2.14s (920ms, conf 0.87)
+  [uhm]   um     3.16–3.58s (420ms, conf 0.70)
+
+and the card rendered "Fillers 2 / Realtime factor 3x / Inference 1074 ms".
+This is `runDetectFillers`, the same function `stopAndProcess` calls, on a real
+recording rather than a fixture.
+
 
 NOT VERIFIED
 ------------
-1. The example app's record-flow Uhm step (`stopAndProcess` -> `runDetectFillers`).
-   Reached `[rec] enhanced` several times; the app was then killed by the OS
-   before the Uhm step logged. Confirmed by `ps` showing the process gone, not by
-   a hang: `analyze` never started. Environmental, not a code defect.
-
-2. The Swift error-mapping fix's failure path. `analyzeFile`/`analyzeSamples` now
+1. The Swift error-mapping fix's failure path. `analyzeFile`/`analyzeSamples` now
    call `load` explicitly first, so a failed download reports
    ERR_MODEL_UNAVAILABLE instead of ERR_INFERENCE_FAILED. It is compiled,
    installed, and the happy path re-verified (model loads in 20.4 s on the new
    binary) — but the failure itself was not induced.
 
-3. A physical device. Everything above is the simulator, so every latency number
+2. A physical device. Everything above is the simulator, so every latency number
    is the CPU path with no Neural Engine. Desert Ant measures 296x realtime on an
    iPhone 17 Pro against the 8–9x seen here.
 
-4. Per-language accuracy. Upstream says English transfers acoustically to es/fr/
+3. Per-language accuracy. Upstream says English transfers acoustically to es/fr/
    de/nl without retraining and has not measured it; neither have we.
 
 
 FINDINGS WORTH KEEPING
 ----------------------
+* What made the record flow look broken was mostly ORDERING, not memory. Uhm
+  takes about 20 s to load, and `stopAndProcess` guards its step with
+  `if (uhm.current)`. Several runs tapped Record before `[uhm] ready` landed, so
+  the step was skipped in silence and looked identical to the model failing.
+  There were genuine jetsam kills too (the app process gone from `ps` after
+  Clear's enhance), which is why both symptoms were present at once and the
+  diagnosis took as long as it did. The app now logs
+  "[uhm] skipped — not ready yet when the recording finished" rather than saying
+  nothing. Wait for `[uhm] ready` before driving the UI.
+
 * Clear's in-memory self-test leg hangs, or takes many minutes, on this simulator
   — intermittently, and it predates this work (the file's own comments flag it).
   Because the self-test legs run sequentially, a hang in one silences every later
@@ -184,9 +200,7 @@ Then build and run:
 Wait for `[uhm] ready` BEFORE tapping anything — the model takes ~20 s to load and
 `uhm.current` is null until then, which silently skips the Uhm step.
 
-To finish item 1, either:
-  (a) free real memory first (the simulator, Metro, Xcode and Chrome together were
-      the problem), release the XCTest runner with `agent-device close` after the
-      taps, and keep the recording to a second or two; or
-  (b) run it on the physical iPhone 16, which has its own memory and would also
-      close out item 3 and give honest latency numbers.
+What is left is worth doing on the physical iPhone 16: it closes out the two
+remaining NOT VERIFIED items at once, and it is the only way to get honest
+latency numbers -- the simulator has no Neural Engine, so everything here is the
+CPU path.

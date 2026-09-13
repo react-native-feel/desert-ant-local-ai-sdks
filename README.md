@@ -78,7 +78,8 @@ Clips is verified end to end on a simulator — it downloads, loads, and returns
 ranked non-overlapping clips with playable spans from a real transcript. Uhm is
 verified end to end on a simulator too: it downloads, loads, and finds six
 filler spans in eleven seconds of real speech, with the type labeller and
-`reconcileWords` both exercised. Voz binds and reports correctly but its
+`reconcileWords` both exercised — and the example app's own record, clean and
+detect flow returns them through the UI. Voz binds and reports correctly but its
 transcription has not been run; that needs ~490 MB of weights and a Neural
 Engine, which a simulator does not have. Android compiles but has not been run —
 no device was available. Each package's README says exactly what was and was not

@@ -433,6 +433,11 @@ export default function App() {
     // transcript, and it is skipped rather than blocking when there is none.
     if (uhm.current) {
       await runDetectFillers(enhanced ?? uri, spoken);
+    } else {
+      // Said out loud, because the silence was genuinely confusing: Uhm takes
+      // about 20 s to load, so a recording stopped before it is ready skips this
+      // step -- and skipping it quietly looks exactly like the model failing.
+      console.log('[uhm] skipped — not ready yet when the recording finished');
     }
   }, [recorder]);
 

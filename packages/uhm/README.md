@@ -224,6 +224,23 @@ The one to read twice is `we`. It **does** still overlap a filler afterwards, by
 overlaps a filler" after reconciliation is the wrong assertion — this README's own
 self-test made it first.
 
+**The app's own flow works end to end too**, driven through the UI rather than
+through a fixture: record from the microphone, clean it with Clear, tap *Find the
+fillers*.
+
+```
+[rec] enhanced — recording-2CF9EB61…-clear.wav 4.34s rtf=7.7x LUFS=-47.1
+[uhm] analyze ok in 1281ms — 2 fillers in 4.34s rtf=3x
+      decode=11ms inference=1074ms labeling=145ms revision=612592c runtime=coreml
+[uhm]   um     1.22–2.14s (920ms, conf 0.87)
+[uhm]   um     3.16–3.58s (420ms, conf 0.70)
+```
+
+Worth one note if you drive this yourself: the model takes about 20 s to load, so
+a recording stopped before it is ready skips the detection step. The example app
+says so in the log rather than staying silent, but wait for its `[uhm] ready`
+line before tapping anything.
+
 Latency here is not worth quoting as a product number: a simulator has no Neural
 Engine, so 9x realtime is the CPU path. Desert Ant measures 296x realtime on an
 iPhone 17 Pro.
