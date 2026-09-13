@@ -42,7 +42,7 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # catalog downloads its artifacts at runtime and the package bundles none -- so
 # this is code size, not hundreds of megabytes. Adding a model to the family
 # means adding it here.
-DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips'].freeze
+DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm'].freeze
 
 Pod::Spec.new do |s|
   s.name           = 'DesertAntCore'

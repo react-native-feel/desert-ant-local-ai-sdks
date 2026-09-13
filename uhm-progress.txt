@@ -1,0 +1,192 @@
+UHM MODEL — PROGRESS AND FINDINGS
+=================================
+Branch: add-voz-model
+Date:   2026-09-13
+
+
+SHORT VERSION
+-------------
+The Uhm SDK is implemented and the model itself is verified working end to end
+on an iOS 26.4 simulator: it downloads, loads, and finds real filler words in
+real speech with correct spans, types, confidences and timings.
+
+One thing is NOT verified, and it is glue rather than model: the example app's
+record-flow step that calls `runDetectFillers` after Clear finishes. Every attempt
+to reach it ended with the app being killed by the OS (jetsam) during Clear's
+enhance pass, on this machine, under current memory pressure. That code path is
+the same `uhm.analyze(...)` call the self-test verifies; only the ~30 lines of
+app glue around it are unexercised.
+
+
+WHAT WAS BUILT
+--------------
+packages/uhm  ->  @desert-ant-labs/react-native-uhm  (iOS only)
+
+  src/types.ts      Filler, FillerType, Bias, UhmResult, UhmTimings, options
+  src/native.ts     the native surface (requireOptionalNativeModule)
+  src/Uhm.ts        the public class
+  src/index.ts      exports
+  ios/UhmModule.swift     @ExpoModule — every async entry point
+  ios/UhmModel.swift      @SharedObject — state + sync access
+  ios/UhmRecords.swift    @Record value types + mapping
+  ios/UhmExceptions.swift coded exceptions -> DesertAntError codes
+  ios/DesertAntUhm.podspec
+  plugin/src/index.ts     config plugin (raises iOS deployment target to 17.0)
+  README.md
+  30 passing unit tests (src + plugin)
+
+Public surface:
+  Uhm.isSupported / unsupportedReason / nativeCoreVersion / modelRevision
+  Uhm.biasThresholds        read off the Swift enum, not duplicated in TS
+  Uhm.fillerTypes
+  Uhm.reconcileWords(words, fillers, options?)   pure, sync, no model
+  Uhm.load(options?) / Uhm.create(options?)
+  uhm.isDownloaded() / warm() / download() / release()
+  uhm.analyze({ uri, bias?, includeTypes?, minConfidence?, minDurationSec?, onProgress? })
+  uhm.analyzeSamples(samples, sampleRate?, options?)
+
+Repo-level changes:
+  packages/core/ios/DesertAntCore.podspec   added 'Uhm' to DESERT_ANT_PRODUCTS
+  packages/core/src/model.ts                added the 'detecting' ModelPhase
+  package.json                              added uhm to the build script
+  apps/example/*                            dependency, plugin, UI card,
+                                            self-test leg, record-flow wiring
+  README.md, docs/architecture.md           documented
+  .gitignore                                corrected a stale comment
+
+
+VERIFIED ON DEVICE (iPhone 17 Pro Max simulator, iOS 26.4, driven with agent-device)
+------------------------------------------------------------------------------------
+Module binds, every @JS property reports:
+
+  [uhm] isSupported=true nativeCore=3.1.0 revision=612592c
+        bias={"precision":0.75,"balanced":0.65,"recall":0.5} types=uh/um/hmm/and/other
+
+  -> @ExpoModule registration, the [String: Double] return (a conversion no other
+     package in this repo had exercised), createModel returning a @SharedObject,
+     its synchronous isDownloaded(), and release().
+
+Download + Core ML session build:
+  39 s cold (45 MB download + build), ~20 s warm on every later launch.
+  isDownloaded() answers true across relaunches.
+
+Real detection, on 10.93 s of speech containing six fillers:
+
+  [uhm] analyze(file) ok in 1208ms — 6 fillers, 10.93s rtf=9x
+        decode=21ms inference=934ms labeling=189ms
+  [uhm]   other  0.70–1.14s (440ms, conf 0.91)
+  [uhm]   other  2.46–2.94s (480ms, conf 0.86)
+  [uhm]   other  4.56–4.98s (420ms, conf 0.92)
+  [uhm]   um     6.10–6.28s (180ms, conf 0.89)
+  [uhm]   other  7.70–8.14s (440ms, conf 0.88)
+  [uhm]   other  9.34–9.82s (480ms, conf 0.91)
+  [uhm] ordered=true insideAudio=true aboveThreshold=true typesKnown=true
+
+  Every filler found and placed; spans 180–480 ms, which is what a filler is.
+
+Also verified:
+  analyzeSamples on 48 kHz audio  (native resample + Float32Array copy)
+  includeTypes: false             (same six spans, every type null)
+  all three bias presets
+  reconcileWords, rule by rule:
+
+  [uhm] reconcileWords: 7 words -> 6 ranges
+        [["so",0,0.4],["think",0.8,0.95],["we",1.3,1.9],["I",1.35,1.5],
+         ["should",2,2.4],["go",4,4.3]]
+  [uhm] dropped(um)=true trimmedEnd(think->0.95)=true pushedStart(I->1.35)=true
+        splitKeptLongerHalf(should->2.0-2.4)=true underGateUntouched(we->1.3-1.9)=true
+        untouched(so,go)=true sortedByStart=true
+
+The Uhm UI card renders the real results (fillers, realtime factor, inference and
+labelling times, reconciled word count, typed chips). Screenshot captured.
+
+
+NOT VERIFIED
+------------
+1. The example app's record-flow Uhm step (`stopAndProcess` -> `runDetectFillers`).
+   Reached `[rec] enhanced` several times; the app was then killed by the OS
+   before the Uhm step logged. Confirmed by `ps` showing the process gone, not by
+   a hang: `analyze` never started. Environmental, not a code defect.
+
+2. The Swift error-mapping fix's failure path. `analyzeFile`/`analyzeSamples` now
+   call `load` explicitly first, so a failed download reports
+   ERR_MODEL_UNAVAILABLE instead of ERR_INFERENCE_FAILED. It is compiled,
+   installed, and the happy path re-verified (model loads in 20.4 s on the new
+   binary) — but the failure itself was not induced.
+
+3. A physical device. Everything above is the simulator, so every latency number
+   is the CPU path with no Neural Engine. Desert Ant measures 296x realtime on an
+   iPhone 17 Pro against the 8–9x seen here.
+
+4. Per-language accuracy. Upstream says English transfers acoustically to es/fr/
+   de/nl without retraining and has not measured it; neither have we.
+
+
+FINDINGS WORTH KEEPING
+----------------------
+* Clear's in-memory self-test leg hangs, or takes many minutes, on this simulator
+  — intermittently, and it predates this work (the file's own comments flag it).
+  Because the self-test legs run sequentially, a hang in one silences every later
+  leg, and its own try/catch cannot help. The Uhm leg was therefore moved to run
+  FIRST and made self-contained (it writes its own WAV when no real sample is
+  present). That is what made the Uhm verification possible at all.
+
+* Running `npm run build` while the app is running reloads the app. The build
+  rewrites packages/*/build/*.js, Metro watches those, and fast refresh takes the
+  whole runtime down mid-model-load. Several "the app restarted again" mysteries
+  were this. Do not build packages during a device run.
+
+* The simulator's SpringBoard wedged once: `simctl launch` returned
+  "The request was denied by service delegate (SBMainWorkspace)". Fix is
+  `simctl shutdown` + `boot`. After a reboot, launch via
+  `agent-device open` rather than `simctl launch`, which stayed unreliable
+  ("did not return a process handle nor launch error").
+
+* `simctl install` over an existing app REPLACED the data container, wiping the
+  downloaded model cache and the test sample. Re-copy the sample after any
+  install.
+
+* reconcileWords has a subtlety worth not re-discovering: with the default
+  `minOverlapFraction` of 0.5, a word overlapping a filler by a small fraction of
+  its own length comes back UNTOUCHED and still overlapping. That is the gate
+  absorbing the disagreement between Voz's ~80 ms word boundaries and Uhm's 20 ms
+  filler edges. Asserting "no word overlaps a filler" after reconciliation is the
+  wrong assertion — the first version of the self-test made it and failed.
+
+* macOS `say` output is a usable but imperfect test fixture. Of six synthesized
+  fillers the labeller typed one as `um` and five as `other` — its "something is
+  here, not sure which kind" bucket. The detector found all six regardless, so
+  detection is verified and type accuracy is not.
+
+
+HOW TO REPRODUCE / FINISH
+-------------------------
+Test fixture (the real-speech sample):
+
+  say -v Samantha -r 150 -o uhm-raw.aiff \
+    "So, ummm, I think we should, uh, ship it on Tuesday. Ummm, actually, hmmm, \
+     maybe Wednesday. Uh, that gives us, um, two more days."
+  afconvert -f WAVE -d LEI16@16000 -c 1 uhm-raw.aiff uhm-sample.wav
+  cp uhm-sample.wav "$(xcrun simctl get_app_container <SIM> com.desertant.clearexample data)/Library/Caches/"
+
+Then build and run:
+
+  npm install && npm run build
+  cd apps/example && npx expo prebuild --clean --platform ios
+  xcodebuild -workspace ios/DesertAntExample.xcworkspace -scheme DesertAntExample \
+    -configuration Debug -sdk iphonesimulator -destination 'id=<SIM>' \
+    -derivedDataPath ios/build build
+  xcrun simctl install <SIM> ios/build/Build/Products/Debug-iphonesimulator/DesertAntExample.app
+  CI=1 npx expo start --dev-client --port 8099
+  agent-device open com.desertant.clearexample --platform ios --device "iPhone 17 Pro Max" --session uhm
+  agent-device press 'label="Run self-test"' --session uhm
+
+Wait for `[uhm] ready` BEFORE tapping anything — the model takes ~20 s to load and
+`uhm.current` is null until then, which silently skips the Uhm step.
+
+To finish item 1, either:
+  (a) free real memory first (the simulator, Metro, Xcode and Chrome together were
+      the problem), release the XCTest runner with `agent-device close` after the
+      taps, and keep the recording to a second or two; or
+  (b) run it on the physical iPhone 16, which has its own memory and would also
+      close out item 3 and give honest latency numbers.

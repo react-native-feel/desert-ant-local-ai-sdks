@@ -10,7 +10,7 @@
       "bundleIdentifier": "com.desertant.clearexample",
       "supportsTablet": true,
       "infoPlist": {
-        "NSMicrophoneUsageDescription": "Record a clip so Clear can clean it up and Voz can transcribe it, on this device."
+        "NSMicrophoneUsageDescription": "Record a clip so Clear can clean it up, Voz can transcribe it and Uhm can find the filler words, on this device."
       }
     },
     "android": {
@@ -24,7 +24,8 @@
       "expo-audio",
       "@desert-ant-labs/react-native-clear",
       "@desert-ant-labs/react-native-voz",
-      "@desert-ant-labs/react-native-clips"
+      "@desert-ant-labs/react-native-clips",
+      "@desert-ant-labs/react-native-uhm"
     ],
     "scheme": "clearexample"
   }

@@ -3,9 +3,10 @@
  *
  * The union spans every model SDK in this repo, so a given model emits only the
  * subset that means something for it: Clear reports `loadingModel`, `analyzing`
- * and `enhancing`; Voz reports `loadingModel` and `transcribing`. Switching on a
- * phase a model never emits is dead code, not a bug -- but narrow the type at
- * the call site rather than assuming, because the set grows with the catalog.
+ * and `enhancing`; Voz reports `loadingModel` and `transcribing`; Uhm reports
+ * `loadingModel` and `detecting`. Switching on a phase a model never emits is
+ * dead code, not a bug -- but narrow the type at the call site rather than
+ * assuming, because the set grows with the catalog.
  */
 export type ModelPhase =
   /** Resolving the model: downloading or adopting files, then building the
@@ -19,7 +20,11 @@ export type ModelPhase =
   | 'enhancing'
   /** Speech recognition: mel front end, encoder and decode loop, reported as one
    *  fraction over the whole recording. Voz's only working phase. */
-  | 'transcribing';
+  | 'transcribing'
+  /** The filler detector sliding its 30 s window over the waveform, reported as
+   *  one fraction over the whole recording. Uhm's only working phase -- the type
+   *  labeller that follows it is milliseconds and reports nothing. */
+  | 'detecting';
 
 export interface ProgressEvent {
   /** Which call this belongs to. Every `enhance*` call takes a job id, so

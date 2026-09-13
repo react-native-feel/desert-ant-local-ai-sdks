@@ -122,6 +122,70 @@ sentences, and where a sentence ends is something selection was trained on. A
 regex in TypeScript would be a guess at it. It is exposed as a synchronous,
 model-free module function, so it costs nothing and needs no download.
 
+## What Desert Ant ships for Uhm (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Uhm` in `desert-ant-core` | A 45 MB DistilHuBERT `uhm.mlmodelc`, plus a ~13 KB `UhmLabel.mlmodel` type labeller. No `@available` and no `osFloor`, so its floor is the package's `iOS 17`. |
+| Kotlin | — | **Nothing.** `Sources/Uhm/Catalog.swift` declares `files` for `.apple` and no other platform. |
+| JavaScript | — | An ONNX export exists (51 MB, per the model page) but no npm package is published. |
+
+This is the third distinct shape of "iOS only" in this repo, and the distinction
+keeps mattering. Voz has no Android *artifact*; Clips has files and no *package*;
+Uhm has **neither half of the model**. The detector has no LiteRT export, and the
+type labeller is a CreateML sound classifier driven through SoundAnalysis — a
+framework that exists on Apple platforms and nowhere else. Upstream's own code
+says so structurally rather than in a comment: `labelDetections` is behind
+`#if canImport(SoundAnalysis) && canImport(CoreML)`, with an `#else` branch that
+returns the detections untouched.
+
+So there is no `unsupportedReason` string to compute here the way Clips computes
+one. `Uhm.isSupported` is false off iOS for one reason, which the TypeScript side
+can state without asking native — which is just as well, because off iOS there is
+no native module to ask.
+
+### Nothing has to travel back, again
+
+Uhm lands on the easy side of the one constraint that shaped Clear: audio goes
+*in* (a path, or a `Float32Array` copied to `[Float]` before the first
+suspension), and what comes back is a handful of spans. So, like Voz, this
+package needs no equivalent of `ClearAudio` and no two-call handshake. The
+`@Record` nesting is one level deeper than Voz's — `UhmResult` holds both a
+`[UhmFiller]` and a single `UhmTimings` — and both work for the same reason:
+every `Record` is `JavaScriptEncodable`, and `Array` is where its `Element` is.
+
+`biasThresholds` crosses as a `[String: Double]`, which is the one conversion in
+this repo that had not been exercised before. It works.
+
+### Two states that are one number on the wire
+
+`Uhm.Options.minConfidence` is `Double?` in Swift: nil means "use the bias
+preset's threshold". JavaScript has no way to send that — an absent field and an
+explicit `0` arrive identically, and `0` is a threshold a caller can legitimately
+mean. So the record carries both `minConfidence` and `useBiasThreshold`, and
+`src/Uhm.ts` is the only place that decides which. It is the same split Clips
+makes for `limit` and `useDurationCurve`, for the same reason.
+
+### `reconcileWords` stays on the Swift side
+
+Upstream ships `Uhm.reconcileWords(_:fillers:options:)`: pure geometry over two
+sets of spans, no model, no I/O. It would port to TypeScript in an afternoon.
+
+It is exposed as a synchronous module function instead, on the same argument
+`Clips.toSentences` is: it would be a *second definition of where a cut goes*.
+And the rules are not ones you would reliably re-derive — a recognizer's word span
+can straddle a filler, contain one, or *be* one, because the recognizer heard "um"
+and wrote it down. That last case is about a third of the detections in Desert
+Ant's own notes, and it is the one a naive "drop any overlapping word" loses.
+
+The `minOverlapFraction` gate is the part worth knowing about. Voz places a word
+boundary to about 80 ms and Uhm places a filler edge to 20 ms, so a sliver of
+overlap between the two is the models disagreeing about the same audio rather
+than a word running into a filler. At the 0.5 default a word overlapping a filler
+by 8% of its length comes back **untouched**, still overlapping. That is correct,
+and it surprises anyone who asserts "no word overlaps a filler" afterwards —
+including, briefly, this repo's own self-test.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
