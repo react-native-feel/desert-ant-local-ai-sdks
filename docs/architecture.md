@@ -1029,6 +1029,202 @@ puts it in a different category of integration decision than anything else here.
 Voz and Clips have to be asked about. Emo, Ear and Redact can load on mount. Shapes
 barely registers as a decision at all.
 
+## What Desert Ant ships for Align (v3.1.0)
+
+The eleventh model, and the first one whose job is to correct another model's
+answer rather than produce one of its own.
+
+`Sources/Align` is a `SpeechTimestampRefiner`: feed it the audio Apple's
+`SpeechAnalyzer` is transcribing, hand it each finalized `SpeechTranscriber.Result`,
+and it returns the same words with their `audioTimeRange` boundaries moved. Two
+Core ML cascade stages — a 241-frame coarse pass and an 81-frame fine pass
+recentred on it — run per boundary in batches of 16, and a fitted calibrator
+decides from both stages' output distributions how much of the proposed correction
+to apply, or whether to keep Apple's original. Upstream reports 106.4 ms of mean
+boundary error down to 20.2 ms on LibriSpeech test-clean.
+
+Apple-only, and not by omission. `Package.swift` puts the target outside its
+`models` array with the reason written above it — *"Align is Apple-only (Core ML,
+Speech, AVFoundation), so it lives outside the `models` list: it gets no
+Android/Node/Web products and no NativeBindings"* — and upstream's manifest
+records `swift: live`, `kotlin: none`, `js: none`. So `packages/align` has no
+`android/` directory at all and its `expo-module.config.json` lists
+`"platforms": ["apple"]`.
+
+### The public surface is one function, and it decides the whole design
+
+`SpeechTimestampRefiner` has three `refine` overloads. Two of them take what a
+wrapper would want — an arbitrary `[WordTiming]` plus samples, or an
+`AttributedString` plus samples — and **both are `internal`** to the `Align`
+module. The only `public` one is
+
+```swift
+@available(iOS 26, macOS 26, tvOS 26, visionOS 26, *)
+public func refine(_ result: SpeechTranscriber.Result) -> RefinedSpeechResult
+```
+
+That single fact settles three things at once:
+
+1. **This SDK must own the recognizer.** There is no way to hand Align a word list
+   from anywhere else, so `packages/align` constructs the `SpeechTranscriber` and
+   the `SpeechAnalyzer` itself and runs the file through them. `transcribe` is a
+   transcription API that happens to refine, not a refinement API.
+2. **Align cannot sharpen Voz.** The obvious composition — Voz reads the audio,
+   Align tightens its word spans, Uhm's `reconcileWords` places the cuts — is not
+   expressible against the public API. Align *replaces* Voz as the
+   word-timestamp source; it does not improve it. The chain that does work is
+   Align → Uhm.
+3. **The floor is iOS 26**, because `SpeechAnalyzer` is.
+
+### The OS floor is the API's, not the artifact's
+
+`Sources/Align/Catalog.swift` declares no `osFloor`, so `AlignModel.osFloor` is
+`OSFloor.packageFloor` — iOS 16 — and `align_coarse.mlmodelc` really would load
+there. Nothing about the weights needs 26.
+
+This is the opposite case to Clips, whose 18 *is* an artifact floor: `clips.mlmodelc`
+is a Core ML multifunction package and an older OS refuses to load it. Here the
+artifact is fine and the API around it does not exist.
+
+So the pod compiles at 17 — every Speech reference in `packages/align/ios` sits
+inside an `@available(iOS 26, *)` scope — and `AlignModelObject.isSupported`
+checks `ProcessInfo.isOperatingSystemAtLeast(26)` at runtime. The config plugin
+raises the app to 17 and no further.
+
+That is a deliberate trade and worth stating as one. CocoaPods gives an app a
+single deployment target, so an Align pod declaring 26 would raise the *whole app*
+to 26 — Shapes, Emo, Uhm and the rest included, all of which run happily on 17. An
+app that installs Align beside them would lose eight major versions of devices for
+a model those devices would refuse anyway. The rule the other ten plugins already
+follow gives the right answer here too: raise to what the pod needs to *build*,
+and answer what the model needs to *run* at runtime.
+
+### Two downloads, and only one of them is Desert Ant's
+
+Align is the only model in this repo that needs something `desert-ant-core` does
+not ship, and it is the larger half by three orders of magnitude.
+
+| | what | size | managed by | call |
+| --- | --- | --- | --- | --- |
+| Align's weights | two `.mlmodelc` directories + 3 sidecars | **672,560 bytes**, 13 files (measured) | the catalog | `load()` |
+| Apple's recognizer | the on-device speech model for one locale | hundreds of MB | `AssetInventory` | `prepareLocale(locale)` |
+
+`isDownloaded()` answers only the first, which is why the TypeScript says so
+explicitly. An app with the weights and no recognizer has nothing to refine.
+
+Getting the second half right took two trips through a device, and neither
+mistake is visible to a compiler:
+
+* **`AssetInventory.assetInstallationRequest(supporting:)` fails before
+  `reserve`.** It throws `SFSpeechErrorDomain Code=1 "Cannot check the download
+  status, <bundle id> is not subscribed to transcription.en"` — which reads like a
+  missing entitlement and is not one. Reserving is what declares the interest the
+  word "subscribed" refers to.
+* **Reserve the locale Apple names, not the one the caller passed.**
+  `Locale(identifier: "en-US")` and what
+  `SpeechTranscriber.supportedLocale(equivalentTo:)` returns (`en_US`) are not
+  interchangeable; `AssetInventory` keys on its own spelling.
+
+Nothing upstream mentions either, because upstream does not manage Apple's assets
+at all. Its download is the 0.7 MB; the recognizer behind it is assumed to be
+somebody else's problem, and on this SDK it is.
+
+### There is no session to build, so `load` is not what it is elsewhere
+
+Every other model here builds its platform session inside `load`/`warm`. Align
+cannot: `SpeechTimestampRefiner`'s initializer constructs both `StageModel`s, and
+that initializer is per-locale **and** per-audio-file — the file-input form calls
+`useCompleteAudio`, which loads that file's samples into the refiner and clears
+the streaming ring buffer.
+
+So the shared object holds a resolved directory and a parsed language map, not a
+refiner. A refiner is built per `transcribe` call, and what that cost is comes back
+on the result as `setupSec`, separately from `refineSec`. The two are separated
+because they scale differently — setup is fixed per call, refinement scales with
+the transcript — and because `processingSec` includes Apple's recognition, which
+is not Align's to be judged on.
+
+### Both timelines cross the bridge
+
+`AlignedWord` carries `start`/`end`, `originalStart`/`originalEnd` and `refined`.
+That is the one design decision here that is this package's rather than upstream's,
+and it follows from what the model is: a delta of tens of milliseconds. A result
+carrying only the corrected span would be **indistinguishable** from Apple's output
+with a boolean bolted on, and no app could tell whether the model was working.
+
+Apple's original spans are not on `RefinedSpeechResult` in any form —
+`words(from:)` is `internal` — so this package walks `result.original.text`'s runs
+itself, the same way upstream walks them, and pairs the two arrays by index. If
+that pairing ever breaks it degrades to "original equals refined", not to a wrong
+number.
+
+`timestampShift` is the pure half, in TypeScript alongside Gist's `channelTopics`
+and Redact's `restore`: no model, no bridge hop, no download. It averages over
+*boundaries* rather than words, because two per word is the unit upstream's 106.4
+ms and 20.2 ms are quoted in.
+
+### A locale typo would void the result silently, so it is refused
+
+`SpeechTimestampRefiner.init` reads `locale.language.languageCode?.identifier ?? ""`
+and looks the first two lowercased characters up in the config's language map. A
+miss sets `languageId = nil`, and `isSupported` false — at which point `refine`
+**returns its input unchanged**. No error, no flag on the call, and a transcript
+that looks exactly like a refined one.
+
+`Locale(identifier:)` never fails, so `''`, `'english'` and `'en US'` all reach
+that state. This package refuses in three places: a shape check in TypeScript
+before the bridge, the same check natively, and a lookup against the model's own
+downloaded language map before any work starts. `allowUnrefined: true` is the
+explicit opt-out, and `languageRefined` on the result is how an app that used it
+tells the difference.
+
+The same judgement covers `maxBufferedSeconds`, which upstream multiplies into a
+ring-buffer cap with no validation — `0` caps the buffer at nothing and `NaN`
+traps the `Int` conversion. It is validated here even though this SDK's file path
+does not use the ring buffer at all.
+
+### The vocabulary is read off the artifact, which Shapes could not do
+
+`supportedLanguages()` returns the keys of the `languages` map in
+`refiner_config.json`, one of the three sidecars the model downloads —
+`de, en, es, fr, it, ja, ko, pt, zh`. Same policy as `Gist.variants`,
+`Redact.labelDisplayNames` and `Uhm.fillerTypes`: a list that lives in the
+artifact is read from the artifact.
+
+Align makes it slightly harder than those three — `RefinerConfig` is an `internal`
+struct and its map is not exposed on `SpeechTimestampRefiner` in any form — but
+the file it is decoded from is a plain JSON sidecar this SDK has already
+downloaded, so the list comes out of the same bytes the model reads it from. That
+is also why it is a method on a loaded model rather than a property on the module:
+before `load` there is nothing to answer with, and answering with a hardcoded nine
+would be exactly the mistake `packages/shapes` declined to make when its own
+vocabulary turned out to be unreadable.
+
+### `.audioTimeRange` is load-bearing, so JavaScript never gets to set it
+
+`SpeechTimestampRefiner` reads word spans out of the result's `AttributedString`
+runs. A `SpeechTranscriber` configured without the `.audioTimeRange` attribute
+option produces runs with no time attribute, so the refiner sees zero words,
+returns its input, and the pipeline degrades to plain transcription with no error
+anywhere. Owning the transcriber is what makes that unmisconfigurable.
+`.volatileResults` is deliberately absent for the mirror reason: a volatile result
+passes through `refine` unrefined by design, so subscribing would buy recognition
+work for output this SDK discards.
+
+### Where Align sits next to the others
+
+Beside Voz, and in competition with it rather than after it. Voz is a 490 MB
+recognizer that runs anywhere Core ML does and times words to about 80 ms; Align
+is 0.7 MB on top of Apple's own recognizer, needs iOS 26, and times them to a
+measured 20.2 ms upstream. An app choosing between them is choosing between
+portability and precision, not between two steps of a pipeline.
+
+The chain it does belong to is Align → Uhm. `AlignedWord` is structurally
+`Uhm.WordRange` plus two extra fields, so `Uhm.reconcileWords` takes it directly,
+and that is the one place in this whole family where tens of milliseconds change an
+output rather than a number on a screen: a filler-trimmed word span is what an
+automatic cut is made from.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -1884,6 +2080,89 @@ test; upstream publishes no accuracy figure for this model and neither does this
 repo. The 15° rotation snap was not directly observed either — every sample that
 snapped landed on 0°, 72° or 90°, all already multiples of 15.
 
+### Align, as far as a simulator can take it
+
+The eleventh pod in the same app, and the first one whose central claim this repo
+could **not** verify. Driven on an iPhone 17 Pro Max simulator running iOS 26.4.
+
+What was verified:
+
+```
+[align] isSupported=true nativeCore=3.1.0 revision=main pinned=false
+        repo=desert-ant-labs/align appleSpeech=false maxBuffered=30
+[align] ready in 33345ms downloaded=true languages=de/en/es/fr/it/ja/ko/pt/zh
+[align] refused an empty locale, 'english', an unrefined locale, and zero/NaN buffer windows
+[align] transcription skipped — Apple's en-US recognizer is not installed (ERR_MODEL_UNAVAILABLE)
+[selftest] all prepared models passed
+```
+
+- **The pod builds and links** into an app already carrying ten Desert Ant pods,
+  with no duplicate symbols. `DESERT_ANT_PRODUCTS` gained `'Align'` and nothing
+  else changed; no `_NumericsShims` include path was added, because
+  `alignTargets` depends only on `DesertAnt`. That is the swift-numerics rule
+  read off `Package.swift` and correctly *not* applied, which is the first time
+  this repo has had the negative case.
+- **The download works.** 672,560 bytes across 13 files, on disk under
+  `…/desert-ant-models/desert-ant-labs/align/main/` — two `.mlmodelc` directories
+  and three sidecars. The last path component is the branch name, which is as
+  concrete an illustration of the pinning risk as one could ask for.
+- **The nine languages come off the artifact**, not out of TypeScript: they are
+  the keys of the `languages` map in the downloaded `refiner_config.json`, and
+  they match the nine the product page advertises.
+- **Every refusal fires before a native call**: empty locale, `'english'`,
+  `'cy-GB'`, `maxBufferedSeconds: 0` and `maxBufferedSeconds: NaN`, all
+  `ERR_INVALID_ARGUMENT`.
+- **A missing recognizer is classified rather than guessed**: `transcribe` against
+  a real 10.93 s speech file with a valid locale raised `ERR_MODEL_UNAVAILABLE`,
+  not `ERR_INFERENCE_FAILED`.
+- **No crash attributable to Align.** Two `EXC_BAD_ACCESS`es were seen across the
+  session and both symbolicate to the same stack: `ClearMetrics.toObject` →
+  `Record.encode` → `ClearModule._decorateModule` closure #6, on
+  `com.apple.root.user-initiated-qos.cooperative`. That is the known pre-existing
+  Clear async-return crash described above, tripped by the Clear leg of the same
+  self-test, which runs after Align's. Of four self-test runs, two finished and
+  two were taken down by it — which is a useful datum in its own right about the
+  limit-4 race: it is roughly a coin flip on this hardware, not a rare event.
+  Align's own async entry points return `Void` by construction and never appeared
+  on a crashing stack.
+
+**What was not verified is the model itself.** No transcript was ever refined, so
+no latency, no word count and no boundary movement is quoted anywhere in this repo
+for Align; upstream's 106.4 ms → 20.2 ms remains attributed to upstream.
+
+The reason was diagnosed rather than assumed. On this simulator:
+
+| probe | answer |
+| --- | --- |
+| `SpeechTranscriber.isAvailable` | **false** |
+| `SpeechTranscriber.supportedLocale(equivalentTo: en-US)` | `en_US` — so the supported-locale check does *not* catch it |
+| `AssetInventory.status(forModules:)` | **`.unsupported`** |
+| `SpeechTranscriber.installedLocales` | **empty** |
+| `assetInstallationRequest(supporting:)` after a successful `reserve` | throws `SFSpeechErrorDomain Code=1` |
+
+Apple's on-device recognizer assets are device-only, and no physical device was
+available. The SDK now checks `status` first and reports that case as a sentence
+naming the simulator, rather than forwarding Apple's message about a download
+status — which is the most this could be taken to.
+
+Two real ordering bugs were found on the way to that answer, both invisible to a
+compiler and both fixed: `assetInstallationRequest` must come **after**
+`reserve`, and the locale reserved must be the one
+`SpeechTranscriber.supportedLocale(equivalentTo:)` returns rather than the one the
+caller passed.
+
+The other half of the intended join *was* exercised on the same audio: Uhm found
+six filler spans in the 10.93 s sample at `rtf=10x`, and `Uhm.reconcileWords` hit
+all five of its rules. So the chain is one model short of end to end, and the
+missing model is the one that needs hardware.
+
+Also worth not over-reading: the 33.3 s and 33.7 s `load()` figures above are a
+ceiling under contention. They were measured at app mount while six other models
+downloaded and built Core ML sessions concurrently on a memory-pressured machine
+— Uhm reported 57.0 s in the same window — and the second of them had
+`downloaded=true`, so neither is a measure of a 0.7 MB download. No isolated load
+figure was taken.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -1908,7 +2187,7 @@ and no `@Record`/`@SharedObject` to lean on.
 These are consequences of the upstream SDKs. They are documented in the
 TypeScript types rather than papered over.
 
-These are Clear's; Voz, Clips and Uhm have no Android half to differ from.
+These are Clear's; Voz, Clips, Uhm and Align have no Android half to differ from.
 
 | | iOS | Android | Why |
 | --- | --- | --- | --- |
@@ -1998,6 +2277,19 @@ and the only one with no progress row at all -- it emits none:
 | `modelRevision` / `modelRepo` / `tieMargin` | Catalog, catalog, mirrored | Constants in the module | `ai.desertant:tongue` publishes `Tongue`, `Detection`, `Prediction`, `Route`, `Reliability` and `Verdict`, and nothing to read the first two from. `tieMargin` is written inline in `isTooCloseToCall` on *both* platforms, so neither can read it. |
 | Progress | None | None | Nothing downloads and no entry point takes a handler. No `ModelPhase` was added for this model. |
 | Verified | Module binds; no detection run | No -- compiles only | The product gap on one side, no Android hardware on the other. |
+
+Align's table is the only one with **no Android column to fill**, so the axis is
+the OS version instead -- which is the split that actually matters for this model:
+
+| | iOS 26+ | iOS 17-25 | Android / web | Why |
+| --- | --- | --- | --- | --- |
+| The pod | Builds and links | **Builds and links** | Not built at all | Every Speech reference sits inside `@available(iOS 26, *)`, so the pod's own floor is the desert-ant-core package floor of 17. |
+| `isSupported` | True | **False**, with a reason | False, module is `null` | `SpeechAnalyzer` is iOS 26 and the only public `refine` takes one of its results. The artifact itself would load on iOS 16. |
+| `transcribe` | The whole model | `ERR_UNSUPPORTED_PLATFORM` | `ERR_UNSUPPORTED_PLATFORM` | Same reason. |
+| The config plugin | Raises the app to 17 | Raises the app to 17 | Touches no `build.gradle` | Raising to 26 would take iOS 17-25 devices away from every other Desert Ant model installed beside it. |
+| Downloads | Two: 0.7 MB + Apple's recognizer | n/a | n/a | Only the first is desert-ant-core's. `isDownloaded()` answers only the first. |
+| Progress | `loadingModel`, `transcribing` | n/a | n/a | Both fractions are real -- the catalog's bytes, Apple's `Progress`, and `result.range.end / durationSec`. Refinement itself reports nothing because `refine` takes no handler. |
+| Verified | **Binding and refusals only** | Not reachable to test | Not built | A simulator reports Apple's speech assets as `unsupported` and installs none, so no transcript was ever refined. See "Align, as far as a simulator can take it". |
 
 ## Constraints an app inherits
 
@@ -2097,6 +2389,41 @@ others in the `android/build.gradle` files that must move with
 `DESERT_ANT_CORE_VERSION`. Shapes' FFI payload is a point count and `f64` x/y
 pairs in, a present flag plus a kind tag and that kind's fields out — a wire
 schema like the rest, so a mismatched pair is a wire bug that builds cleanly.
+
+Align couples in two directions at once, and one of them is not to a version
+number at all.
+
+The first is ordinary: `DESERT_ANT_PRODUCTS` gains `'Align'`, and it is the one
+entry in that list that reaches desert-ant-core's manifest through
+`alignProducts` rather than `modelProducts` — being Apple-only, its target lives
+outside the `models` array. The line to check before adding it is therefore a
+different line than for Gist, Redact or Shapes: `products: products +
+modelProducts + alignProducts + vozProducts`, which does include it. It adds no
+Maven coordinate, because there is no Android half, and no `SWIFT_INCLUDE_PATHS`
+entry, because `alignTargets` depends only on `DesertAnt` and pulls no C module.
+
+The second has no version to pin, and that is the problem.
+`Sources/Align/Catalog.swift` sets `revision = "main"` — a **branch** — with
+upstream's own `// TODO: pin to a tagged revision once the align model repo is
+tagged` above it. Every other model in the catalog names a `v`-prefixed tag, and
+`Sources/Ear/Catalog.swift` says why in as many words: *"A branch means a push to
+the Hub silently changes what already-shipped SDKs download, which is the kind of
+change nobody is looking for when something starts behaving differently."*
+
+So Align is the one model here where the coupling that matters cannot be checked
+by reading two files. The weights an app downloads are whatever `main` pointed at
+the moment it ran, and nothing in the version graph moves when they change — not
+this package's version, not `DESERT_ANT_CORE_VERSION`, and not
+`AlignedTranscript.modelRevision`, which reads `main` either way. On disk the
+branch name is literally the cache directory: `…/desert-ant-labs/align/main/`.
+
+Two things follow. `Align.revisionIsPinned` is computed from
+`AlignModel.revision.hasPrefix("v")` rather than hardcoded, so it reports the
+situation today and flips on its own the day upstream tags the repo; the example
+app prints it on every launch and shows it in the UI. And an app that needs
+reproducibility should resolve the weights once, ship that directory, and pass it
+as `directory` to `load` so the download never runs — which is the same escape
+hatch every model here has, used for a reason no other model has.
 
 The other Tongue coupling is the one that is currently unsatisfiable:
 `DESERT_ANT_PRODUCTS` in the same podspec must gain `'Tongue'` the moment

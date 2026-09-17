@@ -1,4 +1,9 @@
 import {
+  Align,
+  timestampShift,
+  type AlignedTranscript,
+} from '@desert-ant-labs/react-native-align';
+import {
   Clear,
   DesertAntError,
   type ClearMetrics,
@@ -115,6 +120,7 @@ export default function App() {
   const gist = useRef<Gist | null>(null);
   const redact = useRef<Redact | null>(null);
   const shapes = useRef<Shapes | null>(null);
+  const align = useRef<Align | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -260,6 +266,25 @@ export default function App() {
   // milliseconds, which is small enough that the bridge hop is visible next to it.
   const [shapeMs, setShapeMs] = useState<number | null>(null);
 
+  // Align is 0.7 MB of Core ML, so its own weights load on mount like Shapes'.
+  // Apple's speech model for a locale is the *other* download and is much
+  // larger, so that one waits for a tap -- which is the asymmetry this model has
+  // and none of the others do, and the reason `alignState` and `localeState` are
+  // two states rather than one.
+  const [alignState, setAlignState] = useState<ModelState>(
+    Align.isSupported ? 'loading' : 'unsupported'
+  );
+  const [alignLocaleState, setAlignLocaleState] = useState<ModelState>('absent');
+  const [aligned, setAligned] = useState<AlignedTranscript | null>(null);
+  // Which file produced it, for the label on screen: the recording, the enhanced
+  // copy, or the speech sample dropped into the cache.
+  const [alignSource, setAlignSource] = useState<string | null>(null);
+  // Measured around the call as well as reported natively, for the same reason
+  // Ear's, Gist's, Redact's and Shapes' are -- and here the gap is larger than
+  // anywhere else, because `processingSec` includes Apple's recognition and
+  // `refineSec` is the only part of it Align is responsible for.
+  const [alignMs, setAlignMs] = useState<number | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -321,6 +346,17 @@ export default function App() {
         `revision=${Shapes.modelRevision} repo=${Shapes.modelRepo} ` +
         `minConfidence=${Shapes.defaultMinimumConfidence} kinds=${Shapes.kinds.join('/')}` +
         `${Shapes.unsupportedReason ? ` reason=${Shapes.unsupportedReason}` : ''}`
+    );
+    // `pinned=false` is the one line in this block that is a warning rather than
+    // a reading. Every other model here resolves a `v`-prefixed tag; Align
+    // resolves the branch `main`, so what a user downloads can change without any
+    // version number moving. Printed on every launch so it cannot be forgotten.
+    console.log(
+      `[align] isSupported=${Align.isSupported} nativeCore=${Align.nativeCoreVersion} ` +
+        `revision=${Align.modelRevision} pinned=${Align.revisionIsPinned} ` +
+        `repo=${Align.modelRepo} appleSpeech=${Align.isAppleSpeechAvailable} ` +
+        `maxBuffered=${Align.defaultMaxBufferedSeconds}` +
+        `${Align.unsupportedReason ? ` reason=${Align.unsupportedReason}` : ''}`
     );
   }, []);
 
@@ -415,6 +451,13 @@ export default function App() {
       // of a model whose whole point is that it answers while you draw.
       if (Shapes.isSupported) void prepareShapes();
 
+      // Align is 0.7 MB, so its own half loads on mount too. What does NOT load
+      // on mount is Apple's speech model for a locale -- that is the larger of
+      // Align's two downloads, it is managed by `AssetInventory` rather than by
+      // desert-ant-core, and pulling it unasked on first launch would be the same
+      // mistake as pulling Voz's 490 MB. The section below asks.
+      if (Align.isSupported) void prepareAlign();
+
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
       if (cancelled || !Voz.isSupported) return;
@@ -472,6 +515,8 @@ export default function App() {
       redact.current = null;
       shapes.current?.release();
       shapes.current = null;
+      align.current?.release();
+      align.current = null;
     };
   }, []);
 
@@ -1002,6 +1047,138 @@ export default function App() {
     if (points.length < 2) return;
     void runShapes(points, 'drawn');
   }, [runShapes]);
+
+  /**
+   * Get Align's own half ready: 0.7 MB of compiled Core ML in two cascade stages
+   * plus three sidecars.
+   *
+   * This is the download desert-ant-core manages, and it is the small one. It
+   * builds no session -- `SpeechTimestampRefiner` constructs its two stages per
+   * locale *and* per audio file, so there is nothing to hoist -- which is why
+   * this model has no "warming" cost to show and why `ready` here does not yet
+   * mean a transcript is possible.
+   */
+  const prepareAlign = useCallback(async () => {
+    if (align.current) return;
+    setAlignState('loading');
+    try {
+      const t0 = Date.now();
+      const model = await Align.load();
+      align.current = model;
+      setAlignState('ready');
+      console.log(
+        `[align] ready in ${Date.now() - t0}ms downloaded=${model.isDownloaded()} ` +
+          `languages=${model.supportedLanguages().join('/')} dir=${model.resolvedDirectory()}`
+      );
+    } catch (e) {
+      console.log(`[align] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setAlignState('absent');
+    }
+  }, []);
+
+  /**
+   * Install Apple's on-device speech model for `ALIGN_LOCALE`.
+   *
+   * Align's *other* download, and the reason this section has two buttons where
+   * every other section has one. Apple's recognizer weights are per-locale, live
+   * under `AssetInventory`, and are hundreds of megabytes -- so this behaves like
+   * Voz's and Clips' downloads rather than like Emo's: an explicit tap, a
+   * progress bar, and a state of its own.
+   */
+  const prepareAlignLocale = useCallback(async () => {
+    const model = align.current;
+    if (!model) return;
+    setError(null);
+    setAlignLocaleState('loading');
+    setBusy(`Installing the ${ALIGN_LOCALE} speech model`);
+    try {
+      const t0 = Date.now();
+      await model.prepareLocale(ALIGN_LOCALE, setProgress);
+      setAlignLocaleState('ready');
+      console.log(`[align] locale ${ALIGN_LOCALE} ready in ${Date.now() - t0}ms`);
+    } catch (e) {
+      console.log(`[align] prepareLocale FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setAlignLocaleState('absent');
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  }, []);
+
+  /**
+   * Transcribe one file with Apple's recognizer and refine every word boundary.
+   *
+   * The join is the interesting part and it happens at the end of this function.
+   * Align produces word spans; Uhm finds the fillers in the *same* audio; and
+   * `Uhm.reconcileWords` trims the one around the other so a cut lands on silence
+   * rather than through a word. That is three models over one recording, and it
+   * is the only place in this app where a timestamp is used for something where
+   * tens of milliseconds actually change the output.
+   *
+   * Note what is NOT here: Voz. Align cannot refine Voz's words, and that is
+   * upstream's shape rather than a gap in this app -- the two `refine` overloads
+   * that take an arbitrary `[WordTiming]` are `internal` to the `Align` module,
+   * so the only public entry point takes a `SpeechTranscriber.Result`. Align
+   * therefore *replaces* Voz as the word-timestamp source when you want refined
+   * ones; it does not sharpen Voz's.
+   */
+  const runAlign = useCallback(async (uri: string, source: string) => {
+    const model = align.current;
+    if (!model) return;
+    setError(null);
+    setAlignSource(source);
+    setBusy('Refining word timestamps');
+    try {
+      const t0 = Date.now();
+      const result = await model.transcribe({ uri, locale: ALIGN_LOCALE, onProgress: setProgress });
+      const waited = Date.now() - t0;
+      setAlignMs(waited);
+      setAligned(result);
+
+      const shift = timestampShift(result.words);
+      console.log(
+        `[align] ${source} ok in ${waited}ms — ${result.words.length} words, ` +
+          `${result.refinedWordCount} refined, ${result.durationSec.toFixed(2)}s ` +
+          `rtf=${result.realtimeFactor.toFixed(2)}x setup=${(result.setupSec * 1000).toFixed(0)}ms ` +
+          `refine=${(result.refineSec * 1000).toFixed(0)}ms revision=${result.modelRevision}`
+      );
+      console.log(`[align] text="${result.text}"`);
+      console.log(
+        `[align] shift: mean ${(shift.meanAbsSec * 1000).toFixed(1)}ms ` +
+          `max ${(shift.maxAbsSec * 1000).toFixed(1)}ms ` +
+          `start ${(shift.meanStartSec * 1000).toFixed(1)}ms ` +
+          `end ${(shift.meanEndSec * 1000).toFixed(1)}ms`
+      );
+      result.words.slice(0, 12).forEach((w) =>
+        console.log(
+          `[align]   ${w.text.padEnd(14)} ${w.originalStart.toFixed(3)}–${w.originalEnd.toFixed(3)}` +
+            ` -> ${w.start.toFixed(3)}–${w.end.toFixed(3)}` +
+            ` (${w.refined ? `${((w.start - w.originalStart) * 1000).toFixed(0)}ms / ` +
+              `${((w.end - w.originalEnd) * 1000).toFixed(0)}ms` : 'kept'})`
+        )
+      );
+
+      // The three-model chain, on one file: Align times the words, Uhm finds the
+      // fillers, `reconcileWords` puts the two together.
+      const detector = uhm.current;
+      if (detector && result.words.length > 0) {
+        const { fillers } = await detector.analyze({ uri });
+        const clean = Uhm.reconcileWords(result.words, fillers);
+        console.log(
+          `[align] + uhm: ${fillers.length} fillers over the same audio; ` +
+            `${result.words.length} words -> ${clean.length} after reconcileWords`
+        );
+      }
+    } catch (e) {
+      console.log(`[align] transcribe FAILED: ${describe(e)}`);
+      setError(describe(e));
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  }, []);
 
   /**
    * Name the language of whatever is in the Tongue field.
@@ -2616,6 +2793,237 @@ export default function App() {
       console.log(`[uhm] self-test FAILED: ${describe(e)}`);
     }
 
+    // --- Align. The leg with the most preconditions, and none of them are this
+    //     app's doing: it needs iOS 26, Align's own 0.7 MB, Apple's on-device
+    //     recognizer for the locale, and a file with actual speech in it. The
+    //     synthetic tone every other leg falls back to would produce an empty
+    //     transcript, which proves nothing about a *timestamp* refiner, so this
+    //     leg skips rather than pretending.
+    //
+    //     What it asserts is what can be asserted from a device: that the words
+    //     come back, that the two timings are both present and self-consistent,
+    //     that a word the refiner declined to move has identical spans, that the
+    //     spans stay ordered and inside the audio, and that a locale Align does
+    //     not refine is refused rather than silently passed through. It does NOT
+    //     assert how far anything moved -- upstream's 106.4 ms and 20.2 ms are
+    //     upstream's, measured on LibriSpeech against reference boundaries this
+    //     app does not have.
+    try {
+      const refiner = align.current;
+      const sample = new File(Paths.cache, ALIGN_SAMPLE);
+      if (!refiner) {
+        console.log('[align] self-test skipped — model not prepared');
+      } else {
+        // Everything down to the refusals runs without Apple's recognizer,
+        // because none of it reaches one: the language map comes out of a file
+        // this SDK downloaded, and every refusal below is raised before a native
+        // call is made. That split is what keeps this leg useful on a simulator,
+        // where the recognizer assets cannot be installed at all.
+        console.log(
+          `[align] languages=${refiner.supportedLanguages().join('/')} ` +
+            `downloaded=${refiner.isDownloaded()} dir=${refiner.resolvedDirectory()}`
+        );
+        const known = refiner.supportedLanguages();
+        if (!known.includes('en')) {
+          failures.push(`align: the downloaded config lists no 'en' (${known.join('/')})`);
+        }
+
+        for (const [what, options] of [
+          ['an empty locale', { uri: sample.uri, locale: '' }],
+          ['a language name for a locale', { uri: sample.uri, locale: 'english' }],
+          ['a locale Align does not refine', { uri: sample.uri, locale: 'cy-GB' }],
+          ['a zero buffer window', { uri: sample.uri, locale: ALIGN_LOCALE, maxBufferedSeconds: 0 }],
+          ['a NaN buffer window', { uri: sample.uri, locale: ALIGN_LOCALE, maxBufferedSeconds: NaN }],
+        ] as const) {
+          try {
+            await refiner.transcribe(options as never);
+            failures.push(`align: ${what} was accepted`);
+          } catch (e) {
+            const code = e instanceof DesertAntError ? e.code : 'unknown';
+            if (code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`align: ${what} raised ${code}`);
+            }
+          }
+        }
+        console.log(
+          "[align] refused an empty locale, 'english', an unrefined locale, and zero/NaN buffer windows"
+        );
+
+        // Everything past here needs Apple's recognizer. A simulator does not
+        // have one and cannot install one -- `AssetInventory.status` answers
+        // `unsupported` -- so `transcribe` comes back ERR_MODEL_UNAVAILABLE.
+        // That is a skip rather than a failure, and asserting the *code* is
+        // itself worth something: it proves the native path was reached and the
+        // missing-recognizer case was classified rather than surfacing as an
+        // inference error.
+        if (!sample.exists) {
+          console.log(
+            `[align] transcription skipped — no ${ALIGN_SAMPLE} in the cache. A timestamp ` +
+              'refiner needs speech; the synthetic tone the other legs use has no words to time.'
+          );
+        } else if (alignLocaleState !== 'ready') {
+          try {
+            await refiner.transcribe({ uri: sample.uri, locale: ALIGN_LOCALE });
+            failures.push('align: transcribe succeeded without a prepared locale, unexpectedly');
+          } catch (e) {
+            const code = e instanceof DesertAntError ? e.code : 'unknown';
+            console.log(
+              `[align] transcription skipped — Apple's ${ALIGN_LOCALE} recognizer is not ` +
+                `installed (${code}): ${describe(e)}`
+            );
+            if (code !== 'ERR_MODEL_UNAVAILABLE') {
+              failures.push(`align: a missing recognizer raised ${code}, not ERR_MODEL_UNAVAILABLE`);
+            }
+          }
+        } else {
+
+        const t8 = Date.now();
+        const result = await refiner.transcribe({ uri: sample.uri, locale: ALIGN_LOCALE });
+        const waited = Date.now() - t8;
+        const shift = timestampShift(result.words);
+        console.log(
+          `[align] transcribe ok in ${waited}ms — ${result.words.length} words, ` +
+            `${result.refinedWordCount} refined, ${result.durationSec.toFixed(2)}s ` +
+            `rtf=${result.realtimeFactor.toFixed(2)}x ` +
+            `setup=${(result.setupSec * 1000).toFixed(0)}ms ` +
+            `refine=${(result.refineSec * 1000).toFixed(0)}ms ` +
+            `locale=${result.locale} refinedLanguage=${result.languageRefined} ` +
+            `revision=${result.modelRevision}`
+        );
+        console.log(`[align] text="${result.text}"`);
+        console.log(
+          `[align] shift: mean ${(shift.meanAbsSec * 1000).toFixed(1)}ms ` +
+            `max ${(shift.maxAbsSec * 1000).toFixed(1)}ms ` +
+            `start ${(shift.meanStartSec * 1000).toFixed(1)}ms ` +
+            `end ${(shift.meanEndSec * 1000).toFixed(1)}ms ` +
+            `(${shift.refinedCount}/${shift.wordCount} moved)`
+        );
+        result.words.slice(0, 12).forEach((w) =>
+          console.log(
+            `[align]   ${w.text.padEnd(14)} ` +
+              `${w.originalStart.toFixed(3)}–${w.originalEnd.toFixed(3)} -> ` +
+              `${w.start.toFixed(3)}–${w.end.toFixed(3)} ` +
+              (w.refined
+                ? `(${((w.start - w.originalStart) * 1000).toFixed(0)}ms / ` +
+                  `${((w.end - w.originalEnd) * 1000).toFixed(0)}ms)`
+                : '(kept)')
+          )
+        );
+
+        if (result.words.length === 0) {
+          failures.push('align: the recognizer produced no words from the speech sample');
+        }
+        if (!result.languageRefined) {
+          failures.push(`align: ${ALIGN_LOCALE} came back unrefined`);
+        }
+        // Ordered, non-inverted, and inside the audio -- on both timelines, since
+        // a correction that broke one and not the other would be invisible in a
+        // check of either alone.
+        const ordered = result.words.every(
+          (w, i) =>
+            w.end >= w.start &&
+            w.originalEnd >= w.originalStart &&
+            (i === 0 || w.start >= result.words[i - 1]!.start)
+        );
+        const inside = result.words.every(
+          (w) => w.start >= 0 && w.end <= result.durationSec + 0.5
+        );
+        // The documented contract of `refined: false`: upstream keeps Apple's
+        // span verbatim, so the two timelines must be identical for those words.
+        const keptIsIdentical = result.words.every(
+          (w) => w.refined || (w.start === w.originalStart && w.end === w.originalEnd)
+        );
+        // And the converse, which is the one that would catch a silent
+        // passthrough being reported as a refinement.
+        const refinedActuallyMoved = result.words.every(
+          (w) => !w.refined || w.start !== w.originalStart || w.end !== w.originalEnd
+        );
+        console.log(
+          `[align] ordered=${ordered} insideAudio=${inside} ` +
+            `keptIsIdentical=${keptIsIdentical} refinedActuallyMoved=${refinedActuallyMoved}`
+        );
+        if (!ordered) failures.push('align: word spans are not monotonic');
+        if (!inside) failures.push('align: a word span falls outside the audio');
+        if (!keptIsIdentical) {
+          failures.push('align: a word marked unrefined has a different span than the original');
+        }
+
+        // `allowUnrefined` is the escape hatch, and what it must produce is a
+        // transcript that is honest about being unrefined rather than one that
+        // looks the same as a refined one.
+        //
+        // Welsh is the right probe: Apple may or may not have a recognizer for
+        // it, and Align certainly has no language id for it. If the assets are
+        // missing this throws ERR_MODEL_UNAVAILABLE, which is a different and
+        // equally correct answer -- so both are accepted and the one that
+        // happened is logged.
+        try {
+          const unrefined = await refiner.transcribe({
+            uri: sample.uri,
+            locale: 'cy-GB',
+            allowUnrefined: true,
+          });
+          console.log(
+            `[align] allowUnrefined cy-GB -> languageRefined=${unrefined.languageRefined} ` +
+              `refinedWordCount=${unrefined.refinedWordCount} words=${unrefined.words.length}`
+          );
+          if (unrefined.languageRefined || unrefined.refinedWordCount > 0) {
+            failures.push('align: an unrefined language reported refinements');
+          }
+        } catch (e) {
+          const code = e instanceof DesertAntError ? e.code : 'unknown';
+          console.log(`[align] allowUnrefined cy-GB -> ${code} (no Apple recognizer for it)`);
+          if (code !== 'ERR_MODEL_UNAVAILABLE') {
+            failures.push(`align: allowUnrefined raised ${code}`);
+          }
+        }
+
+        // The three-model chain, on one file. Align times the words, Uhm finds
+        // the fillers in the same audio, and `reconcileWords` trims the one
+        // around the other -- which is the only place in this app where tens of
+        // milliseconds change an output rather than a number on screen.
+        const detector = uhm.current;
+        if (!detector) {
+          console.log('[align] + uhm skipped — Uhm not prepared');
+        } else if (result.words.length === 0) {
+          console.log('[align] + uhm skipped — no words to reconcile');
+        } else {
+          const { fillers } = await detector.analyze({ uri: sample.uri });
+          const clean = Uhm.reconcileWords(result.words, fillers);
+          const fromApple = Uhm.reconcileWords(
+            result.words.map((w) => ({
+              text: w.text,
+              start: w.originalStart,
+              end: w.originalEnd,
+            })),
+            fillers
+          );
+          console.log(
+            `[align] + uhm: ${fillers.length} fillers over the same audio; ` +
+              `${result.words.length} words -> ${clean.length} reconciled ` +
+              `(Apple's own timings -> ${fromApple.length})`
+          );
+          // Not asserted as an improvement -- there is no ground truth here to
+          // say which count is better. What IS asserted is that the join runs on
+          // Align's output at all, which is the integration this leg is for.
+          const reconciledOrdered = clean.every(
+            (w, i) => w.end >= w.start && (i === 0 || w.start >= clean[i - 1]!.start)
+          );
+          if (!reconciledOrdered) {
+            failures.push('align: reconcileWords returned spans out of order');
+          }
+        }
+
+        setAligned(result);
+        setAlignMs(waited);
+        setAlignSource(ALIGN_SAMPLE);
+        }
+      }
+    } catch (e) {
+      failures.push(`align: ${describe(e)}`);
+      console.log(`[align] self-test FAILED: ${describe(e)}`);
+    }
+
     // --- Clear: file in, file out (the primary API), then the in-memory one.
     try {
       const model = clear.current ?? Clear.create();
@@ -2759,11 +3167,13 @@ export default function App() {
     if (failures.length > 0) setError(failures.join('\n'));
     setBusy(null);
     setProgress(null);
-    // `transcript` is the one piece of state this closure reads rather than
-    // reaching for through a ref, because the Redact leg masks the transcript Voz
-    // produced when there is one. Every other leg works from a ref, a constant or
-    // a file it writes itself, which is what keeps the dependency list to one.
-  }, [transcript]);
+    // `transcript` and `alignLocaleState` are the two pieces of state this
+    // closure reads rather than reaching for through a ref. The Redact leg masks
+    // the transcript Voz produced when there is one; the Align leg has to know
+    // whether Apple's per-locale speech model was installed, which is not
+    // something any model object can be asked. Every other leg works from a ref,
+    // a constant or a file it writes itself.
+  }, [transcript, alignLocaleState]);
 
   const audioToTranscribe = enhancedUri ?? originalUri;
 
@@ -3790,6 +4200,137 @@ export default function App() {
           </>
         ) : null}
       </View>
+
+      <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Align</Text>
+
+        {alignState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Align.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {alignState === 'loading' ? (
+          <Text style={styles.note}>Preparing — 0.7 MB, so this is usually over already.</Text>
+        ) : null}
+
+        {alignState === 'absent' ? (
+          <Button
+            label="Prepare Align (0.7 MB)"
+            onPress={() => void prepareAlign()}
+            disabled={busy !== null}
+            tone="ghost"
+          />
+        ) : null}
+
+        {alignState === 'ready' ? (
+          <>
+            <Text style={styles.note}>
+              The one model here that does not answer a question. Apple&apos;s
+              SpeechAnalyzer transcribes well and times loosely; Align takes the
+              same words and moves the boundaries, by tens of milliseconds. The
+              text never changes. Both timings come back, so the shift is
+              measurable on your own audio rather than taken on trust.
+            </Text>
+            {/* The pinned-revision warning, on screen rather than only in the
+                log. This is the only model in the app whose weights can change
+                under a shipped build. */}
+            {!Align.revisionIsPinned ? (
+              <Text style={styles.note}>
+                Weights resolve “{Align.modelRevision}” — a branch, not a tag. A push to the Hub changes what an already-shipped
+                app downloads, with no version number moving. Ship the directory
+                yourself if that matters.
+              </Text>
+            ) : null}
+
+            {alignLocaleState !== 'ready' ? (
+              <>
+                <Text style={styles.note}>
+                  Align needs Apple&apos;s on-device recognizer for the locale as
+                  well as its own weights, and that is the larger of the two
+                  downloads. It is not pulled on launch.
+                </Text>
+                <Button
+                  label={
+                    alignLocaleState === 'loading'
+                      ? `Installing ${ALIGN_LOCALE}…`
+                      : `Install the ${ALIGN_LOCALE} speech model`
+                  }
+                  onPress={() => void prepareAlignLocale()}
+                  disabled={busy !== null || alignLocaleState === 'loading'}
+                  tone="ghost"
+                />
+              </>
+            ) : null}
+
+            {alignLocaleState === 'ready' ? (
+              <>
+                <Button
+                  label="Refine the speech sample"
+                  onPress={() => void runAlign(new File(Paths.cache, ALIGN_SAMPLE).uri, ALIGN_SAMPLE)}
+                  disabled={busy !== null}
+                  tone="ghost"
+                />
+                {(enhancedUri ?? originalUri) ? (
+                  <Button
+                    label={enhancedUri ? 'Refine the enhanced recording' : 'Refine the recording'}
+                    onPress={() => void runAlign((enhancedUri ?? originalUri)!, enhancedUri ? 'enhanced' : 'recording')}
+                    disabled={busy !== null}
+                    tone="ghost"
+                  />
+                ) : null}
+              </>
+            ) : null}
+          </>
+        ) : null}
+
+        {aligned ? (
+          <>
+            <Text style={styles.transcript}>
+              {aligned.text.length > 0 ? aligned.text : '(nothing recognized)'}
+            </Text>
+            <Row label="Source" value={alignSource ?? '—'} />
+            <Row label="Words" value={`${aligned.words.length}`} />
+            <Row
+              label="Refined"
+              value={`${aligned.refinedWordCount} / ${aligned.words.length}`}
+            />
+            <Row
+              label="Mean shift"
+              value={`${(timestampShift(aligned.words).meanAbsSec * 1000).toFixed(1)} ms`}
+            />
+            <Row
+              label="Max shift"
+              value={`${(timestampShift(aligned.words).maxAbsSec * 1000).toFixed(1)} ms`}
+            />
+            {/* Three numbers, not one, because they belong to different vendors.
+                "Waited" is the whole call, most of which is Apple recognizing;
+                "Refine" is the only part Align is responsible for; "Setup" is the
+                per-call cost of building the two cascade stages. */}
+            <Row label="Refine" value={`${(aligned.refineSec * 1000).toFixed(0)} ms`} />
+            <Row label="Setup" value={`${(aligned.setupSec * 1000).toFixed(0)} ms`} />
+            <Row label="Waited" value={alignMs === null ? '—' : `${alignMs} ms`} />
+            <Row label="Language refined" value={aligned.languageRefined ? 'yes' : 'NO'} />
+            <Row label="Revision" value={aligned.modelRevision ?? '—'} />
+            {aligned.words.length > 0 ? (
+              <View style={styles.words}>
+                {aligned.words.slice(0, 16).map((word, index) => (
+                  <View key={`${index}-${word.text}`} style={styles.filler}>
+                    <Text style={styles.wordText}>{word.text}</Text>
+                    {/* Apple's span above, Align's below -- the two numbers this
+                        model exists to put next to each other. */}
+                    <Text style={styles.wordTime}>
+                      {word.refined
+                        ? `${(word.originalStart * 1000).toFixed(0)} → ${(word.start * 1000).toFixed(0)} ms`
+                        : 'kept'}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+          </>
+        ) : null}
+      </View>
     </ScrollView>
   );
 }
@@ -3861,6 +4402,27 @@ function Fit({ shape }: { shape: FittedShape }) {
  * translations should rank the same emoji. That is the claim that separates this
  * model from a keyword table, and it is cheap to check by tapping.
  */
+/**
+ * The locale this app asks Align for.
+ *
+ * One rather than a picker, and hardcoded rather than derived from the device:
+ * Apple's speech model is a per-locale download of hundreds of megabytes, so a
+ * demo that let you pick would mostly be a demo of downloading. `en-US` is the
+ * language the speech samples in this app are in.
+ */
+const ALIGN_LOCALE = 'en-US';
+
+/**
+ * The speech file Align is pointed at.
+ *
+ * Deliberately the *same* file Uhm analyzes, rather than one of its own. That is
+ * what makes the three-model join real: Align times the words in this audio, Uhm
+ * finds the fillers in this audio, and `Uhm.reconcileWords` puts the two
+ * together. Two models over two different recordings would prove nothing about
+ * either.
+ */
+const ALIGN_SAMPLE = 'uhm-sample.wav';
+
 const SAMPLE_PHRASES = [
   'Pay my bills',
   'Pagar mis facturas',

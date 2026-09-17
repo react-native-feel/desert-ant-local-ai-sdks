@@ -31,7 +31,8 @@
       "@desert-ant-labs/react-native-tongue",
       "@desert-ant-labs/react-native-gist",
       "@desert-ant-labs/react-native-redact",
-      "@desert-ant-labs/react-native-shapes"
+      "@desert-ant-labs/react-native-shapes",
+      "@desert-ant-labs/react-native-align"
     ],
     "scheme": "clearexample"
   }

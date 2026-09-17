@@ -10,6 +10,7 @@
     "android": "expo run:android"
   },
   "dependencies": {
+    "@desert-ant-labs/react-native-align": "0.1.0",
     "@desert-ant-labs/react-native-clear": "0.1.0",
     "@desert-ant-labs/react-native-clips": "0.1.0",
     "@desert-ant-labs/react-native-ear": "0.1.0",

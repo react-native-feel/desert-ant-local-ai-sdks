@@ -5,7 +5,7 @@ on-device models. Desert Ant ships Swift, Kotlin and JavaScript/WebAssembly SDKs
 from [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core); this
 repository is the React Native one they do not.
 
-Ten models so far. Five of them compose into one pipeline: **Clear** cleans a
+Eleven models so far. Five of them compose into one pipeline: **Clear** cleans a
 recording up — denoise, dereverb, loudness-normalize — **Ear** names the language
 it is in, **Voz** reads it back as a transcript with word-level timestamps,
 **Clips** picks the moments worth cutting, and **Uhm** finds every "um" in the
@@ -17,8 +17,11 @@ post and names what it is *about*, from a fixed 36-topic taxonomy across 101
 languages, and **Redact** finds the people in a piece of text and masks them,
 reversibly, before it goes anywhere. The tenth reads neither sound nor words:
 **Shapes** takes one hand-drawn stroke and gives back a clean line, rectangle,
-triangle, ellipse or star — or nothing, when what was drawn was not a shape.
-Entirely offline.
+triangle, ellipse or star — or nothing, when what was drawn was not a shape. And
+the eleventh answers no question at all: **Align** takes the transcript Apple's
+own `SpeechAnalyzer` produced and moves its word boundaries, by tens of
+milliseconds, so a caption highlights the word you are hearing and a cut lands
+between two of them. Entirely offline.
 
 ```ts
 import { Clear } from '@desert-ant-labs/react-native-clear';
@@ -31,6 +34,7 @@ import { Tongue } from '@desert-ant-labs/react-native-tongue';
 import { Gist, channelTopics } from '@desert-ant-labs/react-native-gist';
 import { Redact, restore } from '@desert-ant-labs/react-native-redact';
 import { Shapes, outline } from '@desert-ant-labs/react-native-shapes';
+import { Align, timestampShift } from '@desert-ant-labs/react-native-align';
 
 const { uri } = await (await Clear.load()).enhance({ uri: recording.uri });
 
@@ -70,6 +74,15 @@ const { shape } = await (await Shapes.load()).recognize(strokePoints);
 // shape -> { kind: 'ellipse', center: {...}, semiMajor: 72.3, semiMinor: 72.3 }
 //          semiMajor === semiMinor: a wobbly loop snapped to an exact circle
 outline(shape);   // the polyline to draw. No model, no bridge hop.
+
+const align = await Align.load();              // 0.7 MB
+await align.prepareLocale('en-US');            // Apple's recognizer — the big half
+const refined = await align.transcribe({ uri, locale: 'en-US' });
+refined.words[0];
+// { text: 'so', start: 0.31, end: 0.47, originalStart: 0.28, originalEnd: 0.52,
+//   refined: true }   — Apple's numbers and Align's, side by side
+timestampShift(refined.words).meanAbsSec;      // how far they disagreed, on YOUR audio
+Uhm.reconcileWords(refined.words, fillers);    // now the cut lands on silence
 ```
 
 Ear sits ahead of Voz rather than beside it, and that is the point of it: Voz does
@@ -135,6 +148,20 @@ residual gates. So a scribble comes back as nothing — which is half the produc
 because a whiteboard that turns a scribble into a triangle is worse than one that
 leaves it alone.
 
+Align is the odd one out in a way none of the others are: it does not answer a
+question, it corrects an answer. Apple's `SpeechAnalyzer` transcribes well and
+times loosely — upstream measures its mean word-boundary error at 106.4 ms — and
+Align takes the same words, unchanged, and moves the numbers on them to a measured
+20.2 ms on LibriSpeech test-clean. Tens of milliseconds is the whole product,
+which is also why it is the only model here that hands back **both** timelines: a
+result carrying only the corrected span would be indistinguishable from Apple's
+output with a flag bolted on, so `timestampShift` lets an app measure the
+difference on its own audio rather than take a benchmark's word for it. It is also
+the only model with **two** downloads — its own 0.7 MB, and Apple's per-locale
+recognizer, which is hundreds of megabytes and is not Desert Ant's to ship. And it
+is the only one that resolves a **branch** rather than a tag, which is a real risk
+a consumer inherits; `Align.revisionIsPinned` reports it rather than hiding it.
+
 ## Packages
 
 | Package | What it is |
@@ -149,15 +176,16 @@ leaves it alone.
 | [`@desert-ant-labs/react-native-gist`](packages/gist) | The Gist model: text in, ranked topics from a fixed 36-topic taxonomy out, 101 languages. Plus a channel roll-up that needs no model. iOS + Android. |
 | [`@desert-ant-labs/react-native-redact`](packages/redact) | The Redact model: text in, the same text with every person masked by a numbered placeholder out — plus the mapping to put them back. 27 languages. iOS + Android. |
 | [`@desert-ant-labs/react-native-shapes`](packages/shapes) | The Shapes model: one hand-drawn stroke in, a clean line, rectangle, triangle, ellipse or star out — snapped to circles, squares and axes. 0.2 MB. iOS + Android. |
+| [`@desert-ant-labs/react-native-align`](packages/align) | The Align model: an audio file in, Apple's transcript out with word boundaries refined to the word — and Apple's original timings beside them. 0.7 MB. **iOS 26+ only.** |
 | [`@desert-ant-labs/react-native-core`](packages/core) | Types, error codes and lifecycle contracts shared by every model SDK here — and the single native bridge to the `desert-ant-core` Swift package. |
-| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue, Gist and Redact — a roll-up of what the sample transcript is about, and the same transcript with its people masked — and a canvas you draw one stroke on for Shapes. A dev build. |
+| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue, Gist and Redact — a roll-up of what the sample transcript is about, and the same transcript with its people masked — a canvas you draw one stroke on for Shapes, and an Align section that refines the word timestamps in a speech sample and shows Apple's numbers next to Align's. A dev build. |
 
 ## How it is built
 
 The native work is **not** a reimplementation. Each package is a thin Expo module
 over Desert Ant's own platform SDKs:
 
-- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Gist`, `Redact` and `Shapes` products of the `desert-ant-core`
+- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Gist`, `Redact`, `Shapes` and `Align` products of the `desert-ant-core`
   Swift package, pulled in through React Native's `spm_dependency` bridge — that
   package ships as SPM only, with no podspec and no XCFramework. The bridge is
   declared exactly once, by the `DesertAntCore` pod, because two pods each
@@ -173,6 +201,13 @@ over Desert Ant's own platform SDKs:
   swift-numerics. Any `desert-ant-core` product that depends on swift-numerics
   needs that include path, which is now a rule rather than an incident: Shapes'
   pod was written with the line already in it and built on the first attempt.
+  **Align is the case that proves the rule is a rule and not a habit** — its
+  target declaration is `.target(name: "Align", dependencies: [.byName(name:
+  "DesertAnt")])` and nothing else, so it needs no such line and does not have
+  one. It is also the only product in that list that does not reach
+  `desert-ant-core`'s manifest through `modelProducts`: being Apple-only it lives
+  outside the `models` array in its own `alignProducts`, which the `products:`
+  sum does include — the same sum `tongueProducts` is missing from.
   **Tongue is
   the one model not in that list**, and not by choice: desert-ant-core v3.1.0
   declares a `Tongue` product and never adds it to the manifest's `products:`
@@ -195,9 +230,13 @@ over Desert Ant's own platform SDKs:
   Android half: **Voz**
   drives Core ML directly and
   upstream ships no artifact for it at all, **Clips** has LiteRT files declared
-  but no published Android package to bind to yet, and **Uhm** has neither half —
+  but no published Android package to bind to yet, **Uhm** has neither half —
   no LiteRT export of the detector, and a type labeller that is a SoundAnalysis
-  classifier and so Apple-only by construction.
+  classifier and so Apple-only by construction — and **Align** is Apple-only by
+  design rather than by omission: upstream's manifest records its Kotlin and
+  JavaScript SDKs as `none`, and `Package.swift` keeps its target outside the
+  `models` array so it gets no Android, Node or Web products at all. `packages/align`
+  has no `android/` directory.
 
 The Apple half is written against the **Expo Modules 2.0** macros (`@ExpoModule`,
 `@JS`, `@SharedObject`, `@Record`, `@Event`), which ship for Swift in
@@ -270,7 +309,22 @@ legs came back **exactly equilateral**, a five-pointed star came back with
 having. The same stroke twice gave byte-identical geometry; the same stroke
 translated and scaled ×1.7 gave the same class both times. Its Android half is the
 third in this repo that has not been compiled, for the same reason as Gist's and
-Redact's. Each package's
+Redact's. Align is the eleventh pod in the same app, and it is the one model here
+whose central claim is **not** verified: its 0.7 MB downloads (672,560 bytes in 13
+files), the module binds, every property reads, the nine languages come off the
+downloaded `refiner_config.json` rather than out of TypeScript, and all five
+argument refusals fire — but **no transcript has ever been refined**, because
+refining one needs Apple's on-device recognizer and a simulator cannot install it.
+Measured rather than assumed: `SpeechTranscriber.isAvailable` is false,
+`AssetInventory.status` answers `unsupported`, `installedLocales` is empty, and
+the installation request throws `SFSpeechErrorDomain Code=1` even after a
+successful `reserve`. Two real ordering bugs were found and fixed against the
+device on the way to that answer — Apple's assets must be reserved before they can
+be asked about, and reserved under the identifier
+`SpeechTranscriber.supportedLocale(equivalentTo:)` returns rather than the one the
+caller passed. So no latency, no word count and no boundary movement is quoted
+anywhere for Align; upstream's 106.4 ms → 20.2 ms is attributed to upstream. Each
+package's
 README says exactly what was and was not exercised.
 
 ## Requirements
@@ -279,7 +333,7 @@ README says exactly what was and was not exercised.
 | --- | --- |
 | Expo SDK | 57+ (`expo-modules-core` 57 is where the 2.0 macros live) |
 | React Native | 0.75+ for `spm_dependency`; 0.83 in the example |
-| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue, Gist, Redact or Shapes alone |
+| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue, Gist, Redact, Shapes or Align alone. **Align itself needs iOS 26 at runtime** — `SpeechAnalyzer` is iOS 26 — but its pod builds at 17 and reports `isSupported: false` below 26, so installing it does not raise anyone else's floor |
 | Xcode | 26 (`desert-ant-core` is `swift-tools-version: 6.2`) |
 | Android | API 24+; `arm64-v8a` and `x86_64` only for Clear, Emo, Ear, Gist, Redact and Shapes — Tongue needs no native library and runs on any ABI |
 | Expo Go | Not supported — these are native modules, so use a dev build |
@@ -289,9 +343,13 @@ Clear's, Emo's, Ear's, Gist's, Redact's and Shapes' also narrow the Android ABIs
 to the two LiteRT ships — so add
 whichever packages you use to `plugins` in your app config. The plugins only ever
 raise, and the six that touch `build.gradle` defer to each other's block, so they
-compose (there is a test that asserts it over all 720 orderings). Tongue's touches `build.gradle` not at all, deliberately: it has no
-native library, so narrowing an app's ABIs on its behalf would take away devices
-it can serve.
+compose (there is a test that asserts it over all 720 orderings). Tongue's and
+Align's touch `build.gradle` not at all, deliberately: Tongue has no native
+library, so narrowing an app's ABIs on its behalf would take away devices it can
+serve, and Align has no Android half to narrow. Align's plugin also declines to
+raise iOS past 17 even though the model needs 26, for the same reason: an app is
+given one deployment target, and taking it to 26 would cost every other installed
+model its iOS 17–25 devices.
 
 ## Develop
 

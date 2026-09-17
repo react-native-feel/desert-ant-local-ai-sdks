@@ -43,13 +43,24 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # this is code size, not hundreds of megabytes. Adding a model to the family
 # means adding it here.
 #
-# `Gist`, `Redact` and `Shapes`, the three added last, are the cases that prove
-# the rule Tongue's absence states: each is a member of the `models` array in
+# `Gist`, `Redact` and `Shapes` are the cases that prove the rule Tongue's
+# absence states: each is a member of the `models` array in
 # desert-ant-core's Package.swift, so each reaches the manifest through
 # `modelProducts` -- which is literally `models.flatMap { ... }` -- and
 # `products: products + modelProducts + alignProducts + vozProducts` does include
 # that. Checked against those two lines before any of the three pods was written,
 # because the failure mode is the build rather than the import.
+#
+# `Align`, added last, is the one product in this list that does NOT reach the
+# manifest through `modelProducts`, and it is worth saying so because the check to
+# run on it is a different line. Align is Apple-only (Core ML, Speech,
+# AVFoundation) and so lives outside desert-ant-core's `models` array entirely --
+# Package.swift says as much above it: "it gets no Android/Node/Web products and
+# no NativeBindings" -- in its own `alignProducts`, alongside `vozProducts`. What
+# makes it safe to name here is that `products:` reads
+# `products + modelProducts + alignProducts + vozProducts`, and `alignProducts` is
+# in that sum. Read at Package.swift line 546 before the pod was written, because
+# the failure mode is the build rather than the import.
 #
 # `Tongue` is deliberately NOT in this list, and it is the one model in the
 # family that is missing from it. desert-ant-core v3.1.0 declares the product --
@@ -69,7 +80,7 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # When upstream adds those two words, adding `'Tongue'` here is the whole change
 # on this side: `packages/tongue/ios` is already written against the module and
 # guarded by `#if canImport(Tongue)`, so it lights up on its own.
-DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear', 'Gist', 'Redact', 'Shapes'].freeze
+DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear', 'Gist', 'Redact', 'Shapes', 'Align'].freeze
 
 Pod::Spec.new do |s|
   s.name           = 'DesertAntCore'
