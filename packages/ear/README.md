@@ -254,7 +254,12 @@ upstream measures ~250 ms on device. The number is stable across every call
 above, including the two-second synthetic clip, which is consistent with a fixed
 encoder cost rather than one that scales with the audio.
 
-**Android compiles but has not been run** — no device was available.
+**Android has not been compiled**, let alone run. The machine this was developed
+on has no Android SDK — `ANDROID_HOME` points at a directory that does not exist,
+and there is no `sdkmanager` or `gradle`. An earlier version of this file claimed
+it compiled; that was never verified, and saying so is more useful than repeating
+it. The Kotlin half is written against the same DSL as Clear's and Emo's, and it
+is the first thing to check before trusting this package on Android.
 
 ### One crash found and fixed, and one found and not
 

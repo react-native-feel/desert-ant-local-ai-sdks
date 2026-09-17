@@ -324,8 +324,7 @@ was available for the half that does bind. What is verified is that the seventh
 pod builds and links into an app that already carries six, that the module
 registers and every `@JS` property reads, and that the refusal reaches JavaScript
 as a sentence naming the cause — the example app's self-test still ends with all
-prepared models passing. Android compiles but
-has not been run — no device was available. Gist is verified end to end on a
+prepared models passing. Gist is verified end to end on a
 simulator as the eighth pod in the same app: it downloads ~74 MB and builds a
 Core ML session in 65.3 s, tags one headline in English, Spanish, German and
 Japanese with the same two or three topics and no language passed in, answers a
@@ -346,11 +345,7 @@ recorded rather than smoothed over. Two sentences that should come back untouche
 do. Two upstream behaviours are worth reporting and are written up: a
 checksum-validated `IP_ADDRESS` can lose to the address post-processing and leave
 three of its four octets in the text, and a label the deterministic layer owns can
-arrive with a sub-1 confidence — so neither field reads as provenance. Gist's and
-Redact's Android halves are the two in this repo that have **not even been
-compiled** — there is no usable Android SDK on the machine this was built on, and
-the older packages' "Android compiles but has not been run" is itself an
-unverified claim that is being corrected separately. Shapes is verified end to end
+arrive with a sub-1 confidence — so neither field reads as provenance. Shapes is verified end to end
 on a simulator as the tenth pod in the same app, and it is the fastest and
 smallest thing here: 0.2 MB of weights, and six synthetic hand-drawn strokes
 recognized at **min 1.0 ms, median 2.0 ms, max 9.7 ms** natively — the maximum
@@ -360,9 +355,7 @@ being the first inference after the session was built. A wobbly loop came back a
 legs came back **exactly equilateral**, a five-pointed star came back with
 `pointCount: 5`, and a scribble came back as **nothing**, which is the half worth
 having. The same stroke twice gave byte-identical geometry; the same stroke
-translated and scaled ×1.7 gave the same class both times. Its Android half is the
-third in this repo that has not been compiled, for the same reason as Gist's and
-Redact's. Align is the eleventh pod in the same app, and it is the one model here
+translated and scaled ×1.7 gave the same class both times. Align is the eleventh pod in the same app, and it is the one model here
 whose central claim is **not** verified: its 0.7 MB downloads (672,560 bytes in 13
 files), the module binds, every property reads, the nine languages come off the
 downloaded `refiner_config.json` rather than out of TypeScript, and all five
@@ -395,9 +388,17 @@ and Xcode 26.4.1 mentions `enabledTraits` only inside PackageDescription's own
 `.swiftinterface`. Even with the trait it would not have run here: MLX is Metal on
 Apple silicon and a simulator is not that. So no latency, no card and no quality
 figure is quoted for Title anywhere; upstream's 213 ms / 55 ms Core ML-versus-MLX
-numbers are attributed to upstream. Each
-package's
+numbers are attributed to upstream. Each package's
 README says exactly what was and was not exercised.
+
+**No Android half in this repo has been compiled**, and nothing here has been run
+on an Android device. The machine this was built on has no Android SDK at all —
+`ANDROID_HOME` points at a directory that does not exist, and there is no
+`sdkmanager` or `gradle` — so the Kotlin halves of Clear, Emo, Ear, Gist, Redact,
+Shapes and Tongue are written and reviewed, and nothing more than that. Clear's,
+Emo's and Ear's READMEs previously said they "compiled as written"; that was never
+verified here, and the claim has been corrected in all three rather than repeated.
+Building them is the first thing to do before trusting any of this on Android.
 
 ## Requirements
 

@@ -238,8 +238,12 @@ with any `suggest` failure it did not cause.
 
 ### Not verified
 
-- **Android.** Compiles as written against the same DSL as Clear's Android half,
-  but no `prebuild --platform android` has been run and no device was available.
+- **Android — not compiled.** Written against the same DSL as Clear's Android
+  half, but no `prebuild --platform android` has been run, and it could not be:
+  the machine this was developed on has no Android SDK (`ANDROID_HOME` points at
+  a directory that does not exist; no `sdkmanager`, no `gradle`). An earlier
+  version of this file said it "compiles as written" — that was never verified,
+  and is corrected here.
 - **Real-device latency.** A simulator has no Neural Engine, so the numbers above
   are the CPU path.
 

@@ -98,8 +98,13 @@ round-tripped 96,000 samples, and a live microphone recording (`.m4a`, 82 KB)
 came back enhanced at 15.4x realtime. The example app's **Run self-test** button
 reproduces the first two without a microphone or a permission dialog.
 
-**Android is unverified.** It compiles as written, but no Android device or
-emulator was available to run it. Treat it as untested until you do.
+**Android is unverified, and unbuilt.** The Kotlin half is written against the
+same Expo Modules DSL as the rest of this repo, but it has not been compiled: the
+machine this was developed on has no Android SDK (`ANDROID_HOME` points at a
+directory that does not exist, and there is no `sdkmanager` or `gradle`). An
+earlier version of this file said it "compiles as written"; that was never
+verified here, and it is corrected rather than repeated. Treat the Android half
+as unbuilt and untested until you build it yourself.
 
 ## Platform notes
 
