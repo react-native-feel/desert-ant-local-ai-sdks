@@ -1,0 +1,37 @@
+plugins {
+  id 'com.android.library'
+  id 'expo-module-gradle-plugin'
+}
+
+group = 'ai.desertant.rn'
+version = '0.1.0'
+
+android {
+  namespace 'ai.desertant.rn.tongue'
+  defaultConfig {
+    // No `ndk { abiFilters }` here and none in the config plugin, which is the
+    // one structural difference between this module and Clear's, Emo's and
+    // Ear's. Those three bind LiteRT, which ships `arm64-v8a` and `x86_64` and
+    // nothing else, so a build targeting a third ABI produces an APK with no
+    // matching `.so`. `ai.desertant:tongue` is a pure Kotlin jar -- no NDK, no
+    // native library, nothing to fail to find -- so every ABI is supported and
+    // narrowing the app's would be a restriction this model does not need.
+    minSdkVersion 24
+  }
+}
+
+dependencies {
+  // A plain jar, not an AAR, and deliberately not `ai.desertant:core`: the
+  // pipeline is a direct Kotlin port of the same frozen specification the Swift
+  // target implements, using only `java.text.Normalizer` and `java.util.regex`.
+  // Upstream's own note is that bridging the Swift core would cost ~51 MB of
+  // static Swift runtime per ABI to serve 2 MB of weights. The 2 MB of int8
+  // arrives as a jar resource, so nothing downloads here either.
+  //
+  // Keep this pinned in lockstep with DESERT_ANT_CORE_VERSION in
+  // ios/DesertAntTongue.podspec. The two ports are held to each other by shared
+  // golden vectors upstream, and a mismatched pair is two models answering
+  // differently rather than a build error.
+  implementation 'ai.desertant:tongue:3.1.0'
+  implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1'
+}

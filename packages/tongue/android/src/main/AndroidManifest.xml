@@ -1,0 +1,11 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- Not for the model. Nothing about Tongue is downloaded: the 2 MB of int8
+       weights and the metadata JSON are resources inside the jar, so a detection
+       works with the radio off and always has.
+
+       This is for the usage turnstile in `ai.desertant:tongue`, which posts a
+       fire-and-forget count to platform.desertant.ai. Declaring it is the honest
+       thing to do -- the permission is normal-level and prompts no one, and an
+       SDK that opened a socket the app never declared would be worse. -->
+  <uses-permission android:name="android.permission.INTERNET" />
+</manifest>

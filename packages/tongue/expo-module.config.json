@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["TongueModule"]
+  },
+  "android": {
+    "modules": ["ai.desertant.rn.tongue.TongueModule"]
+  }
+}

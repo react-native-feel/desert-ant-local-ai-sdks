@@ -5,12 +5,14 @@ on-device models. Desert Ant ships Swift, Kotlin and JavaScript/WebAssembly SDKs
 from [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core); this
 repository is the React Native one they do not.
 
-Six models so far. Five of them compose into one pipeline: **Clear** cleans a
+Seven models so far. Five of them compose into one pipeline: **Clear** cleans a
 recording up — denoise, dereverb, loudness-normalize — **Ear** names the language
 it is in, **Voz** reads it back as a transcript with word-level timestamps,
 **Clips** picks the moments worth cutting, and **Uhm** finds every "um" in the
-same audio without reading a word of it. The sixth, **Emo**, reads text rather
-than audio: a phrase in, the emoji that fit it out. Entirely offline.
+same audio without reading a word of it. The other two read text rather than
+audio: **Emo** takes a phrase and gives back the emoji that fit it, and
+**Tongue** takes three words and names the language they are in — the same
+question Ear answers, from the other kind of evidence. Entirely offline.
 
 ```ts
 import { Clear } from '@desert-ant-labs/react-native-clear';
@@ -19,6 +21,7 @@ import { Clips } from '@desert-ant-labs/react-native-clips';
 import { Uhm } from '@desert-ant-labs/react-native-uhm';
 import { Emo } from '@desert-ant-labs/react-native-emo';
 import { Ear } from '@desert-ant-labs/react-native-ear';
+import { Tongue } from '@desert-ant-labs/react-native-tongue';
 
 const { uri } = await (await Clear.load()).enhance({ uri: recording.uri });
 
@@ -37,6 +40,10 @@ const clean = Uhm.reconcileWords(words, fillers);  // word spans that miss the u
 
 const emoji = await (await Emo.load()).suggest('Pay my bills');
 // emoji[0] -> { emoji: '💰', confidence: 0.62 }
+
+const tongue = await Tongue.load();
+tongue.detectSync(transcript.text).language;   // "pt" — the same answer as Ear,
+                                               // from the words rather than the sound
 ```
 
 Ear sits ahead of Voz rather than beside it, and that is the point of it: Voz does
@@ -56,6 +63,17 @@ because it is the same lifecycle — create, load, call, release — over a mode
 that shares nothing else with the other four, and because at ~5 MB and ~2 ms it
 is the one you can call on every keystroke.
 
+Tongue is Ear's sibling across that divide: same question, different evidence.
+Ear listens to ninety seconds of a recording; Tongue reads three words. Asking
+both about one recording — Ear from the waveform, Tongue from the transcript — is
+two independent models on one piece of content, and where they disagree the
+disagreement is the useful output: a transcriber out of its depth produces text
+that *looks* like a language it is not. It is also the odd one out mechanically.
+Nothing about it downloads — the whole model is 2 MB of int8 inside the package —
+and at tens of microseconds it is the only model here whose inference is
+synchronous, which is why `detectSync` exists and why a text field needs no
+debounce behind it.
+
 ## Packages
 
 | Package | What it is |
@@ -66,8 +84,9 @@ is the one you can call on every keystroke.
 | [`@desert-ant-labs/react-native-uhm`](packages/uhm) | The Uhm model: audio in, frame-precise filler-word spans out. No transcript needed. **iOS only.** |
 | [`@desert-ant-labs/react-native-ear`](packages/ear) | The Ear model: audio in, the language it is spoken in out, across 99. iOS + Android. |
 | [`@desert-ant-labs/react-native-emo`](packages/emo) | The Emo model: short text in, ranked emoji with confidences out, 22 languages. iOS + Android. |
+| [`@desert-ant-labs/react-native-tongue`](packages/tongue) | The Tongue model: three words in, the language they are in out, across 84. 2 MB bundled, nothing downloaded. **Android; the Apple half is written and blocked on an upstream product export.** |
 | [`@desert-ant-labs/react-native-core`](packages/core) | Types, error codes and lifecycle contracts shared by every model SDK here — and the single native bridge to the `desert-ant-core` Swift package. |
-| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field for Emo, on a dev build. |
+| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo and Tongue, on a dev build. |
 
 ## How it is built
 
@@ -79,10 +98,17 @@ over Desert Ant's own platform SDKs:
   package ships as SPM only, with no podspec and no XCFramework. The bridge is
   declared exactly once, by the `DesertAntCore` pod, because two pods each
   linking the same package duplicates its thirteen shared objects and fails to
-  link; see [`packages/core`](packages/core#the-desertantcore-pod).
+  link; see [`packages/core`](packages/core#the-desertantcore-pod). **Tongue is
+  the one model not in that list**, and not by choice: desert-ant-core v3.1.0
+  declares a `Tongue` product and never adds it to the manifest's `products:`
+  array, so naming it fails the build rather than the import. Its Apple sources
+  are written and guarded by `#if canImport(Tongue)`.
 - **Android** depends on `ai.desertant:clear`, `ai.desertant:emo` and
   `ai.desertant:ear` from Maven Central, which bring LiteRT and the shared native
-  core with them. Those three are the only models with an Android half: **Voz**
+  core with them, and on `ai.desertant:tongue`, which brings **nothing** — it is a
+  pure-Kotlin port of the same frozen specification the Swift target implements,
+  with no NDK and no `.so`, so it is the only model here with no ABI constraint on
+  Android. Those four are the only models with an Android half: **Voz**
   drives Core ML directly and
   upstream ships no artifact for it at all, **Clips** has LiteRT files declared
   but no published Android package to bind to yet, and **Uhm** has neither half —
@@ -115,7 +141,14 @@ verified end to end on a simulator too: it
 downloads, loads in 7.6 s, and answers "Pay my bills" with 💰 at 0.64 in 5–16 ms
 — and the same phrase in Spanish and Japanese ranks 💰 first as well, which is
 the multilingual claim rather than a keyword table. Its skin-tone path is
-exercised and the ranking is unchanged by it, as documented. Android compiles but
+exercised and the ranking is unchanged by it, as documented. Tongue is the one
+model here that has **not** been run at all: its Apple half cannot be linked
+until desert-ant-core exports its `Tongue` SwiftPM product, and no Android device
+was available for the half that does bind. What is verified is that the seventh
+pod builds and links into an app that already carries six, that the module
+registers and every `@JS` property reads, and that the refusal reaches JavaScript
+as a sentence naming the cause — the example app's self-test still ends with all
+prepared models passing. Android compiles but
 has not been run — no device was available. Each package's
 README says exactly what was and was not exercised.
 
@@ -125,16 +158,18 @@ README says exactly what was and was not exercised.
 | --- | --- |
 | Expo SDK | 57+ (`expo-modules-core` 57 is where the 2.0 macros live) |
 | React Native | 0.75+ for `spm_dependency`; 0.83 in the example |
-| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo or Ear alone |
+| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear or Tongue alone |
 | Xcode | 26 (`desert-ant-core` is `swift-tools-version: 6.2`) |
-| Android | API 24+, `arm64-v8a` and `x86_64` only |
+| Android | API 24+; `arm64-v8a` and `x86_64` only for Clear, Emo and Ear — Tongue needs no native library and runs on any ABI |
 | Expo Go | Not supported — these are native modules, so use a dev build |
 
 Each package's bundled config plugin raises the iOS deployment target — and
 Clear's, Emo's and Ear's also narrow the Android ABIs to the two LiteRT ships — so add
 whichever packages you use to `plugins` in your app config. The plugins only ever
-raise, and the two that touch `build.gradle` defer to each other's block, so they
-compose.
+raise, and the three that touch `build.gradle` defer to each other's block, so they
+compose. Tongue's touches `build.gradle` not at all, deliberately: it has no
+native library, so narrowing an app's ABIs on its behalf would take away devices
+it can serve.
 
 ## Develop
 

@@ -7,6 +7,7 @@ import {
 import { Clips, type Clip } from '@desert-ant-labs/react-native-clips';
 import { Ear, type Detection } from '@desert-ant-labs/react-native-ear';
 import { Emo, type EmojiSkinTone, type EmoSuggestion } from '@desert-ant-labs/react-native-emo';
+import { Tongue, type Detection as TextDetection } from '@desert-ant-labs/react-native-tongue';
 import { Uhm, type UhmResult } from '@desert-ant-labs/react-native-uhm';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
 import { File, Paths } from 'expo-file-system';
@@ -43,11 +44,17 @@ import {
  * comparison out loud: it identifies the recording, checks the answer against
  * `Voz.supportedLanguages`, and says so when the two disagree.
  *
- * Then a fifth that is not in that chain at all. Emo reads text, not audio, so it
- * has its own field at the bottom: type a phrase and the emoji that fit it come
- * back. It is here rather than in a separate app because it is the same lifecycle
- * -- create, load, call, release -- over a model that shares nothing else with the
- * other four, which is the part worth being able to see side by side.
+ * Then two that are not in that chain at all, both reading text rather than
+ * audio. Emo has its own field at the bottom: type a phrase and the emoji that
+ * fit it come back. Tongue has another: type a phrase and it names the language
+ * it is in.
+ *
+ * Tongue is the one worth watching next to Ear, because the two answer the same
+ * question from different evidence -- Ear from the waveform, Tongue from the
+ * words. So this app asks both about the same recording whenever it has a
+ * transcript for one: Ear identifies the audio, Voz reads it, and Tongue reads
+ * what Voz wrote. Two independent models agreeing is worth more than either
+ * alone, and where they disagree, the disagreement is the interesting output.
  *
  * The whole point of the file APIs is visible here: the recording never becomes
  * a JavaScript array. `recorder.uri` goes into Clear, an enhanced `uri` comes
@@ -76,6 +83,7 @@ export default function App() {
   const uhm = useRef<Uhm | null>(null);
   const emo = useRef<Emo | null>(null);
   const ear = useRef<Ear | null>(null);
+  const tongue = useRef<Tongue | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -135,6 +143,30 @@ export default function App() {
   // is what the caller waited for. The gap is the bridge hop.
   const [earMs, setEarMs] = useState<number | null>(null);
 
+  // Tongue is 2 MB and bundled in the binary, so there is nothing to download
+  // and `loading` lasts about as long as one file read. It is still a state
+  // rather than an assumption: the read happens off the JavaScript thread, and a
+  // `detect` before it lands refuses rather than blocking.
+  const [tongueState, setTongueState] = useState<ModelState>(
+    Tongue.isSupported ? 'loading' : 'unsupported'
+  );
+  const [typed, setTyped] = useState('');
+  const [read, setRead] = useState<TextDetection | null>(null);
+  // Microseconds, not milliseconds, and measured around the *synchronous* call
+  // so it is the model rather than a promise. This is the number the whole
+  // design of this package rests on -- if it were milliseconds, `detectSync`
+  // would not be worth having.
+  const [readUs, setReadUs] = useState<number | null>(null);
+  // What Ear said about the audio and what Tongue said about the transcript of
+  // the same audio. The join this app exists to show.
+  const [agreement, setAgreement] = useState<{
+    ear: string | null;
+    earReliable: boolean;
+    tongue: string | null;
+    tongueReliability: string;
+    words: number;
+  } | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -162,6 +194,13 @@ export default function App() {
         `windows=${Ear.defaultWindows} margin=${Ear.reliableMargin} ` +
         `confusable=${Ear.confusableLanguages.join('/')}` +
         `${Ear.unsupportedReason ? ` reason=${Ear.unsupportedReason}` : ''}`
+    );
+    console.log(
+      `[tongue] isSupported=${Tongue.isSupported} nativeCore=${Tongue.nativeCoreVersion} ` +
+        `revision=${Tongue.modelRevision} repo=${Tongue.modelRepo} ` +
+        `topK=${Tongue.defaultTopK} tieMargin=${Tongue.tieMargin} ` +
+        `maxChars=${Tongue.maxCharacters}` +
+        `${Tongue.unsupportedReason ? ` reason=${Tongue.unsupportedReason}` : ''}`
     );
     console.log(
       `[emo] isSupported=${Emo.isSupported} nativeCore=${Emo.nativeCoreVersion} ` +
@@ -238,6 +277,12 @@ export default function App() {
       if (cancelled || !Ear.isSupported) return;
       void prepareEar();
 
+      // Tongue is 2 MB, and unlike every other model here those 2 MB are already
+      // on the device -- they are inside the app binary. "Preparing" it is a file
+      // read, so there is nothing to justify and nothing to ask permission for.
+      if (cancelled || !Tongue.isSupported) return;
+      void prepareTongue();
+
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
       if (cancelled || !Voz.isSupported) return;
@@ -273,6 +318,8 @@ export default function App() {
       emo.current = null;
       ear.current?.release();
       ear.current = null;
+      tongue.current?.release();
+      tongue.current = null;
     };
   }, []);
 
@@ -417,6 +464,79 @@ export default function App() {
       setEarState('absent');
     }
   }, []);
+
+  /**
+   * Get Tongue ready: 2 MB, already on the device, read off the app binary.
+   *
+   * The only model here with nothing to download and no progress to report, so
+   * this is the shortest prepare in the app -- and the only one where `absent`
+   * cannot mean "not on this device yet". A failure here means the package's
+   * resources did not survive the build, which is a different problem and worth
+   * saying so.
+   */
+  const prepareTongue = useCallback(async () => {
+    if (tongue.current) return;
+    setTongueState('loading');
+    try {
+      const t0 = Date.now();
+      const model = await Tongue.load();
+      tongue.current = model;
+      setTongueState('ready');
+      console.log(`[tongue] ready in ${Date.now() - t0}ms loaded=${model.isLoaded()}`);
+      // iOS only: Swift exposes `Script` as a public enum, the Kotlin jar keeps
+      // its router internal. Asked once so the refusal is exercised on the
+      // platform that refuses.
+      try {
+        const scripts = Tongue.supportedScripts();
+        console.log(`[tongue] ${scripts.length} scripts: ${scripts.join(' ')}`);
+      } catch (e) {
+        console.log(`[tongue] supportedScripts unavailable: ${describe(e)}`);
+      }
+    } catch (e) {
+      console.log(`[tongue] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setTongueState('absent');
+    }
+  }, []);
+
+  /**
+   * Name the language of whatever is in the Tongue field.
+   *
+   * Called straight from `onChangeText` with **no debounce**, which is the whole
+   * demonstration. Emo's field two sections down debounces at 150 ms because a
+   * suggestion is a promise and a couple of milliseconds; a Tongue detection is
+   * synchronous and tens of microseconds, so the timer would cost more than the
+   * model and would make the answer lag the keystroke for no reason.
+   *
+   * `detectSync` rather than `detect` for the same reason. They are the same
+   * native call; the async one exists so this package reads like the other six,
+   * and so it can load the model for a caller who did not.
+   */
+  const runRead = useCallback((text: string) => {
+    setTyped(text);
+    const model = tongue.current;
+    if (!model) return;
+    if (text.length === 0) {
+      setRead(null);
+      setReadUs(null);
+      return;
+    }
+    try {
+      const t0 = performance.now();
+      const detection = model.detectSync(text, { topK: 5 });
+      setReadUs(Math.round((performance.now() - t0) * 1000));
+      setRead(detection);
+    } catch (e) {
+      console.log(`[tongue] detect FAILED: ${describe(e)}`);
+      setError(describe(e));
+      // Same Fast Refresh hazard Emo hits, and for the same reason: this is the
+      // other model called from something that is not a tap, so it is the other
+      // one that can outlive its native half during development.
+      tongue.current?.release();
+      tongue.current = null;
+      void prepareTongue();
+    }
+  }, [prepareTongue]);
 
   /**
    * Name the language of a recording, and say whether Voz can be trusted with it.
@@ -595,6 +715,7 @@ export default function App() {
     setHighlights(null);
     setDisfluency(null);
     setReconciled(null);
+    setAgreement(null);
     // Re-arm the session every time, not once at mount: `stopAndEnhance` hands it
     // back to playback when it finishes, so by the second recording iOS would
     // otherwise refuse with RecordingDisabledException.
@@ -685,6 +806,33 @@ export default function App() {
       if (spoken && clips.current) {
         await runFindClips(spoken);
       }
+    }
+
+    // The join this app is here to show, and the only place two models answer the
+    // same question from different evidence. Ear read the waveform; Tongue reads
+    // the words Voz got out of it. Neither sees what the other saw.
+    //
+    // It is reported, not enforced. Where the two disagree, that is the output --
+    // Ear is listening to phonetics and Tongue is reading orthography, and a
+    // transcriber that was out of its depth produces text that *looks* like a
+    // language it is not. A real pipeline would treat the disagreement as a
+    // reason to distrust the transcript; a demo should show it.
+    if (spoken && spoken.text.trim().length > 0 && tongue.current) {
+      const fromText = tongue.current.detectSync(spoken.text);
+      const earSaid = language?.language ?? null;
+      setAgreement({
+        ear: earSaid,
+        earReliable: language?.isReliable ?? false,
+        tongue: fromText.language,
+        tongueReliability: fromText.reliability,
+        words: spoken.words.length,
+      });
+      console.log(
+        `[join] Ear heard ${earSaid ?? 'nothing'} (reliable=${language?.isReliable ?? false}); ` +
+          `Tongue read ${fromText.language ?? 'nothing'} from ${spoken.words.length} words ` +
+          `(${fromText.reliability}, ${(fromText.processingSec * 1e6).toFixed(0)}us) — ` +
+          `${earSaid === fromText.language ? 'AGREE' : 'DISAGREE'}`
+      );
     }
 
     // Uhm runs on whatever audio exists, enhanced or not, and runs even when
@@ -823,7 +971,9 @@ export default function App() {
     // before it: a leg that hangs rather than throwing takes every later leg
     // down with it, and its own try/catch cannot help. Putting the always-ready
     // ones at the front means the self-test always reports something. Ear leads
-    // because it is the cheapest of them -- ~9 MB and a quarter of a second.
+    // because it is the cheapest *audio* model here -- ~9 MB and a quarter of a
+    // second -- and Tongue follows it because the two answer the same question
+    // from different evidence, which makes them worth reading next to each other.
 
     // --- Ear. Loaded on mount like Uhm, and cheaper, so it runs first.
     //
@@ -1004,6 +1154,189 @@ export default function App() {
     } catch (e) {
       console.log(`[ear] self-test FAILED: ${describe(e)}`);
       failures.push(`ear: ${describe(e)}`);
+    }
+
+    // --- Tongue. Ear's sibling in the text domain, and cheaper than it by four
+    //     orders of magnitude: 2 MB already inside the app binary, and a
+    //     detection measured in microseconds rather than seconds.
+    //
+    //     This is the one leg with a real answer key that needs no fixture files.
+    //     Ear's labelled samples are half-minute recordings someone has to put in
+    //     the cache; Tongue's are strings, so the question "does it actually name
+    //     the language, or does it only produce a well-formed ranking?" can be
+    //     asked on every run.
+    try {
+      const reader = tongue.current;
+      if (!reader) {
+        console.log('[tongue] self-test skipped — model not prepared');
+      } else {
+        // The invariants first, on one string, before anything is scored.
+        const one = reader.detectSync('kann ich das haben');
+        console.log(
+          `[tongue] detectSync("kann ich das haben") -> ${one.language ?? 'none'} ` +
+            `${one.confidence.toFixed(3)} ${one.reliability} tooClose=${one.isTooCloseToCall} ` +
+            `route=${one.route.verdict}/${one.route.script ?? '—'} ` +
+            `native=${(one.processingSec * 1e6).toFixed(0)}us`
+        );
+        const ranked = one.candidates.every(
+          (c, i) => i === 0 || c.probability <= one.candidates[i - 1]!.probability
+        );
+        const bounded = one.candidates.every((c) => c.probability >= 0 && c.probability <= 1);
+        const headAgrees =
+          one.language === (one.candidates[0]?.language ?? null) &&
+          Math.abs(one.confidence - (one.candidates[0]?.probability ?? 0)) < 1e-9;
+        if (!ranked) failures.push('tongue: candidates are not in descending order');
+        if (!bounded) failures.push('tongue: a probability is outside 0..1');
+        if (!headAgrees) failures.push('tongue: language/confidence disagree with candidates[0]');
+        console.log(`[tongue] ranked=${ranked} bounded=${bounded} headAgrees=${headAgrees}`);
+
+        // `isTooCloseToCall` is decided natively, so this does not recompute it --
+        // it checks the answer is *consistent* with the margin it is made of,
+        // which is a weaker claim and the only one a caller can make without
+        // duplicating the rule.
+        const gap = one.confidence - (one.candidates[1]?.probability ?? 0);
+        const consistent =
+          one.candidates.length < 2 ? !one.isTooCloseToCall : one.isTooCloseToCall === gap < Tongue.tieMargin;
+        if (!consistent) {
+          failures.push(
+            `tongue: isTooCloseToCall=${one.isTooCloseToCall} but the gap is ${gap.toFixed(3)}`
+          );
+        }
+        console.log(`[tongue] isTooCloseToCall consistent with tieMargin: ${consistent}`);
+
+        // The answer key. Eleven languages across seven scripts, each a handful
+        // of words -- which is the claim: "detect language based on 3 words".
+        let correct = 0;
+        for (const { code, text } of TONGUE_SAMPLES) {
+          const answer = reader.detectSync(text, { topK: 3 });
+          const right = answer.language === code;
+          if (right) correct += 1;
+          console.log(
+            `[tongue]   ${code.padEnd(3)} -> ${(answer.language ?? 'none').padEnd(3)} ` +
+              `${answer.confidence.toFixed(3)} ${right ? 'OK   ' : 'WRONG'} ` +
+              `${answer.reliability.padEnd(9)} ${answer.route.verdict.padEnd(9)} ` +
+              `${(answer.route.script ?? '—').padEnd(10)} ` +
+              `${(answer.processingSec * 1e6).toFixed(0)}us  "${text}"`
+          );
+        }
+        console.log(`[tongue] labelled strings: ${correct} of ${TONGUE_SAMPLES.length} correct`);
+        if (correct < TONGUE_SAMPLES.length) {
+          failures.push(
+            `tongue: ${TONGUE_SAMPLES.length - correct} of ${TONGUE_SAMPLES.length} strings misidentified`
+          );
+        }
+
+        // The latency claim, which is the reason `detectSync` exists at all. A
+        // thousand detections of one string, timed in JavaScript, so the number
+        // includes the bridge hop a real caller pays.
+        const timed = 'the quick brown fox jumps over the lazy dog';
+        const t0 = performance.now();
+        for (let i = 0; i < 1000; i += 1) reader.detectSync(timed);
+        const perCall = ((performance.now() - t0) * 1000) / 1000;
+        console.log(`[tongue] 1000 synchronous detections: ${perCall.toFixed(1)}us each, bridge included`);
+
+        // The router's two shortcuts, which are the interesting structure: a
+        // script only one language uses answers at probability 1 without the
+        // model, and a script several share narrows the field before the model
+        // decodes.
+        const decisive = reader.detectSync('안녕하세요 반갑습니다');
+        const narrowing = reader.detectSync('привет как дела сегодня');
+        console.log(
+          `[tongue] decisive: ko text -> ${decisive.language} p=${decisive.confidence.toFixed(3)} ` +
+            `${decisive.reliability} verdict=${decisive.route.verdict} ` +
+            `allowed=${decisive.route.candidates.join('/')}`
+        );
+        console.log(
+          `[tongue] narrowing: ru text -> ${narrowing.language} verdict=${narrowing.route.verdict} ` +
+            `allowed=${narrowing.route.candidates.join('/')}`
+        );
+        if (decisive.route.verdict !== 'decisive') {
+          failures.push(`tongue: Hangul routed ${decisive.route.verdict}, expected decisive`);
+        }
+        if (narrowing.route.verdict !== 'narrowing') {
+          failures.push(`tongue: Cyrillic routed ${narrowing.route.verdict}, expected narrowing`);
+        }
+
+        // Empty input is an answer, not an error -- a field that clears while
+        // someone is typing should get `empty`, not an exception.
+        const nothing = reader.detectSync('   \n  ');
+        console.log(
+          `[tongue] whitespace -> language=${nothing.language} reliability=${nothing.reliability} ` +
+            `candidates=${nothing.candidates.length}`
+        );
+        if (nothing.reliability !== 'empty' || nothing.language !== null) {
+          failures.push(`tongue: whitespace gave ${nothing.reliability}/${nothing.language}`);
+        }
+
+        // The normalizer is visible, and that is the point of `normalized`: the
+        // model never saw the URL, the digits or the capitals.
+        const messy = reader.detectSync('Check HTTPS://example.com/x?q=1 @someone — 2024 très bien');
+        console.log(`[tongue] normalized: "${messy.normalized}" -> ${messy.language}`);
+
+        // Over the cap. Not an error: truncated at Tongue.maxCharacters scalars,
+        // and `normalized` shows exactly what was seen.
+        const long = reader.detectSync('gato '.repeat(300));
+        console.log(
+          `[tongue] ${1500} chars in -> normalized ${long.normalized.length} ` +
+            `(cap ${Tongue.maxCharacters}) -> ${long.language}`
+        );
+        if (long.normalized.length > Tongue.maxCharacters) {
+          failures.push(`tongue: normalized ${long.normalized.length} chars, cap is ${Tongue.maxCharacters}`);
+        }
+
+        // topK is honoured and does not move the winner.
+        const one_ = reader.detectSync('la casa', { topK: 1 });
+        const many = reader.detectSync('la casa', { topK: 8 });
+        console.log(
+          `[tongue] topK 1 -> ${one_.candidates.length} candidate(s), topK 8 -> ` +
+            `${many.candidates.length}; winner ${one_.language}/${many.language}; ` +
+            `tooClose=${many.isTooCloseToCall} (${many.candidates
+              .map((c) => `${c.language} ${c.probability.toFixed(3)}`)
+              .join(', ')})`
+        );
+        if (one_.candidates.length !== 1) failures.push('tongue: topK=1 returned more than one');
+        if (one_.language !== many.language) failures.push('tongue: topK changed the winner');
+
+        // The argument guards, which never reach native.
+        for (const bad of [0, -1, 1.5]) {
+          try {
+            reader.detectSync('hola', { topK: bad });
+            failures.push(`tongue: topK=${bad} was accepted`);
+          } catch (e) {
+            if (!(e instanceof DesertAntError) || e.code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`tongue: topK=${bad} raised ${describe(e)}`);
+            }
+          }
+        }
+        console.log('[tongue] rejected 0, -1 and 1.5 candidates with ERR_INVALID_ARGUMENT');
+
+        // The script catalogue, which is the one call iOS can answer and Android
+        // cannot.
+        try {
+          const scripts = Tongue.supportedScripts();
+          console.log(`[tongue] supportedScripts -> ${scripts.length} names, unique=${new Set(scripts).size}`);
+          if (scripts.length < 30) {
+            failures.push(`tongue: supportedScripts returned ${scripts.length}, expected ~32`);
+          }
+        } catch (e) {
+          const code = e instanceof DesertAntError ? e.code : 'not a DesertAntError';
+          console.log(`[tongue] supportedScripts -> ${code} (expected off iOS)`);
+          if (Platform.OS === 'ios') {
+            failures.push(`tongue: supportedScripts failed on iOS with ${code}`);
+          }
+        }
+
+        // And the join, on the one content both models can be asked about
+        // without a microphone: the transcript this app ranks with Clips.
+        const fromTranscript = reader.detectSync(SAMPLE_TRANSCRIPT.join(' '));
+        console.log(
+          `[tongue] the sample transcript reads as ${fromTranscript.language} ` +
+            `${fromTranscript.confidence.toFixed(3)} ${fromTranscript.reliability}`
+        );
+      }
+    } catch (e) {
+      console.log(`[tongue] self-test FAILED: ${describe(e)}`);
+      failures.push(`tongue: ${describe(e)}`);
     }
 
     // --- Uhm. The only model here that is loaded by the time a self-test can run
@@ -1293,7 +1626,8 @@ export default function App() {
       <Text style={styles.title}>Desert Ant</Text>
       <Text style={styles.subtitle}>
         Clear cleans it, Ear names the language, Voz reads it, Clips cuts it, Uhm finds
-        the ums
+        the ums — and Tongue names the language again, from the words rather than the
+        sound
       </Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -1656,6 +1990,169 @@ export default function App() {
       </View>
 
       <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Tongue</Text>
+
+        {tongueState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Tongue.unsupportedReason ?? 'Not available in this build.'}
+          </Text>
+        ) : null}
+
+        {tongueState === 'absent' ? (
+          <>
+            <Text style={styles.note}>
+              Reading the bundled model failed. Nothing was downloaded — the 2 MB is
+              inside the app binary — so this is a build problem rather than a network
+              one.
+            </Text>
+            <Button
+              label="Retry"
+              onPress={() => void prepareTongue()}
+              disabled={busy !== null}
+              tone="ghost"
+            />
+          </>
+        ) : null}
+
+        {tongueState === 'loading' ? (
+          <Text style={styles.note}>Reading the bundled 2 MB.</Text>
+        ) : null}
+
+        {tongueState === 'ready' ? (
+          <>
+            <Text style={styles.note}>
+              Ear names the language of a recording; Tongue names it from the words.
+              Type three and it answers — synchronously, with no debounce, because a
+              detection costs less than the keystroke that triggered it.
+            </Text>
+            <TextInput
+              value={typed}
+              onChangeText={runRead}
+              placeholder="kann ich das haben"
+              autoCorrect={false}
+              autoCapitalize="none"
+              style={styles.input}
+            />
+            {/* Seven scripts, so the router's two shortcuts are something a tester
+                can tap: Hangul and Greek are decided by script alone at
+                probability 1, Cyrillic narrows to eight languages before the
+                model decodes, and "la casa" is a genuine tie between Italian and
+                Spanish that the model is right to refuse to break. */}
+            <View style={styles.phrases}>
+              {TONGUE_PHRASES.map((sample) => (
+                <Pressable
+                  key={sample}
+                  onPress={() => runRead(sample)}
+                  style={({ pressed }) => [styles.phrase, pressed && styles.buttonPressed]}>
+                  <Text style={styles.phraseText}>{sample}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </>
+        ) : null}
+
+        {read ? (
+          <>
+            <Row label="Language" value={read.language ?? 'none'} />
+            <Row label="Confidence" value={read.confidence.toFixed(3)} />
+            <Row label="Reliability" value={read.reliability} />
+            <Row
+              label="Route"
+              value={`${read.route.verdict}${read.route.script ? ` · ${read.route.script}` : ''}`}
+            />
+            <Row
+              label="Detection"
+              value={`${(read.processingSec * 1e6).toFixed(0)} µs${
+                readUs === null ? '' : ` (${readUs} µs with the bridge)`
+              }`}
+            />
+
+            {/* The two things a caller should not read as the same problem. One is
+                about how much evidence there was; the other is about two
+                languages being equally good answers for it. */}
+            {read.reliability === 'tentative' ? (
+              <Text style={styles.note}>
+                Tentative — under 12 characters, or the winner leads by less than 0.20.
+                Treat it as unknown rather than as an answer with an asterisk. One or two
+                words is often genuinely undecidable, whatever the probability says.
+              </Text>
+            ) : null}
+
+            {read.isTooCloseToCall ? (
+              <Text style={styles.note}>
+                The top two are within {Tongue.tieMargin} of each other, so this is a tie
+                rather than a reading — show both. “la casa” is equally Italian and
+                Spanish, and saying so is more useful than picking.
+              </Text>
+            ) : null}
+
+            {read.route.verdict === 'decisive' ? (
+              <Text style={styles.note}>
+                Settled by script alone: only {read.route.candidates.join(', ')} uses{' '}
+                {read.route.script}, so the model was never asked. That is why the
+                probability is 1 and the answer is confident however short the text is —
+                25 of the 84 languages are reachable this way.
+              </Text>
+            ) : null}
+
+            {read.route.verdict === 'narrowing' ? (
+              <Text style={styles.note}>
+                {read.route.script} narrowed the field to{' '}
+                {read.route.candidates.join(', ')} before the model decoded — so the
+                probabilities above are over those {read.route.candidates.length}, not over
+                all 59.
+              </Text>
+            ) : null}
+
+            <Text style={styles.note}>
+              The model saw: “{read.normalized}”
+            </Text>
+
+            {read.candidates.length > 0 ? (
+              <View style={styles.words}>
+                {read.candidates.map((candidate, index) => (
+                  <View key={`${index}-${candidate.language}`} style={styles.filler}>
+                    <Text style={styles.wordText}>{candidate.language}</Text>
+                    <Text style={styles.wordTime}>{candidate.probability.toFixed(3)}</Text>
+                  </View>
+                ))}
+              </View>
+            ) : (
+              <Text style={styles.note}>
+                Nothing survived normalization, so there is no answer — which is a
+                different thing from a low-confidence one.
+              </Text>
+            )}
+          </>
+        ) : null}
+
+        {/* Two models, one recording, different evidence. Reported rather than
+            enforced: where they disagree, the disagreement is the output. */}
+        {agreement ? (
+          <>
+            <Text style={styles.sectionTitle}>Ear vs Tongue</Text>
+            <Row
+              label="Ear, from the audio"
+              value={`${agreement.ear ?? 'none'}${agreement.earReliable ? '' : ' (unreliable)'}`}
+            />
+            <Row
+              label="Tongue, from the words"
+              value={`${agreement.tongue ?? 'none'} (${agreement.tongueReliability})`}
+            />
+            <Text style={styles.note}>
+              {agreement.ear === agreement.tongue
+                ? `Both read it as ${agreement.tongue}, from ${agreement.words} transcribed words ` +
+                  'and from the waveform respectively. Two models that share no input agreeing is ' +
+                  'worth more than either alone.'
+                : 'They disagree. Ear hears phonetics and Tongue reads orthography, so a ' +
+                  'transcriber out of its depth produces text that looks like a language it is ' +
+                  'not — which is exactly the case this comparison exists to surface.'}
+            </Text>
+          </>
+        ) : null}
+      </View>
+
+      <View style={styles.metrics}>
         <Text style={styles.sectionTitle}>Emo</Text>
 
         {emoState === 'unsupported' ? (
@@ -1770,6 +2267,56 @@ const SAMPLE_PHRASES = [
   '請求書を払う',
   'go for a run',
   'call mum on her birthday',
+];
+
+/**
+ * Tongue's answer key: a handful of words per language, with the right answer
+ * attached.
+ *
+ * Eleven languages across seven scripts, and every one of them short on purpose
+ * -- the product claim is "detect language based on 3 words", so a paragraph
+ * would be testing something easier than what is advertised. Ear's labelled
+ * fixtures are half-minute recordings someone has to drop into the cache; these
+ * are strings, so this half of the comparison runs on every self-test with
+ * nothing to install.
+ *
+ * `es` and `it` are both here deliberately. They are the pair the model is most
+ * often right to be unsure about, and the self-test prints the margin rather
+ * than only the verdict.
+ */
+const TONGUE_SAMPLES = [
+  { code: 'de', text: 'kann ich das haben' },
+  { code: 'es', text: 'me gustaría pedir la cuenta' },
+  { code: 'fr', text: 'je voudrais réserver une table' },
+  { code: 'pt', text: 'onde fica a estação de trem' },
+  { code: 'it', text: 'vorrei prenotare un tavolo per due' },
+  { code: 'nl', text: 'waar is het dichtstbijzijnde station' },
+  { code: 'en', text: 'where is the nearest train station' },
+  { code: 'ru', text: 'привет как дела сегодня' },
+  { code: 'ja', text: 'これをください' },
+  { code: 'ko', text: '안녕하세요 반갑습니다' },
+  { code: 'el', text: 'που είναι ο σταθμός' },
+] as const;
+
+/**
+ * The buttons under the Tongue field: one per interesting behaviour rather than
+ * one per language.
+ *
+ * Hangul and Greek are settled by the script router alone and come back at
+ * probability 1; Cyrillic narrows to eight languages before the model decodes;
+ * "la casa" is a real tie between Italian and Spanish; and "hi i am" is the
+ * cautionary one -- it reads as Welsh to any character model at high
+ * probability, which is what `reliability` exists to catch and a confidence
+ * threshold does not.
+ */
+const TONGUE_PHRASES = [
+  'kann ich das haben',
+  'la casa',
+  'hi i am',
+  'привет как дела',
+  '안녕하세요',
+  'που είναι ο σταθμός',
+  'これをください',
 ];
 
 /**

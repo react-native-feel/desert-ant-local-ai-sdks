@@ -42,6 +42,25 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # catalog downloads its artifacts at runtime and the package bundles none -- so
 # this is code size, not hundreds of megabytes. Adding a model to the family
 # means adding it here.
+#
+# `Tongue` is deliberately NOT in this list, and it is the one model in the
+# family that is missing from it. desert-ant-core v3.1.0 declares the product --
+# `tongueProducts` in its Package.swift -- and then never adds it to the
+# `products:` array the manifest is built from, which reads
+# `products + modelProducts + alignProducts + vozProducts` with no
+# `+ tongueProducts`. `swift package dump-package` on the pinned tag reports 45
+# products, every other model among them and no `Tongue`; the only thing in the
+# whole package that depends on the target is the `ModelCatalogTests` test
+# target, which is why it has gone unnoticed.
+#
+# Naming it here does not fail at `import` time. It fails the build outright,
+# before a line is compiled:
+#
+#     Missing package product 'Tongue' (in target 'DesertAntCore' from project 'Pods')
+#
+# When upstream adds those two words, adding `'Tongue'` here is the whole change
+# on this side: `packages/tongue/ios` is already written against the module and
+# guarded by `#if canImport(Tongue)`, so it lights up on its own.
 DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear'].freeze
 
 Pod::Spec.new do |s|

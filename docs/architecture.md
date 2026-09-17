@@ -357,6 +357,164 @@ The example app does the comparison and reports it, but deliberately does **not*
 gate on it. A real app routing unattended work should; a demo that hid Voz
 behind Ear's opinion would be showing one model instead of two.
 
+## What Desert Ant ships for Tongue (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM target `Tongue` in `desert-ant-core` | **Declared as a product and never exported.** 2 MB of int8 weights plus `tongue_meta.json` as `.copy` target resources. No `@available`, no `osFloor`, no inference runtime. |
+| Kotlin | `ai.desertant:tongue:3.1.0` on Maven Central | A plain **jar**, not an AAR, and not a binding: a direct Kotlin port of the same frozen specification. No `ai.desertant:core`, no NDK, no `.so`. The 2 MB ships as a jar resource. |
+| JavaScript | `@desert-ant-labs/tongue` | A third port of the same spec. Browser and Node; not usable from React Native. |
+
+Tongue is the odd one out three times over, and every one of them changes the
+shape of this package rather than a line of it.
+
+**It is not downloaded.** Every other model in this catalog resolves its
+artifacts through `ModelStore` at runtime; Tongue's whole model is 2 MB and ships
+inside each package. So this SDK has no `directory` load option, no
+`isDownloaded()`, no `ProgressEvent`, no `onProgress`, no `jobId` on any native
+call, and no `INTERNET`-for-the-weights story. `modelRevision` names a Hub tag
+that mirrors sha256-identical bytes for the website demo, and no `ModelStore`
+path in any Desert Ant SDK resolves that manifest. Upstream's `Catalog.swift`
+says so in its first paragraph.
+
+**It is not bridged.** `ai.desertant:tongue` is pure Kotlin, and upstream's
+reasoning is worth repeating because it is a real number: bridging the Swift core
+would cost ~51 MB of static Swift runtime *per ABI* to serve 2 MB of weights. So
+where Clear, Emo and Ear are one implementation plus JNI, Tongue is three
+implementations -- Swift, Kotlin, TypeScript -- held to each other by golden
+vectors replayed byte for byte in all three. Two consequences reach this
+package. There is no ABI constraint on Android, so this is the only
+cross-platform model here whose config plugin writes nothing to `build.gradle`
+and whose `isSupported` off Apple is not a statement about the device. And the
+usual argument for a thin wrapper -- one implementation, many bindings -- does
+not apply, which is why the `INTERNET` permission in the manifest is for the
+usage turnstile alone and says so.
+
+**It is not slow.** A detection is an int8 embedding gather, a sum over the
+n-grams present, one 59x32 matmul and a masked softmax. Upstream measures tens of
+microseconds and documents it as a main-thread call.
+
+### Synchronous inference, and why that is the safe shape as well as the fast one
+
+Every other model here answers asynchronously because every other model takes
+milliseconds to seconds, and an `@JS async` function on the module is how that is
+expressed. Tongue's `detect` is a synchronous `@JS` function on the module
+instead, and `Tongue.detect()` in TypeScript wraps it in a promise so the seven
+packages read alike. `detectSync()` is the same call with the promise removed,
+and it is what an `onChangeText` should use: no debounce, no timer, nothing for a
+suggestion to lag behind.
+
+The second reason is limit 4 below. A `@JS async` function's return value can be
+encoded off the JavaScript thread and segfault the runtime -- that cost a day
+during Ear, and the same defect had been sitting in Clear for months. A
+synchronous `@JS` function's return value is encoded on the JavaScript thread by
+construction. This module has exactly **one** `async` function, `load`, and it
+returns `Void`; the `scripts` catalogue is a property rather than a call for the
+same reason, since an array of bare strings is precisely what crashed Ear. So the
+hazard has no surface here at all, rather than being avoided by care.
+
+That is the general lesson Ear's fix only gestured at: the safe arrangement is to
+split "do the work" from "hand the result over", and a model fast enough to do
+its work on the JavaScript thread needs no split because there is no hop.
+
+### `reliability` is the API, and it is four-valued on purpose
+
+The same argument as Ear's `isReliable`, one level further. The probability is a
+softmax over a masked label set and is badly overconfident on short text --
+`"hi i am"` reads as Welsh at high probability to any character model.
+`reliability` is keyed off evidence instead: `confident` at 18+ characters and a
+0.30+ margin, `likely` at 12+ and 0.20+, `tentative` otherwise, `empty` when
+normalization left nothing. Upstream's own guidance is to treat a low reliability
+as *unknown* rather than as an answer with an asterisk.
+
+`isTooCloseToCall` is a separate question, not a weaker `reliability`: it is true
+when the top two candidates are within 0.12 of each other, so a long sentence can
+be `confident` and still a tie between two sister languages. `"la casa"` is
+equally Italian and Spanish, and presenting both is more useful than picking.
+
+Both are decided natively on both platforms and forwarded, never recomputed here.
+The package's Jest suite deliberately asserts neither against a reconstructed
+threshold -- a test like that would be asserting a second implementation into
+existence -- and the example app's self-test checks only *consistency* with the
+rule, which is a much weaker claim and the only one a caller can make.
+
+### The router is public API, and it explains the answers
+
+25 of the 84 languages never reach the model: a script only one language uses
+settles the route, and such answers come back at probability 1 and `confident`
+however short the text is. A script several share narrows the field first, so
+Cyrillic input is decoded among eight labels rather than 59. `Detection.route`
+carries all of it -- verdict, the allowed candidates, and the UAX#24 script name
+-- and it is forwarded because it is a better explanation of a result than a
+probability is.
+
+`'Japanese'` is the one script name that is not a Unicode script. Japanese mixes
+Han with kana, so any kana settles the route even when Han characters outnumber
+them; without that special case, kanji-heavy Japanese misroutes to Chinese.
+
+`Detection.normalized` is forwarded for the same reason. It is what the model
+actually saw -- NFC, lowercased, URLs and digits stripped, capped at 512 scalars
+-- and a string that normalizes to two characters is a guess whatever the
+probability says.
+
+### The Apple half is written and switched off
+
+desert-ant-core v3.1.0 declares the product:
+
+```swift
+let tongueProducts: [Product] = [
+    .library(name: "Tongue", targets: ["Tongue"]),
+]
+```
+
+and then builds the manifest without it:
+
+```swift
+products: products + modelProducts + alignProducts + vozProducts,
+```
+
+`swift package dump-package` on the pinned tag reports 45 products -- `Clear`,
+`Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Align`, `Title`, and no `Tongue`. The only
+thing in the package that depends on the target is the `ModelCatalogTests` *test*
+target, which is a target and not a product, which is why it builds green
+upstream and is invisible from there.
+
+It is not an import failure. Naming `'Tongue'` in `DESERT_ANT_PRODUCTS` fails the
+whole build before a line is compiled:
+
+```
+Missing package product 'Tongue' (in target 'DesertAntCore' from project 'Pods')
+```
+
+So `packages/tongue/ios` compiles behind `#if canImport(Tongue)` into an inert
+branch: the module still registers, still answers all eight `@JS` properties, and
+refuses `createModel` with `ERR_UNSUPPORTED_PLATFORM` carrying a sentence that
+names the cause. That is a much better failure than a package that simply is not
+there, because the reason a developer would otherwise reach for -- "I must have
+forgotten to prebuild" -- is wrong.
+
+When upstream adds `+ tongueProducts`, the change on this side is adding
+`'Tongue'` to the array in `packages/core/ios/DesertAntCore.podspec`. One entry;
+`canImport` does the rest.
+
+### Bundled resources would have been the next problem, and are solved anyway
+
+Tongue would be the first product in `DESERT_ANT_PRODUCTS` to ship SwiftPM
+**resources**, and the package is linked into a *pod* rather than into the app
+target -- React Native's `spm_dependency` adds the product to
+`libDesertAntCore.a`, and CocoaPods links that into the app. Whether the
+generated `DesertAnt_Tongue.bundle` rides along to where `Bundle.module` looks is
+a property of that pipeline rather than of the package.
+
+Upstream's `Tongue()` resolves the two files through `Bundle.module`, whose
+generated accessor calls `fatalError("unable to find bundle named ...")`. A
+missing resource would therefore take the app down with no JavaScript error and
+nothing for a caller to report. `TongueModel.swift` searches the loaded bundles
+for `tongue_int8.bin` and `tongue_meta.json` itself -- `Bundle.main`, the pod's
+own bundle, `allBundles`, `allFrameworks`, and one level of nested `.bundle`,
+which is a superset of what `Bundle.module` checks -- and raises
+`ERR_MODEL_UNAVAILABLE` with a sentence when it finds nothing.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -825,6 +983,58 @@ cost rather than one that scales with the audio.
 The crash found along the way, and the one it then exposed in Clear, are limit 4
 in **Expo Modules 2.0 limits** above.
 
+### Tongue, as far as it can be taken
+
+The shortest verification section here, and the only one whose limit is not the
+hardware.
+
+The seventh pod builds and links into an app that already carries six -- which is
+the non-trivial half of adding a model to this repo, and the half that broke
+twice before. The module registers and every `@JS` property reads, before
+anything touches a model:
+
+```
+[tongue] isSupported=false nativeCore=3.1.0 revision=v1.0.0 repo=desert-ant-labs/tongue
+         topK=3 tieMargin=0.12 maxChars=512
+         reason=desert-ant-core v3.1.0 declares a `Tongue` SwiftPM product and never adds
+         it to the package's `products:` array, so no consumer can link the target. The
+         Apple half of this SDK is written and waiting behind `#if canImport(Tongue)`;
+         the Android half, which binds the pure-Kotlin `ai.desertant:tongue` jar, is
+         unaffected.
+```
+
+That exercises the `@ExpoModule` registration, all eight `@JS` properties, the
+`#if canImport(Tongue)` fallback values, and the refusal crossing the bridge
+intact. The example app renders the same sentence in its Tongue section, the
+self-test leg skips cleanly (`[tongue] self-test skipped -- model not prepared`),
+and the run still ends `[selftest] all prepared models passed` -- so the seventh
+package costs the other six nothing.
+
+**No detection has been run, on either platform.** On Apple that is the product
+export above. On Android no device or emulator was available, which is where
+every other model in this repo also stops. So this section quotes **no latency
+and no accuracy numbers**: upstream's "tens of microseconds" and its 0.933 on
+three-word FLORES-200 input against 0.887 for a 293 MB detector are upstream's
+measurements, and repeating them here as if they had been observed would be the
+one thing these sections exist not to do.
+
+What is written and waiting: an eleven-language answer key across seven scripts
+in the example app's self-test, a thousand-detection timing loop, assertions on
+the router's two shortcuts (Hangul decisive, Cyrillic narrowing), the normalizer
+and its 512-scalar cap, `topK` honouring and the argument guards, and an **Ear vs
+Tongue** panel that asks both models about one recording -- Ear from the
+waveform, Tongue from the words Voz got out of it -- and reports the agreement
+rather than enforcing it. That join is the reason the model is in this repo, and
+it is the part that has not run.
+
+Off-device, 31 Jest tests cover the argument guards, the no-native-module path,
+the module-present-but-model-not-linked path, the cold-load sequencing, the
+released-handle path, the error mapping, the read-from-the-binary constants, the
+empty-script-list refusal, and the config plugin -- including a permutation test
+that runs Tongue's plugin at every position among Clear's, Emo's and Ear's and
+asserts the single `abiFilters` block those three agree on is left exactly as
+found.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -879,18 +1089,35 @@ Emo's are shorter, because the two SDKs are symmetric:
 | `modelRevision` / `modelRepo` | Read from the catalog | Constants in the module | `ai.desertant:emo` publishes `Emo`, `EmoSuggestion` and `EmojiSkinTone`, and nothing to read them from. |
 | Verified | Yes, on a simulator | No -- compiles only | No Android hardware was available. |
 
+Tongue's table is the only one where the *Apple* column is the constrained one,
+and the only one with no progress row at all -- it emits none:
+
+| | iOS | Android | Why |
+| --- | --- | --- | --- |
+| `isSupported` | **False today** | Always true | desert-ant-core v3.1.0 never exports its `Tongue` product; `ai.desertant:tongue` is published and binds normally. |
+| ABI | n/a | **Every ABI** | Pure Kotlin. No NDK, no `.so`, and so no `abiFilters` block from the config plugin -- the only cross-platform model here without one. |
+| `supportedScripts()` | The 32 names | `ERR_UNSUPPORTED_PLATFORM` | Swift's `Script` is a public `CaseIterable`; Kotlin's `Router` and `ScriptTables` are `internal`. `route.script` still works on both. |
+| `maxCharacters` | `Normalizer.maxCharacters` | `Normalizer.MAX_CHARACTERS` | Public on both, so it is read rather than duplicated -- the one constant in this package that is symmetric. |
+| `modelRevision` / `modelRepo` / `tieMargin` | Catalog, catalog, mirrored | Constants in the module | `ai.desertant:tongue` publishes `Tongue`, `Detection`, `Prediction`, `Route`, `Reliability` and `Verdict`, and nothing to read the first two from. `tieMargin` is written inline in `isTooCloseToCall` on *both* platforms, so neither can read it. |
+| Progress | None | None | Nothing downloads and no entry point takes a handler. No `ModelPhase` was added for this model. |
+| Verified | Module binds; no detection run | No -- compiles only | The product gap on one side, no Android hardware on the other. |
+
 ## Constraints an app inherits
 
 - **iOS 18.0 deployment target.** Above Expo's 16.4 default; the config plugin
   raises it. Drops iOS 16 and 17 devices.
 - **Xcode 26 / Swift 6.2** on whatever builds the app, EAS included.
-- **`arm64-v8a` + `x86_64` only.** The config plugin narrows `abiFilters`;
-  `Clear.isSupported` answers honestly if something slips through.
+- **`arm64-v8a` + `x86_64` only**, for Clear, Emo and Ear. The config plugin
+  narrows `abiFilters`; `Clear.isSupported` answers honestly if something slips
+  through. Tongue imposes none of this and its plugin writes nothing, so an app
+  that installs Tongue alone keeps every ABI.
 - **Not Expo Go.** Dev build or bust.
 - **One `desert-ant-core` bridge.** Adding a model package to an app is free;
   adding one to *this SDK* means naming its product in `DESERT_ANT_PRODUCTS` in
   `packages/core/ios/DesertAntCore.podspec`, and an app that installs one model
-  links every listed model's Swift.
+  links every listed model's Swift. The product has to *exist*: Tongue's does
+  not, and naming a product the manifest does not export fails the build rather
+  than the import.
 - **Expo Modules 2.0 is experimental in SDK 57**, beta in 58. The macros are
   additive, so any function can fall back to the 1.0 DSL individually if an
   upgrade breaks it.
@@ -903,9 +1130,24 @@ Emo's are shorter, because the two SDKs are symmetric:
 
 `DESERT_ANT_CORE_VERSION` in `packages/core/ios/DesertAntCore.podspec` — now
 the only place the Swift package's version is named — the `ai.desertant:clear`,
-`ai.desertant:emo` and `ai.desertant:ear` coordinates in the three
-`android/build.gradle` files, and the
+`ai.desertant:emo`, `ai.desertant:ear` and `ai.desertant:tongue` coordinates in
+the four `android/build.gradle` files, and the
 `coreVersion` constants in each model's Swift and Kotlin module files must move
 together. The Apple and
 Android native cores share an FFI payload schema (see the comments in Desert
 Ant's own `Clear.kt`), so a mismatched pair is a wire bug that builds cleanly.
+
+Tongue couples differently, and more tightly. Its two halves share no FFI, because
+they share no native code: they are independent ports of a frozen specification,
+kept honest upstream by golden vectors rather than by a wire format. A mismatched
+pair there is not a wire bug — it is two models that quietly disagree about the
+same three words, with nothing to fail. Upstream's `ModelCatalogTests` enforces
+that `TongueModel.sdkVersion`, `packages/tongue-node/package.json` and
+`packages/tongue-kotlin/build.gradle.kts` all say `3.1.0`; this repo's job is
+simply not to pin a Maven coordinate the podspec does not name.
+
+The other Tongue coupling is the one that is currently unsatisfiable:
+`DESERT_ANT_PRODUCTS` in the same podspec must gain `'Tongue'` the moment
+desert-ant-core exports the product, and not a release earlier — naming it before
+then fails the build outright rather than degrading. `packages/tongue/ios` is
+written against that future and compiles either way.
