@@ -8,54 +8,65 @@ import {
 
 const pkg = require('../../package.json');
 
-/** The Core ML artifact's floor, not the code's: `clear-studio.mlmodelc` is
- *  built for this deployment target and an older OS refuses to load it. */
-const IOS_DEPLOYMENT_TARGET = '18.0';
+/**
+ * The `desert-ant-core` package floor -- `platforms:` in its Package.swift -- and
+ * the only floor in play for Emo. Package.swift names Emo among the models that
+ * "run on iOS 16 and keep it", `Sources/Emo` carries no `@available`, and its
+ * catalog entry declares no `osFloor`, so `emo.mlmodelc` would load lower;
+ * SwiftPM simply refuses to resolve the package into a consumer below 17.
+ *
+ * The lowest of any model in this family -- Clear and Clips need 18 for their
+ * Core ML artifacts -- and still above Expo's 16.4 default, which is why this is
+ * a plugin rather than a line in a README: getting it wrong fails the build, and
+ * the fix is in a file `expo prebuild` regenerates.
+ */
+const IOS_DEPLOYMENT_TARGET = '17.0';
 
 /** LiteRT ships these two. A build that also targets armeabi-v7a produces an APK
- *  whose Clear AAR has no matching `.so`, and the failure surfaces at model load
+ *  whose Emo AAR has no matching `.so`, and the failure surfaces at model load
  *  rather than at build time -- so narrow it here. */
 const ANDROID_ABIS = ['arm64-v8a', 'x86_64'];
 
-const GRADLE_MARKER = '// @desert-ant-labs/react-native-clear';
+const GRADLE_MARKER = '// @desert-ant-labs/react-native-emo';
 
 /**
  * Any Desert Ant package's ABI block, not just this one's.
  *
- * Emo narrows the same two ABIs for the same LiteRT reason, and an app with both
- * installed runs both plugins over the same `build.gradle`. Matching only this
- * package's own marker would put a second `ndk { abiFilters ... }` inside
+ * Clear narrows the same two ABIs for the same LiteRT reason, and an app with
+ * both installed runs both plugins over the same `build.gradle`. Matching only
+ * this package's own marker would put a second `ndk { abiFilters ... }` inside
  * `defaultConfig` -- a duplicate that Gradle accepts and that says nothing new.
  * So each plugin defers to a block any of them already wrote, and the app ends up
  * with one.
  */
 const ANY_DESERT_ANT_ABI_MARKER = /\/\/ @desert-ant-labs\/react-native-[a-z-]+: LiteRT ships/;
 
-export interface ClearPluginProps {
+export interface EmoPluginProps {
   /**
-   * Set false to leave the app's `abiFilters` alone -- for a project that
-   * already manages its ABIs, or one deliberately shipping a 32-bit variant
-   * without Clear on it.
+   * Set false to leave the app's `abiFilters` alone -- for a project that already
+   * manages its ABIs, or one deliberately shipping a 32-bit variant without Emo
+   * on it.
    */
   restrictAbis?: boolean;
 }
 
 /**
- * Two things a Clear app needs that its own config would not otherwise say.
+ * Two things an Emo app needs that its own config would not otherwise say.
  *
  * Both are consequences of the native SDKs rather than choices this package is
- * making, which is why they are a plugin and not documentation: getting either
- * wrong produces a runtime failure on a real device and nothing at build time.
+ * making, which is why they are a plugin and not documentation: the iOS one fails
+ * the build, and the Android one produces a runtime failure on a real device with
+ * nothing said at build time.
  */
-const withClear: ConfigPlugin<ClearPluginProps | void> = (config, props) => {
+const withEmo: ConfigPlugin<EmoPluginProps | void> = (config, props) => {
   const restrictAbis = props?.restrictAbis ?? true;
 
   // Both halves are required, and neither is sufficient. The Podfile reads the
   // properties file to pick its `platform :ios`, but React Native's post-install
   // then aligns every pod target to the *app project's* deployment target -- so
   // leaving the .xcodeproj at Expo's 16.4 default makes the pods 16.4 too, and
-  // the build fails with "module 'DesertAntClear' has a minimum deployment
-  // target of iOS 18.0".
+  // the build fails with "module 'DesertAntEmo' has a minimum deployment target
+  // of iOS 17.0".
   config = withPodfileProperties(config, (podfileConfig) => {
     const current = podfileConfig.modResults['ios.deploymentTarget'];
     if (!current || parseFloat(current) < parseFloat(IOS_DEPLOYMENT_TARGET)) {
@@ -83,6 +94,12 @@ const withClear: ConfigPlugin<ClearPluginProps | void> = (config, props) => {
  * Raise every build configuration that already names a deployment target, and
  * leave alone any that does not -- a configuration inheriting the project-level
  * value should keep inheriting it rather than acquire a hardcoded one.
+ *
+ * Only ever raises, so this composes with the other Desert Ant plugins over the
+ * same project whichever order they run in: the project ends up at the highest
+ * floor any installed model needs, not at whichever plugin ran last. Emo's floor
+ * is the lowest of the family, so in a multi-model app this usually changes
+ * nothing.
  */
 export function raiseDeploymentTarget(project: {
   pbxXCBuildConfigurationSection(): Record<string, { buildSettings?: Record<string, unknown> }>;
@@ -129,4 +146,4 @@ export function withAbiFilters(contents: string): string {
   return contents.slice(0, insertAt) + block + contents.slice(insertAt);
 }
 
-export default createRunOncePlugin(withClear, pkg.name, pkg.version);
+export default createRunOncePlugin(withEmo, pkg.name, pkg.version);

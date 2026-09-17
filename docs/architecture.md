@@ -186,6 +186,81 @@ by 8% of its length comes back **untouched**, still overlapping. That is correct
 and it surprises anyone who asserts "no word overlaps a filler" afterwards —
 including, briefly, this repo's own self-test.
 
+## What Desert Ant ships for Emo (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Emo` in `desert-ant-core` | A ~4.6 MB `emo.mlmodelc` plus two sidecars: `emo_tokenizer.bin` (~0.75 MB) and a tiny `emo_meta.json`. No `@available` and no `osFloor`, so its floor is the package's `iOS 17`. |
+| Kotlin | `ai.desertant:emo:3.1.0` on Maven Central | Plain AAR; `ai.desertant:core` comes transitively. Same API as Swift: `suggestions(text, limit, skinTone)`. |
+| JavaScript | `@desert-ant-labs/emo` | LiteRT.js in the browser, a prebuilt native core in Node. **Neither is usable from React Native.** |
+
+This is the first model since Clear with a real Android half, and it breaks the
+pattern the middle three established. The four "iOS only" shapes in this repo are
+now: Voz has no Android *artifact*; Clips has files and no *package*; Uhm has
+**neither half of the model**; and Emo has **both** — a LiteRT export and a
+published AAR — so it is simply not in that list.
+
+That makes `isSupported` mean something different here than it does for the other
+three. Off Apple it is not a statement about the catalog but about the *device*:
+LiteRT ships `arm64-v8a` and `x86_64`, and an ABI outside those has no `.so` to
+load. So unlike Uhm, whose reason is a constant the TypeScript side can state
+alone, Emo computes `unsupportedReason` natively — only the Android half knows
+which ABIs the device actually reported.
+
+### The two SDKs are symmetric, for once
+
+Clear's whole design is downstream of an asymmetry: Swift has a file API, Kotlin
+has samples only, so half the Android module is a decoder this repo had to write.
+Emo has no such gap. Both SDKs take a string and return `[(emoji, confidence)]`,
+both fuse download and session build into one `download()`, and both apply the
+skin tone in the shared native core after the ranking. The Android module is
+therefore the thinnest in this repo — a module, a shared object, two records and
+the exceptions — with nothing in it that is not also on the Apple side.
+
+One difference survives, and it is Clear's: Kotlin's `download()` takes no
+callback, so Android reports progress as phase boundaries rather than fractions.
+It matters less here. The download is ~11 MB, not ~490.
+
+### Nothing to marshal, in either direction
+
+Emo is the easiest case yet for the constraint that shaped Clear. A `String` goes
+in; a short array of two-field records comes back. No buffer, no shared object for
+the result, no two-call handshake — and, unlike Uhm, not even a `Float32Array` to
+copy before the first suspension.
+
+The one thing worth noting is what is *not* exposed. `EmoSuggestion` upstream
+carries an `id` alongside `emoji` and `confidence`, and the id is the emoji — a
+`SwiftUI.Identifiable` conformance rather than data. Forwarding it would put the
+same string in a record twice and give a JavaScript caller a second field to keep
+true, so `EmoSuggestionRecord` drops it.
+
+### The skin tone is not the model's
+
+`skinTone` reads like an inference parameter and is not one. The classifier's
+~800 labels are toneless; `applyingSkinTone` walks the result's Unicode scalars
+and appends a modifier to the ones whose base accepts one. So the tone cannot
+change which emoji come back or in what order — worth knowing before building a
+UI that re-ranks when the tone changes, because nothing will move.
+
+It crosses the wire as the Swift enum's lowerCamelCase spelling on both
+platforms, which means the Kotlin half maps rather than calling `valueOf`: the
+Kotlin enum is `MEDIUM_LIGHT` where the wire says `mediumLight`. Mapping
+explicitly is also what turns an unknown tone into a coded
+`ERR_INVALID_ARGUMENT` instead of an `IllegalArgumentException` from the enum.
+
+### Two plugins now write to the same `build.gradle`
+
+Clear narrowed `abiFilters` for a LiteRT constraint. Emo has the same constraint,
+so it narrows the same two ABIs — and an app with both installed runs both
+plugins over one generated file. Each plugin originally matched only its own
+marker comment, which would have produced two `ndk { abiFilters }` blocks inside
+one `defaultConfig`: accepted by Gradle, and saying nothing the first did not.
+
+Both now match a shared pattern instead, so whichever runs first writes the block
+and the other defers to it. This is the general shape of the composition rule the
+iOS plugins already followed — *only ever raise* — applied to a file where "raise"
+has no meaning and "write once, across all of us" does.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -485,6 +560,66 @@ simulator the Clips leg never ran and reported nothing. Three independent legs
 now, each skipped if its model is not prepared: a smoke test that can only tell
 you about its first failure is most of a smoke test missing.
 
+### Emo, end to end
+
+Emo was the cheapest model here to verify and the most complete result: no audio
+fixture, no permission dialog, no long download. On the same iOS 26.4 simulator,
+the module binds and reports every `@JS` property including the `[String]` return:
+
+```
+[emo] isSupported=true nativeCore=3.1.0 revision=v0.7.0 repo=desert-ant-labs/emo
+      limit=3 tones=default/light/mediumLight/medium/mediumDark/dark
+[emo] ready in 7585ms downloaded=true          # ~2.6 s warm on later launches
+```
+
+and suggestion works through the app's own text field. "Pay my bills" returns
+💰 0.64, 📄 0.12, 💳 0.05, 🏠 0.03 — against the 0.62 upstream's README quotes for
+that phrase.
+
+The claim worth testing by hand is the multilingual one, because it is the
+difference between this model and a keyword table. One intent, three languages,
+three scripts, and the same top answer:
+
+| | Top suggestions |
+| --- | --- |
+| `Pay my bills` | 💰 📄 💳 🏠 |
+| `Pagar mis facturas` | 💰 🧾 📄 💳 ✅ 🏠 |
+| `請求書を払う` | 💰 📄 🧾 📮 💳 ✅ |
+
+Latency was 60 ms on the first call and **5–16 ms** after, measured in JavaScript
+around `suggest` so the bridge hop is inside the number. Upstream's <2 ms is the
+model alone, and a simulator is the CPU path, so this is a ceiling.
+
+The skin-tone path was exercised and behaves as the docs describe rather than as
+the name suggests: `skinTone: 'dark'` turned 🏃 into 🏃🏿 (U+1F3C3 U+1F3FF) and left
+👟 🏁 🛒 🎽 💨 alone, with the ranking and every confidence identical to the
+default-tone run. That is the concrete form of "the tone is applied after the
+ranking" — nothing about the ranking moves.
+
+**One dev-only rough edge showed up**, and it is worth recording because it is
+structural rather than Emo's:
+
+```
+[emo] suggest FAILED: ERR_INFERENCE_FAILED: NotFoundException:
+      Unable to find the native shared object associated with given JavaScript object
+```
+
+Fast Refresh tears down the native shared-object registry while a pending timer
+still holds the JavaScript half of the model. Every package here builds on
+`@SharedObject`, so every one is exposed to it — Emo is simply the only model that
+calls a model from a *timer* rather than from a tap, so it is the only one that
+can fire into the gap. It does not arise in a production build, where nothing
+reloads the JS under a live model.
+
+The misleading part is the code. A dead handle is much closer to `ERR_RELEASED`
+than to `ERR_INFERENCE_FAILED`, but the exception is raised by ExpoModulesCore
+while *converting the argument*, before any code in this repo runs, so there is
+nothing to catch and re-map. Re-mapping it would have to happen in
+`toDesertAntError` in `packages/core`, for all five models at once, against an
+error shape only observed here. The example app recovers instead — release the
+handle, re-prepare — which is the right response to any `suggest` failure an app
+did not cause.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -509,7 +644,7 @@ and no `@Record`/`@SharedObject` to lean on.
 These are consequences of the upstream SDKs. They are documented in the
 TypeScript types rather than papered over.
 
-These are Clear's; Voz has no Android half to differ from.
+These are Clear's; Voz, Clips and Uhm have no Android half to differ from.
 
 | | iOS | Android | Why |
 | --- | --- | --- | --- |
@@ -518,6 +653,15 @@ These are Clear's; Voz has no Android half to differ from.
 | `variant: 'clear-natural'` | Supported | Throws `ERR_INVALID_ARGUMENT` | `Clear(context, directory)` is the entire Kotlin constructor; there is no variant to pass. |
 | `warm()` | Downloads *and* builds the session | Downloads only | LiteRT session construction is lazy inside the first `enhance`. |
 | Verified | Yes, on an iPhone 16 | No -- compiles only | No Android hardware was available. |
+
+Emo's are shorter, because the two SDKs are symmetric:
+
+| | iOS | Android | Why |
+| --- | --- | --- | --- |
+| `ProgressEvent.fraction` | A real fraction | `0` entering a phase, `1` leaving it | Kotlin `Emo.download()` takes no progress handler. |
+| `isSupported` | Always true | False on an ABI LiteRT does not ship | The Core ML export has no device constraint; the LiteRT one has two ABIs. |
+| `modelRevision` / `modelRepo` | Read from the catalog | Constants in the module | `ai.desertant:emo` publishes `Emo`, `EmoSuggestion` and `EmojiSkinTone`, and nothing to read them from. |
+| Verified | Yes, on a simulator | No -- compiles only | No Android hardware was available. |
 
 ## Constraints an app inherits
 
@@ -542,8 +686,9 @@ These are Clear's; Voz has no Android half to differ from.
 ## Version coupling
 
 `DESERT_ANT_CORE_VERSION` in `packages/core/ios/DesertAntCore.podspec` — now
-the only place the Swift package's version is named — the `ai.desertant:clear`
-coordinate in `android/build.gradle`, and the `coreVersion` constants in each
-model's Swift and Kotlin module files must move together. The Apple and
+the only place the Swift package's version is named — the `ai.desertant:clear` and
+`ai.desertant:emo` coordinates in the two `android/build.gradle` files, and the
+`coreVersion` constants in each model's Swift and Kotlin module files must move
+together. The Apple and
 Android native cores share an FFI payload schema (see the comments in Desert
 Ant's own `Clear.kt`), so a mismatched pair is a wire bug that builds cleanly.

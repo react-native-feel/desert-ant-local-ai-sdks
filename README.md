@@ -5,17 +5,19 @@ on-device models. Desert Ant ships Swift, Kotlin and JavaScript/WebAssembly SDKs
 from [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core); this
 repository is the React Native one they do not.
 
-Four models so far, and they compose into one pipeline: **Clear** cleans a
+Five models so far. Four of them compose into one pipeline: **Clear** cleans a
 recording up — denoise, dereverb, loudness-normalize — **Voz** reads it back as a
 transcript with word-level timestamps, **Clips** picks the moments worth cutting,
-and **Uhm** finds every "um" in the same audio without reading a word of it.
-Entirely offline.
+and **Uhm** finds every "um" in the same audio without reading a word of it. The
+fifth, **Emo**, reads text rather than audio: a phrase in, the emoji that fit it
+out. Entirely offline.
 
 ```ts
 import { Clear } from '@desert-ant-labs/react-native-clear';
 import { Voz } from '@desert-ant-labs/react-native-voz';
 import { Clips } from '@desert-ant-labs/react-native-clips';
 import { Uhm } from '@desert-ant-labs/react-native-uhm';
+import { Emo } from '@desert-ant-labs/react-native-emo';
 
 const { uri } = await (await Clear.load()).enhance({ uri: recording.uri });
 const { words } = await (await Voz.load()).transcribe({ uri });
@@ -27,12 +29,20 @@ const moments = await clips.find({ sentences: Clips.toSentences(words) });
 const { fillers } = await (await Uhm.load()).analyze({ uri });
 // fillers[0] -> { type: 'um', start: 4.21, end: 4.47, confidence: 0.88 }
 const clean = Uhm.reconcileWords(words, fillers);  // word spans that miss the ums
+
+const emoji = await (await Emo.load()).suggest('Pay my bills');
+// emoji[0] -> { emoji: '💰', confidence: 0.62 }
 ```
 
 Uhm is the one that does not sit in the chain: it reads the waveform, so it runs
 on the same file the others do but waits for none of them. What it wants a
 transcript *for* is `reconcileWords`, which trims the word spans around the
 fillers so a cut lands on silence rather than through a word.
+
+Emo is not in the chain either, and not in the medium: it takes text. It is here
+because it is the same lifecycle — create, load, call, release — over a model
+that shares nothing else with the other four, and because at ~5 MB and ~2 ms it
+is the one you can call on every keystroke.
 
 ## Packages
 
@@ -42,26 +52,28 @@ fillers so a cut lands on silence rather than through a word.
 | [`@desert-ant-labs/react-native-voz`](packages/voz) | The Voz model: file in, transcript with word timings out. **iOS only.** |
 | [`@desert-ant-labs/react-native-clips`](packages/clips) | The Clips model: transcript in, ranked highlights with playable spans out. **iOS 18+ only.** |
 | [`@desert-ant-labs/react-native-uhm`](packages/uhm) | The Uhm model: audio in, frame-precise filler-word spans out. No transcript needed. **iOS only.** |
+| [`@desert-ant-labs/react-native-emo`](packages/emo) | The Emo model: short text in, ranked emoji with confidences out, 22 languages. iOS + Android. |
 | [`@desert-ant-labs/react-native-core`](packages/core) | Types, error codes and lifecycle contracts shared by every model SDK here — and the single native bridge to the `desert-ant-core` Swift package. |
-| [`apps/example`](apps/example) | Record → enhance → transcribe → rank highlights → find the fillers, on a dev build. |
+| [`apps/example`](apps/example) | Record → enhance → transcribe → rank highlights → find the fillers, plus a text field for Emo, on a dev build. |
 
 ## How it is built
 
 The native work is **not** a reimplementation. Each package is a thin Expo module
 over Desert Ant's own platform SDKs:
 
-- **iOS** links the `Clear`, `Voz`, `Clips` and `Uhm` products of the `desert-ant-core`
+- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm` and `Emo` products of the `desert-ant-core`
   Swift package, pulled in through React Native's `spm_dependency` bridge — that
   package ships as SPM only, with no podspec and no XCFramework. The bridge is
   declared exactly once, by the `DesertAntCore` pod, because two pods each
   linking the same package duplicates its thirteen shared objects and fails to
   link; see [`packages/core`](packages/core#the-desertantcore-pod).
-- **Android** depends on `ai.desertant:clear` from Maven Central, which brings
-  LiteRT and the shared native core with it. Only Clear has an Android half:
-  **Voz** drives Core ML directly and upstream ships no artifact for it at all,
-  **Clips** has LiteRT files declared but no published Android package to bind to
-  yet, and **Uhm** has neither half — no LiteRT export of the detector, and a type
-  labeller that is a SoundAnalysis classifier and so Apple-only by construction.
+- **Android** depends on `ai.desertant:clear` and `ai.desertant:emo` from Maven
+  Central, which bring LiteRT and the shared native core with them. Those two are
+  the only models with an Android half: **Voz** drives Core ML directly and
+  upstream ships no artifact for it at all, **Clips** has LiteRT files declared
+  but no published Android package to bind to yet, and **Uhm** has neither half —
+  no LiteRT export of the detector, and a type labeller that is a SoundAnalysis
+  classifier and so Apple-only by construction.
 
 The Apple half is written against the **Expo Modules 2.0** macros (`@ExpoModule`,
 `@JS`, `@SharedObject`, `@Record`, `@Event`), which ship for Swift in
@@ -81,9 +93,13 @@ filler spans in eleven seconds of real speech, with the type labeller and
 `reconcileWords` both exercised — and the example app's own record, clean and
 detect flow returns them through the UI. Voz binds and reports correctly but its
 transcription has not been run; that needs ~490 MB of weights and a Neural
-Engine, which a simulator does not have. Android compiles but has not been run —
-no device was available. Each package's README says exactly what was and was not
-exercised.
+Engine, which a simulator does not have. Emo is verified end to end on a simulator too: it
+downloads, loads in 7.6 s, and answers "Pay my bills" with 💰 at 0.64 in 5–16 ms
+— and the same phrase in Spanish and Japanese ranks 💰 first as well, which is
+the multilingual claim rather than a keyword table. Its skin-tone path is
+exercised and the ranking is unchanged by it, as documented. Android compiles but
+has not been run — no device was available. Each package's
+README says exactly what was and was not exercised.
 
 ## Requirements
 
@@ -91,14 +107,16 @@ exercised.
 | --- | --- |
 | Expo SDK | 57+ (`expo-modules-core` 57 is where the 2.0 macros live) |
 | React Native | 0.75+ for `spm_dependency`; 0.83 in the example |
-| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz or Uhm alone |
+| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm or Emo alone |
 | Xcode | 26 (`desert-ant-core` is `swift-tools-version: 6.2`) |
 | Android | API 24+, `arm64-v8a` and `x86_64` only |
 | Expo Go | Not supported — these are native modules, so use a dev build |
 
 Each package's bundled config plugin raises the iOS deployment target — and
-Clear's also narrows the Android ABIs — so add whichever packages you use to
-`plugins` in your app config. The plugins only ever raise, so they compose.
+Clear's and Emo's also narrow the Android ABIs to the two LiteRT ships — so add
+whichever packages you use to `plugins` in your app config. The plugins only ever
+raise, and the two that touch `build.gradle` defer to each other's block, so they
+compose.
 
 ## Develop
 

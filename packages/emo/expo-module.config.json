@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["EmoModule"]
+  },
+  "android": {
+    "modules": ["ai.desertant.rn.emo.EmoModule"]
+  }
+}

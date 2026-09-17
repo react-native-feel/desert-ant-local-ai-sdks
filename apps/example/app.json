@@ -25,7 +25,8 @@
       "@desert-ant-labs/react-native-clear",
       "@desert-ant-labs/react-native-voz",
       "@desert-ant-labs/react-native-clips",
-      "@desert-ant-labs/react-native-uhm"
+      "@desert-ant-labs/react-native-uhm",
+      "@desert-ant-labs/react-native-emo"
     ],
     "scheme": "clearexample"
   }

@@ -5,6 +5,7 @@ import {
   type ProgressEvent,
 } from '@desert-ant-labs/react-native-clear';
 import { Clips, type Clip } from '@desert-ant-labs/react-native-clips';
+import { Emo, type EmojiSkinTone, type EmoSuggestion } from '@desert-ant-labs/react-native-emo';
 import { Uhm, type UhmResult } from '@desert-ant-labs/react-native-uhm';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
 import { File, Paths } from 'expo-file-system';
@@ -24,6 +25,7 @@ import {
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 
@@ -32,6 +34,12 @@ import {
  * device with Clear, transcribe the enhanced audio with Voz, hand that
  * transcript to Clips to find the moments worth cutting, and run Uhm over the
  * same audio to find every "um" in it.
+ *
+ * Then a fifth that is not in that chain at all. Emo reads text, not audio, so it
+ * has its own field at the bottom: type a phrase and the emoji that fit it come
+ * back. It is here rather than in a separate app because it is the same lifecycle
+ * -- create, load, call, release -- over a model that shares nothing else with the
+ * other four, which is the part worth being able to see side by side.
  *
  * The whole point of the file APIs is visible here: the recording never becomes
  * a JavaScript array. `recorder.uri` goes into Clear, an enhanced `uri` comes
@@ -58,6 +66,7 @@ export default function App() {
   const voz = useRef<Voz | null>(null);
   const clips = useRef<Clips | null>(null);
   const uhm = useRef<Uhm | null>(null);
+  const emo = useRef<Emo | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -90,6 +99,22 @@ export default function App() {
   // difference is the words Voz placed over an "um" -- dropped or trimmed.
   const [reconciled, setReconciled] = useState<{ before: number; after: number } | null>(null);
 
+  // Emo loads on mount like Clear and Uhm -- a few megabytes -- so `loading` is
+  // the honest starting state rather than `absent`.
+  const [emoState, setEmoState] = useState<ModelState>(
+    Emo.isSupported ? 'loading' : 'unsupported'
+  );
+  const [phrase, setPhrase] = useState('');
+  // The tone is per call, not per model, so changing it re-asks the same loaded
+  // model. Nothing about the ranking moves -- the vocabulary is toneless and the
+  // modifier is appended afterwards -- which is the point worth seeing.
+  const [tone, setTone] = useState<EmojiSkinTone>('default');
+  const [emoji, setEmoji] = useState<EmoSuggestion[] | null>(null);
+  // Measured around the call, not reported by the model: Emo returns suggestions
+  // and nothing else, and the claim worth checking on a real device is that this
+  // number is small enough to run per keystroke.
+  const [emoMs, setEmoMs] = useState<number | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -110,6 +135,12 @@ export default function App() {
       `[uhm] isSupported=${Uhm.isSupported} nativeCore=${Uhm.nativeCoreVersion} ` +
         `revision=${Uhm.modelRevision?.slice(0, 7)} ` +
         `bias=${JSON.stringify(Uhm.biasThresholds)} types=${Uhm.fillerTypes.join('/')}`
+    );
+    console.log(
+      `[emo] isSupported=${Emo.isSupported} nativeCore=${Emo.nativeCoreVersion} ` +
+        `revision=${Emo.modelRevision} repo=${Emo.modelRepo} ` +
+        `limit=${Emo.defaultLimit} tones=${Emo.skinTones.join('/')}` +
+        `${Emo.unsupportedReason ? ` reason=${Emo.unsupportedReason}` : ''}`
     );
   }, []);
 
@@ -169,6 +200,11 @@ export default function App() {
       if (cancelled || !Uhm.isSupported) return;
       void prepareUhm(false);
 
+      // Emo is ~5 MB, the smallest model here by an order of magnitude, so it
+      // loads on mount with less to justify than any of the others.
+      if (cancelled || !Emo.isSupported) return;
+      void prepareEmo();
+
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
       if (cancelled || !Voz.isSupported) return;
@@ -200,6 +236,8 @@ export default function App() {
       clips.current = null;
       uhm.current?.release();
       uhm.current = null;
+      emo.current?.release();
+      emo.current = null;
     };
   }, []);
 
@@ -287,6 +325,74 @@ export default function App() {
       }
     }
   }, []);
+
+  /**
+   * Get Emo ready: ~5 MB and a session build in milliseconds. It never announces
+   * itself through `busy` -- it is small enough that a global "preparing" banner
+   * would be on screen for less time than it takes to read.
+   */
+  const prepareEmo = useCallback(async () => {
+    if (emo.current) return;
+    setEmoState('loading');
+    try {
+      const t0 = Date.now();
+      const model = await Emo.load();
+      emo.current = model;
+      setEmoState('ready');
+      console.log(`[emo] ready in ${Date.now() - t0}ms downloaded=${model.isDownloaded()}`);
+    } catch (e) {
+      console.log(`[emo] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setEmoState('absent');
+    }
+  }, []);
+
+  /**
+   * Suggest emoji for whatever is in the field.
+   *
+   * Called from a 150 ms debounce below rather than from `onChangeText` directly.
+   * Not to protect the model -- a suggestion is about two milliseconds, and this
+   * is the one model here where per-keystroke inference is the intended use --
+   * but to keep React from re-rendering a suggestion row on every frame of a fast
+   * typist. The timing printed next to the result is the evidence for that claim
+   * on a real device.
+   */
+  const runSuggest = useCallback(async (text: string, skinTone: EmojiSkinTone = 'default') => {
+    const model = emo.current;
+    if (!model) return;
+    if (text.trim().length === 0) {
+      setEmoji(null);
+      setEmoMs(null);
+      return;
+    }
+    try {
+      const t0 = Date.now();
+      const suggestions = await model.suggest(text, { limit: 6, skinTone });
+      setEmoMs(Date.now() - t0);
+      setEmoji(suggestions);
+    } catch (e) {
+      console.log(`[emo] suggest FAILED: ${describe(e)}`);
+      setError(describe(e));
+      // Drop the handle and rebuild it. This exists for one case, and it is a
+      // development one: Fast Refresh tears down the native shared-object
+      // registry while this closure still holds the JavaScript half, so the next
+      // call lands on a model whose native side is gone
+      // ("Unable to find the native shared object..."). Emo is the only model
+      // here that can hit it, because it is the only one that calls a model from
+      // a timer rather than from a tap.
+      emo.current?.release();
+      emo.current = null;
+      void prepareEmo();
+    }
+  }, [prepareEmo]);
+
+  // Debounce the field into `runSuggest`. The cleanup cancels the pending timer
+  // on every keystroke, so only the last one in a burst reaches the model.
+  useEffect(() => {
+    if (emoState !== 'ready') return;
+    const timer = setTimeout(() => void runSuggest(phrase, tone), 150);
+    return () => clearTimeout(timer);
+  }, [phrase, tone, emoState, runSuggest]);
 
   /**
    * Find the fillers in a file, and -- when there is a transcript for the same
@@ -1101,9 +1207,123 @@ export default function App() {
           </>
         ) : null}
       </View>
+
+      <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Emo</Text>
+
+        {emoState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Emo.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {emoState === 'absent' ? (
+          <>
+            <Text style={styles.note}>
+              Preparing Emo failed. It is about 5 MB — the smallest model here —
+              so this is worth retrying.
+            </Text>
+            <Button
+              label="Retry (~5 MB)"
+              onPress={() => void prepareEmo()}
+              disabled={busy !== null}
+              tone="ghost"
+            />
+          </>
+        ) : null}
+
+        {emoState === 'loading' ? (
+          <Text style={styles.note}>Preparing — about 5 MB if it is not already here.</Text>
+        ) : null}
+
+        {emoState === 'ready' ? (
+          <>
+            <Text style={styles.note}>
+              Type a task or a message. Emo reads text rather than audio, so this
+              is the one model here that needs no recording — and it answers in
+              about two milliseconds, which is what makes a suggestion per
+              keystroke reasonable.
+            </Text>
+            <TextInput
+              value={phrase}
+              onChangeText={setPhrase}
+              placeholder="Pay my bills"
+              autoCorrect={false}
+              autoCapitalize="none"
+              style={styles.input}
+            />
+            {/* Three languages and one intent, so the multilingual claim is
+                something a tester can tap rather than take on trust: the same
+                phrase in Spanish and Japanese should land on the same emoji. */}
+            <View style={styles.phrases}>
+              {SAMPLE_PHRASES.map((sample) => (
+                <Pressable
+                  key={sample}
+                  onPress={() => setPhrase(sample)}
+                  style={({ pressed }) => [styles.phrase, pressed && styles.buttonPressed]}>
+                  <Text style={styles.phraseText}>{sample}</Text>
+                </Pressable>
+              ))}
+            </View>
+            {/* Read off the linked binary rather than hardcoded, so this row is
+                whatever the native enum actually accepts. */}
+            <View style={styles.phrases}>
+              {Emo.skinTones.map((option) => (
+                <Pressable
+                  key={option}
+                  onPress={() => setTone(option)}
+                  style={({ pressed }) => [
+                    styles.phrase,
+                    option === tone && styles.phraseSelected,
+                    pressed && styles.buttonPressed,
+                  ]}>
+                  <Text style={[styles.phraseText, option === tone && styles.phraseTextSelected]}>
+                    {option}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </>
+        ) : null}
+
+        {emoji ? (
+          <>
+            <Row label="Suggestions" value={`${emoji.length}`} />
+            <Row label="Latency" value={emoMs === null ? '—' : `${emoMs} ms`} />
+            {emoji.length === 0 ? (
+              <Text style={styles.note}>Nothing suggested.</Text>
+            ) : (
+              <View style={styles.words}>
+                {emoji.map((suggestion, index) => (
+                  <View key={`${index}-${suggestion.emoji}`} style={styles.emoji}>
+                    <Text style={styles.emojiGlyph}>{suggestion.emoji}</Text>
+                    <Text style={styles.wordTime}>{suggestion.confidence.toFixed(2)}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </>
+        ) : null}
+      </View>
     </ScrollView>
   );
 }
+
+/**
+ * One intent in three languages, plus two that are not about money at all.
+ *
+ * The point of the first three is the semantic stream: Emo's vocabulary is
+ * toneless and language-free, so "Pay my bills" and its Spanish and Japanese
+ * translations should rank the same emoji. That is the claim that separates this
+ * model from a keyword table, and it is cheap to check by tapping.
+ */
+const SAMPLE_PHRASES = [
+  'Pay my bills',
+  'Pagar mis facturas',
+  '請求書を払う',
+  'go for a run',
+  'call mum on her birthday',
+];
 
 /** How far along a model is. Shared by the two that download on demand. */
 type ModelState = 'unsupported' | 'absent' | 'loading' | 'ready';
@@ -1286,6 +1506,36 @@ const styles = StyleSheet.create({
     paddingVertical: 4,
     alignItems: 'center',
   },
+  input: {
+    borderWidth: 1,
+    borderColor: '#d0d7de',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 12,
+    fontSize: 17,
+    marginTop: 4,
+  },
+  phrases: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, marginTop: 8 },
+  phrase: {
+    borderWidth: 1,
+    borderColor: '#1f6feb',
+    borderRadius: 999,
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+  },
+  phraseText: { color: '#1f6feb', fontSize: 13 },
+  phraseSelected: { backgroundColor: '#1f6feb' },
+  phraseTextSelected: { color: 'white' },
+  emoji: {
+    borderWidth: 1,
+    borderColor: '#d0d7de',
+    borderRadius: 8,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    alignItems: 'center',
+    gap: 2,
+  },
+  emojiGlyph: { fontSize: 28 },
   wordText: { fontWeight: '600' },
   wordTime: { fontSize: 11, opacity: 0.5, fontVariant: ['tabular-nums'] },
 });
