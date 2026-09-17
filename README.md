@@ -5,7 +5,7 @@ on-device models. Desert Ant ships Swift, Kotlin and JavaScript/WebAssembly SDKs
 from [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core); this
 repository is the React Native one they do not.
 
-Nine models so far. Five of them compose into one pipeline: **Clear** cleans a
+Ten models so far. Five of them compose into one pipeline: **Clear** cleans a
 recording up — denoise, dereverb, loudness-normalize — **Ear** names the language
 it is in, **Voz** reads it back as a transcript with word-level timestamps,
 **Clips** picks the moments worth cutting, and **Uhm** finds every "um" in the
@@ -15,7 +15,10 @@ takes three words and names the language they are in — the same question Ear
 answers, from the other kind of evidence — **Gist** takes a headline or a
 post and names what it is *about*, from a fixed 36-topic taxonomy across 101
 languages, and **Redact** finds the people in a piece of text and masks them,
-reversibly, before it goes anywhere. Entirely offline.
+reversibly, before it goes anywhere. The tenth reads neither sound nor words:
+**Shapes** takes one hand-drawn stroke and gives back a clean line, rectangle,
+triangle, ellipse or star — or nothing, when what was drawn was not a shape.
+Entirely offline.
 
 ```ts
 import { Clear } from '@desert-ant-labs/react-native-clear';
@@ -27,6 +30,7 @@ import { Ear } from '@desert-ant-labs/react-native-ear';
 import { Tongue } from '@desert-ant-labs/react-native-tongue';
 import { Gist, channelTopics } from '@desert-ant-labs/react-native-gist';
 import { Redact, restore } from '@desert-ant-labs/react-native-redact';
+import { Shapes, outline } from '@desert-ant-labs/react-native-shapes';
 
 const { uri } = await (await Clear.load()).enhance({ uri: recording.uri });
 
@@ -61,6 +65,11 @@ channelTopics(scored.map((s) => ({ topics: s.scores })));
 const masked = await (await Redact.load()).redaction(words.map((w) => w.text).join(' '));
 masked.redactedText;   // '… [GIVEN_NAME_1] … [EMAIL_1] …' — safe to send somewhere
 restore(masked, summaryFromAnLLM);   // the originals put back, on device
+
+const { shape } = await (await Shapes.load()).recognize(strokePoints);
+// shape -> { kind: 'ellipse', center: {...}, semiMajor: 72.3, semiMinor: 72.3 }
+//          semiMajor === semiMinor: a wobbly loop snapped to an exact circle
+outline(shape);   // the polyline to draw. No model, no bridge hop.
 ```
 
 Ear sits ahead of Voz rather than beside it, and that is the point of it: Voz does
@@ -113,6 +122,19 @@ that is two detectors rather than one: a six-layer multilingual token classifier
 for names and places, and a checksum layer in front of it that owns cards, IBANs,
 SSNs and the rest outright.
 
+Shapes is in neither medium and neither chain. Its input is a *stroke* — an
+ordered list of x, y points off a canvas — which makes it the first model here
+that reads the screen rather than the microphone or a string, and the only one
+whose whole output is geometry. It is also the smallest by a long way: 0.2 MB on
+Apple, a twenty-fifth of Emo, with a pass upstream advertises at under ten
+milliseconds and this repo measured at a 2.0 ms median. It is two stages, and
+knowing that explains most of what it does: a tiny classifier proposes a class, a
+geometric fitter produces the clean parameters *and* a fit residual, and the
+stroke is kept only if it clears that class's calibrated confidence **and**
+residual gates. So a scribble comes back as nothing — which is half the product,
+because a whiteboard that turns a scribble into a triangle is worse than one that
+leaves it alone.
+
 ## Packages
 
 | Package | What it is |
@@ -126,15 +148,16 @@ SSNs and the rest outright.
 | [`@desert-ant-labs/react-native-tongue`](packages/tongue) | The Tongue model: three words in, the language they are in out, across 84. 2 MB bundled, nothing downloaded. **Android; the Apple half is written and blocked on an upstream product export.** |
 | [`@desert-ant-labs/react-native-gist`](packages/gist) | The Gist model: text in, ranked topics from a fixed 36-topic taxonomy out, 101 languages. Plus a channel roll-up that needs no model. iOS + Android. |
 | [`@desert-ant-labs/react-native-redact`](packages/redact) | The Redact model: text in, the same text with every person masked by a numbered placeholder out — plus the mapping to put them back. 27 languages. iOS + Android. |
+| [`@desert-ant-labs/react-native-shapes`](packages/shapes) | The Shapes model: one hand-drawn stroke in, a clean line, rectangle, triangle, ellipse or star out — snapped to circles, squares and axes. 0.2 MB. iOS + Android. |
 | [`@desert-ant-labs/react-native-core`](packages/core) | Types, error codes and lifecycle contracts shared by every model SDK here — and the single native bridge to the `desert-ant-core` Swift package. |
-| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue, Gist and Redact — a roll-up of what the sample transcript is about, and the same transcript with its people masked — on a dev build. |
+| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue, Gist and Redact — a roll-up of what the sample transcript is about, and the same transcript with its people masked — and a canvas you draw one stroke on for Shapes. A dev build. |
 
 ## How it is built
 
 The native work is **not** a reimplementation. Each package is a thin Expo module
 over Desert Ant's own platform SDKs:
 
-- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Gist` and `Redact` products of the `desert-ant-core`
+- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Gist`, `Redact` and `Shapes` products of the `desert-ant-core`
   Swift package, pulled in through React Native's `spm_dependency` bridge — that
   package ships as SPM only, with no podspec and no XCFramework. The bridge is
   declared exactly once, by the `DesertAntCore` pod, because two pods each
@@ -144,20 +167,31 @@ over Desert Ant's own platform SDKs:
   imports swift-numerics' `RealModule`, which needs `_NumericsShims` — so its
   podspec was the first to put a SwiftPM checkout on `SWIFT_INCLUDE_PATHS`.
   Redact is the second and needs the identical line, for `Double.exp` in its
-  BIOES softmax: any `desert-ant-core` product that depends on swift-numerics
-  needs it, which is now a rule rather than an incident.
+  BIOES softmax; Shapes is the third, and the most explicit — `Package.swift`
+  carries a comment above its entry saying its geometric fitters replace
+  Apple-only `simd` with a portable `V2`, so their transcendental math comes from
+  swift-numerics. Any `desert-ant-core` product that depends on swift-numerics
+  needs that include path, which is now a rule rather than an incident: Shapes'
+  pod was written with the line already in it and built on the first attempt.
   **Tongue is
   the one model not in that list**, and not by choice: desert-ant-core v3.1.0
   declares a `Tongue` product and never adds it to the manifest's `products:`
   array, so naming it fails the build rather than the import. Its Apple sources
   are written and guarded by `#if canImport(Tongue)`.
 - **Android** depends on `ai.desertant:clear`, `ai.desertant:emo`,
-  `ai.desertant:ear`, `ai.desertant:gist` and `ai.desertant:redact` from Maven
+  `ai.desertant:ear`, `ai.desertant:gist`, `ai.desertant:redact` and
+  `ai.desertant:shapes` from Maven
   Central, which bring
   LiteRT and the shared native core with them, and on `ai.desertant:tongue`, which
   brings **nothing** — it is a pure-Kotlin port of the same frozen specification
   the Swift target implements, with no NDK and no `.so`, so it is the only model
-  here with no ABI constraint on Android. Those six are the only models with an
+  here with no ABI constraint on Android. Shapes is the one that makes that
+  distinction worth stating: its fitters and its snapping are pure portable
+  arithmetic, which makes a Tongue-shaped pure-Kotlin AAR sound plausible, and it
+  is not one — stage one is a neural classifier, the catalog ships
+  `shapes.tflite`, and `ShapesNative.ensureLoaded()` loads `libShapesAndroid.so`.
+  What settles the question is whether the Kotlin SDK has a `NativeModelApi`
+  under it. Those seven are the only models with an
   Android half: **Voz**
   drives Core ML directly and
   upstream ships no artifact for it at all, **Clips** has LiteRT files declared
@@ -224,7 +258,19 @@ arrive with a sub-1 confidence — so neither field reads as provenance. Gist's 
 Redact's Android halves are the two in this repo that have **not even been
 compiled** — there is no usable Android SDK on the machine this was built on, and
 the older packages' "Android compiles but has not been run" is itself an
-unverified claim that is being corrected separately. Each package's
+unverified claim that is being corrected separately. Shapes is verified end to end
+on a simulator as the tenth pod in the same app, and it is the fastest and
+smallest thing here: 0.2 MB of weights, and six synthetic hand-drawn strokes
+recognized at **min 1.0 ms, median 2.0 ms, max 9.7 ms** natively — the maximum
+being the first inference after the session was built. A wobbly loop came back an
+**exact circle** (`semiMajor === semiMinor`, r 72.3), a 151 × 137 box came back a
+**149.7 × 149.7 square**, a triangle drawn with a 176-unit base and 168.7-unit
+legs came back **exactly equilateral**, a five-pointed star came back with
+`pointCount: 5`, and a scribble came back as **nothing**, which is the half worth
+having. The same stroke twice gave byte-identical geometry; the same stroke
+translated and scaled ×1.7 gave the same class both times. Its Android half is the
+third in this repo that has not been compiled, for the same reason as Gist's and
+Redact's. Each package's
 README says exactly what was and was not exercised.
 
 ## Requirements
@@ -233,17 +279,17 @@ README says exactly what was and was not exercised.
 | --- | --- |
 | Expo SDK | 57+ (`expo-modules-core` 57 is where the 2.0 macros live) |
 | React Native | 0.75+ for `spm_dependency`; 0.83 in the example |
-| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue, Gist or Redact alone |
+| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue, Gist, Redact or Shapes alone |
 | Xcode | 26 (`desert-ant-core` is `swift-tools-version: 6.2`) |
-| Android | API 24+; `arm64-v8a` and `x86_64` only for Clear, Emo, Ear, Gist and Redact — Tongue needs no native library and runs on any ABI |
+| Android | API 24+; `arm64-v8a` and `x86_64` only for Clear, Emo, Ear, Gist, Redact and Shapes — Tongue needs no native library and runs on any ABI |
 | Expo Go | Not supported — these are native modules, so use a dev build |
 
 Each package's bundled config plugin raises the iOS deployment target — and
-Clear's, Emo's, Ear's, Gist's and Redact's also narrow the Android ABIs to the two
-LiteRT ships — so add
+Clear's, Emo's, Ear's, Gist's, Redact's and Shapes' also narrow the Android ABIs
+to the two LiteRT ships — so add
 whichever packages you use to `plugins` in your app config. The plugins only ever
-raise, and the five that touch `build.gradle` defer to each other's block, so they
-compose (there is a test that asserts it over all 120 orderings). Tongue's touches `build.gradle` not at all, deliberately: it has no
+raise, and the six that touch `build.gradle` defer to each other's block, so they
+compose (there is a test that asserts it over all 720 orderings). Tongue's touches `build.gradle` not at all, deliberately: it has no
 native library, so narrowing an app's ABIs on its behalf would take away devices
 it can serve.
 

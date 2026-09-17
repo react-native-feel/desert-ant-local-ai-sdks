@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["ShapesModule"]
+  },
+  "android": {
+    "modules": ["ai.desertant.rn.shapes.ShapesModule"]
+  }
+}

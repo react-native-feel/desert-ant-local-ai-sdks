@@ -43,12 +43,13 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # this is code size, not hundreds of megabytes. Adding a model to the family
 # means adding it here.
 #
-# `Gist` and `Redact`, the two added last, are the cases that prove the rule
-# Tongue's absence states: each is a member of the `models` array in
+# `Gist`, `Redact` and `Shapes`, the three added last, are the cases that prove
+# the rule Tongue's absence states: each is a member of the `models` array in
 # desert-ant-core's Package.swift, so each reaches the manifest through
-# `modelProducts`, and `products: products + modelProducts + alignProducts +
-# vozProducts` does include that. Checked against those two lines before either
-# pod was written, because the failure mode is the build rather than the import.
+# `modelProducts` -- which is literally `models.flatMap { ... }` -- and
+# `products: products + modelProducts + alignProducts + vozProducts` does include
+# that. Checked against those two lines before any of the three pods was written,
+# because the failure mode is the build rather than the import.
 #
 # `Tongue` is deliberately NOT in this list, and it is the one model in the
 # family that is missing from it. desert-ant-core v3.1.0 declares the product --
@@ -68,7 +69,7 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # When upstream adds those two words, adding `'Tongue'` here is the whole change
 # on this side: `packages/tongue/ios` is already written against the module and
 # guarded by `#if canImport(Tongue)`, so it lights up on its own.
-DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear', 'Gist', 'Redact'].freeze
+DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear', 'Gist', 'Redact', 'Shapes'].freeze
 
 Pod::Spec.new do |s|
   s.name           = 'DesertAntCore'

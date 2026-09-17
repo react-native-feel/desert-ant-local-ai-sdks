@@ -807,6 +807,228 @@ support ticket. Redact is the step that takes the people out of it first.
 That makes the Voz join the honest one to build, and the example app builds it:
 whatever the microphone heard, masked before it can go anywhere.
 
+## What Desert Ant ships for Shapes (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Shapes` in `desert-ant-core` | A **0.2 MB** `shapes.mlmodelc` plus one sidecar, `shapes_meta.json` (the class order, the per-class confidence and residual gates, and the frozen preprocessing constants). No `@available` and no `osFloor`, so its floor is the package's `iOS 17`. |
+| Kotlin | `ai.desertant:shapes:3.1.0` on Maven Central | Plain AAR; `ai.desertant:core` comes transitively. `shapes.tflite` is 1.3 MB — six times the Apple export, same model, same revision `v0.3.0`. |
+| JavaScript | `@desert-ant-labs/shapes` | LiteRT.js in the browser, a prebuilt native core in Node. **Neither is usable from React Native.** |
+
+Sixth model with both halves, after Clear, Emo, Ear, Gist and Redact, so
+`isSupported` means what it means for those five: off Apple it is a statement
+about the *device*, not the catalog. `ai.desertant:shapes` binds the shared native
+core through JNI and `ShapesNative.ensureLoaded()` loads `libShapesAndroid.so`,
+LiteRT ships `arm64-v8a` and `x86_64`, and `unsupportedReason` is computed
+natively because only the Android half knows which ABIs the device reported.
+
+It is the first model in this repo whose **input is neither audio nor text**, and
+that single fact drives most of what is different about this package. A stroke is
+an ordered list of `{ x, y }` in the caller's own coordinate space; the model is
+scale- and translation-invariant, so there is nothing to normalize, no sample
+rate, no language, and no file. It is also the first whose **output is geometry**
+rather than a description — which is why this is the one package here that ships a
+drawing helper.
+
+### Two stages, two gates, and rejecting is half the product
+
+`Sources/Shapes/Model.swift` is short enough to read in one sitting and the shape
+of it explains the API. A stroke is preprocessed into a fixed 256-length window of
+`[distance, cos, sin]` features plus a 1/0 validity mask, a small classifier
+proposes a class, and then:
+
+```swift
+guard let gate = meta.gates[kind] else { return nil }
+if confidence < gate.conf { return nil }
+if confidence < Float(options.minimumConfidence) { return nil }
+
+let (shape, residual) = Fitter.fit(kind, points: points, snap: options.snap)
+if Float(residual) > gate.resid { return nil }
+return shape
+```
+
+Two independent gates, both per class, both calibrated upstream and shipped in the
+sidecar rather than compiled in. The residual is an RMS point-to-shape distance
+normalized by the bounding-box diagonal, so a confident "rectangle" that does not
+actually fit a rectangle is thrown away by the *geometry* after the network has
+already voted for it.
+
+That is why `Recognition.shape` is `Shape | null` and why the null is documented
+as a result rather than a failure. A recognizer that never declines is worse than
+useless on a whiteboard: a scribble silently becoming a triangle corrupts the
+drawing, while a scribble staying a scribble costs nothing. The example app has a
+`scribble` sample for exactly this, and it is rejected.
+
+### The snapping is upstream's and is not configurable
+
+`Options` has one public member, `minimumConfidence`. Its other member, `snap`, is
+`internal`:
+
+```swift
+public struct Options: Sendable {
+    public var minimumConfidence: Double
+    var snap: SnapConfig            // internal
+}
+```
+
+So the regularization — 5° to an axis for a line, 15° rotation increments, 25% to
+a circle, a square, an equilateral or an isosceles triangle — is a fixed behaviour
+on all three upstream SDKs. This package documents the numbers (they are literals
+in `Sources/Shapes/Snapping.swift`) and exposes no knob, because inventing one
+would mean reaching past `internal` into a type upstream deliberately closed.
+
+It is also the reason the output *looks* deliberate rather than merely accurate,
+and the reason the verification numbers are as clean as they are: a 151 × 137 box
+comes back a 149.7 × 149.7 square because the ratio 0.907 clears the 25% gate, not
+because the fitter was lucky.
+
+### The class list cannot be read off the binary, and that is upstream's
+
+Every other model here reads its vocabulary from the native SDK — `Label.allCases`
+for Redact, `Gist.variants`, `Uhm.fillerTypes` — on the principle that a list
+duplicated in TypeScript is a list that goes stale. Shapes is the one exception in
+the family, and it is not a shortcut:
+
+- `ShapeKind` — the `CaseIterable` enum with the five raw values — is `internal`
+  in `Sources/Shapes/Shape.swift`.
+- The public `Shape` is an enum with associated values, so it cannot be
+  `CaseIterable`.
+- Kotlin's `Shape` is a sealed class; its subclasses are not enumerable without
+  reflection.
+
+There is no list on either platform to read, so `Shapes.kinds` is written in
+`src/types.ts` where its provenance is visible, and **no** `@JS var kinds` was
+added — a hardcoded list served from the native module would look like it had been
+read off the binary while being exactly as stale.
+
+What keeps it honest is the compiler. `shapesRecognition(from:processingSec:)` in
+`ios/ShapesRecords.swift` switches exhaustively over the public enum with no
+`default`, so a sixth class in a future `desert-ant-core` **fails the pod's build**
+rather than going silently unreported. The Android half cannot have that — it
+resolves a sealed class out of a Maven artifact at runtime — so its `when` has an
+`else` that throws `ERR_INFERENCE_FAILED` naming the class it did not know. That
+is deliberately *not* what upstream's own Kotlin FFI decoder does:
+
+```kotlin
+// A kind this SDK does not know is a core newer than the AAR. Report it
+// as "no shape" rather than half-decoding a payload we cannot read.
+else -> null
+```
+
+Right for a decoder, wrong here: `null` already means "the model rejected this
+stroke", and a real detection hidden behind the same value a scribble produces is
+two opposite answers collapsed into one.
+
+### The wire is flat because neither `@Record` nor JS has a sum type
+
+`Shape` is a Swift enum with associated values and a Kotlin sealed class. The wire
+carries a `kind` tag, a flat `[x, y, x, y, ...]` array, and scalar fields for the
+rest — which is exactly what upstream's own cross-language binding writes:
+
+```
+u32 present          0 when the stroke was rejected, and nothing follows
+u32 kind             1 line, 2 rectangle, 3 triangle, 4 ellipse, 5 star
+...                  that kind's fields; points are f64 pairs
+```
+
+`src/Shapes.ts` narrows it back into a discriminated union on `kind`, so the
+flatness never reaches a caller and `switch (shape.kind)` narrows in TypeScript.
+A payload that cannot be the kind it claims — four coordinates for a rectangle —
+is refused rather than half-read.
+
+The stroke goes *in* flat for a different reason. A real stroke is hundreds of
+points, this is the only call in the family a gesture stream can issue several
+times a second, and a `[Double]` is the cheapest thing that crosses. It is also
+the layout upstream's FFI already uses between Kotlin and Swift, so it is a format
+two implementations agree on rather than one invented here.
+
+### `outline` is ported, and it is the only port in this repo made knowingly
+
+Upstream's Swift SDK has `Shape.outline(samples:)`, `cgOutline` and a ready
+`CGPath`. `ai.desertant:shapes` has nothing equivalent — its whole public surface
+is `Shapes`, `Shape`, `Point`, `Options` and `ShapesException`. This is the same
+asymmetry `Redact.displayName` has, and the opposite decision was taken, because
+the two asymmetries are not the same kind of thing.
+
+`Redact.displayName` is cosmetic: refusing on Android costs a caller a nicer
+string and a fallback is one line. `outline` is the *rendering* path. Refusing it
+on Android would make the package unable to draw its own output there, which is
+not a tolerable answer for a shape SDK. And the alternative to porting — writing
+it once in Kotlin and once in Swift, then bridging both — is the same duplication
+in two languages instead of one, with a bridge hop per frame on top.
+
+What makes it safe is how little there is. A line, a rectangle and a triangle *are*
+their outlines; the points come straight back out of the union untouched. The only
+arithmetic is an ellipse sampled uniformly in its own frame and rotated into
+place, and a star alternating two radii across `2 × pointCount` evenly spaced
+angles from `rotation - PI/2` — both closed forms fully determined by the field
+documentation upstream publishes, both pinned by unit tests written against
+independently computed values, and both re-checked on device in the example app's
+self-test against geometry the model itself produced. A snapped circle's ported
+outline came back **1.4e-14** from its own radius.
+
+`isClosed` ships beside it for the same reason: upstream's `CGPath` calls
+`closeSubpath()` for every case except `.line`, which is trivial and is exactly
+the kind of trivial thing a renderer gets wrong.
+
+### Two refusals, both against a silent transformation
+
+Shapes is the model where the "validate what upstream does not" rule has the most
+to bite on, because geometry has a failure mode a string does not.
+
+**A non-finite coordinate.** `StrokePreprocessor` does not reject one. Its
+duplicate test is `abs(dx) > epsilon`, which is `false` for `NaN`, so a poisoned
+point is *dropped* rather than caught — and the points that survive are classified
+anyway, producing a real `Shape` whose geometry is `NaN`. It renders as nothing
+and reads as a model that stopped working. A gesture stream that briefly reported
+no location is precisely how an app gets there. Refused in TypeScript and on both
+native halves, naming the offending point index.
+
+**A `minimumConfidence` outside `0...1`.** Upstream's `Options.init` runs
+`isFinite ? min(1, max(0, value)) : 0`. So `95`, meaning "95%", becomes `1.0` and
+rejects every stroke; `NaN` becomes `0` and rejects none. Both look like a working
+recognizer that has quietly stopped recognizing. The Kotlin SDK does not clamp at
+all — it writes the `f64` onto the FFI and lets the Swift initializer on the other
+side do it — so the two platforms agree only by accident. Refused on both.
+
+What is deliberately **not** refused is a stroke of fewer than two points. That is
+upstream's own "no shape" answer on both platforms — `Shapes.kt` opens with
+`if (points.size < 2) return null`, and the Swift path reaches the same nil through
+`DegenerateStrokeError` — and a result is not an error. Both native halves answer
+it before loading the model, so an empty canvas is free on a device that has never
+downloaded a weight.
+
+### SwiftUI also has a `Shape`
+
+`ios/ShapesGeometry.swift` is the same one-import, typealias-only file
+`packages/redact/ios/RedactLabel.swift` is, written *before* the first compile
+rather than after the first failure. Upstream's fitted-geometry enum is spelled
+`Shape` and so is SwiftUI's protocol; any file importing `ExpoModulesCore` gets
+SwiftUI transitively. `Shapes.Shape` is not the fix, for Redact's exact reason:
+the module is named `Shapes` and so is the recognizer class inside it, so a
+module-qualified spelling resolves to the class and then fails to find a member
+type on it. A file importing only `Shapes` has no SwiftUI in scope, so
+`FittedShape` and `CanvasPoint` are unambiguous there and everything else in the
+pod uses them.
+
+`Point` is aliased alongside it as policy rather than against a diagnostic —
+nothing in the current toolchain's transitive SwiftUI shadows it, but this is the
+one package here that puts geometry across the bridge and one extra line is
+cheaper than the same investigation twice.
+
+### Where Shapes sits next to the others
+
+Nowhere near them, which is the interesting part. Every other model in this repo
+reads a recording or a string. Shapes reads the *screen*: a stroke is something
+the app already has, produced by the person using it a fraction of a second ago.
+That makes it the only model here with no permission to ask for, no file to
+decode, no language to establish, and no upstream chain to sit in.
+
+It is also the cheapest by a wide margin — 0.2 MB and a 2.0 ms median pass — which
+puts it in a different category of integration decision than anything else here.
+Voz and Clips have to be asked about. Emo, Ear and Redact can load on mount. Shapes
+barely registers as a decision at all.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -1542,6 +1764,126 @@ exactly 1.0, it is why this package asserts nothing about provenance from either
 checking them -- an earlier draft of the leg asserted "checksum-owned implies
 1.000" and this is what disproved it.
 
+### Shapes, end to end
+
+Driven on an iOS 26 simulator (iPhone 17 Pro Max) with a dev build, as the
+**tenth** pod in an app that already carried nine.
+
+The pod built on the first attempt, which is the first thing worth recording
+because the two things that would have broken it were both known in advance. The
+`_NumericsShims` include path was copied from Gist's and Redact's podspecs rather
+than rediscovered, and `ios/ShapesGeometry.swift` — the `Shape` / `Point`
+typealias file — was written before the first compile rather than after the first
+`'Shape' is ambiguous for type lookup`. Both are rules in this repo now, and this
+is the round that tested whether they travel.
+
+The module binds and every `@JS` property reads before anything touches a model:
+
+```
+[shapes] isSupported=true nativeCore=3.1.0 revision=v0.3.0 repo=desert-ant-labs/shapes
+         minConfidence=0 kinds=line/rectangle/triangle/ellipse/star
+```
+
+`kinds` is the one value on that line that did **not** come off the binary — see
+the model section above for why there is nothing to read it from — and it is
+served from TypeScript rather than from a `@JS var` precisely so that the log line
+is not misleading about it.
+
+**Six synthetic strokes**, generated in code with a seeded LCG so they are the
+same strokes every run, through the same `recognize` call the canvas uses:
+
+```
+[shapes] circle    105 pts -> ellipse   waited 13ms native 9.7ms circle r 72.3 at (120.0, 102.0)
+[shapes]   snapped to a circle; outline error 1.4e-14
+[shapes] rectangle 116 pts -> rectangle waited  4ms native 3.9ms 149.7 × 149.7 (square) at 90°
+[shapes] triangle  106 pts -> triangle  waited  2ms native 1.9ms sides 171.1 / 171.1 / 171.1
+[shapes] line       44 pts -> line      waited  2ms native 1.3ms (26.3, 153.1) → (210.2, 57.7)
+[shapes] star      124 pts -> star      waited  2ms native 2.1ms 5 points, r 70.1 / 28.0 at 72°
+[shapes] scribble   91 pts -> rejected  waited  1ms native 1.0ms
+[shapes] 5/6 samples fitted; rejected scribble
+```
+
+Three of those rows are the snapping working on input that was not symmetric, and
+they are the rows that make the section on it concrete rather than quoted. The
+rectangle was drawn 151 × 137 — a 0.907 side ratio, inside the 25% gate — and came
+back an exact square. The triangle was drawn with a 176-unit base and 168.7-unit
+legs and came back exactly equilateral. The circle was drawn with ±6 units of
+jitter and came back with `semiMajor === semiMinor` to the last bit, which is what
+the `outline error 1.4e-14` line is measuring: every sample of the ported ellipse
+parametrization sitting one radius from the center.
+
+**The scribble was rejected**, which is the half of this model that is easy to
+forget to test. It is a bounded random walk with a hard turn every seventh step —
+no consistent curvature, no closed outline, nothing for a fitter to agree with —
+and the two gates threw it out in 1.0 ms.
+
+**Latency**: **min 1.0 ms, median 2.0 ms, max 9.7 ms** natively over those six
+strokes. The 9.7 ms is the first inference after the session was built; everything
+after it was 1.0–3.9 ms. Wall clock from JavaScript including the bridge hop was
+1–13 ms. Upstream advertises "under 10 ms per stroke" and on this hardware the
+steady-state figure was well inside it — which is also why this package reports
+`processingSec` *and* the example app times the call separately: at this speed the
+bridge is a visible fraction of the total, which is not true of any other model
+here.
+
+**Loading**: `[shapes] ready in 39232ms downloaded=true`. That number is honest
+and also misleading, so it is worth writing down what it is not. It is a cold
+first launch in which Emo, Ear, Uhm, Redact and Shapes were all downloading and
+building Core ML sessions concurrently on a simulator; Emo (5 MB) came ready at
+35.9 s and Redact (12 MB) at 39.8 s in the same window. It is not a measurement of
+a 0.2 MB download, and **no isolated cold-load figure was measured**.
+
+**Invariants asserted on device**, none of which encodes an expected answer —
+which class a stroke produces is upstream's business and an answer key here would
+turn a legitimate gate change into a red self-test on a working build:
+
+- Every fitted coordinate finite; a `line` outline 2 points, a `rectangle` 4, a
+  `triangle` 3; `semiMajor >= semiMinor`; a star's outline exactly
+  `2 × pointCount` points alternating between its radii to within 1e-6.
+- Every fit inside the stroke's own bounding box expanded by half — which catches
+  a fit that landed somewhere else entirely without pretending to measure
+  accuracy.
+- `isClosed` agrees with the kind.
+- **Determinism**: the same stroke twice gave byte-identical geometry. There is no
+  sampling anywhere in this model, so anything else would be a session bug.
+- **Invariance**, which is a claim upstream makes rather than an opinion of this
+  file's: the same stroke translated by (+37, −11) and scaled ×1.7 came back the
+  same class both times.
+- An empty stroke and a one-point stroke both `null`, without loading the model.
+- `minimumConfidence: 1` rejected everything, as arithmetic says it must.
+- All five refusals raised `ERR_INVALID_ARGUMENT`: a `NaN` coordinate, an
+  `Infinity` coordinate, and `minimumConfidence` of 95, −0.1 and `NaN`.
+
+`[selftest] all prepared models passed`, with no new crash report in
+`~/Library/Logs/DiagnosticReports`. The app did not go down during the session at
+all; the known `ClearModule` (`Record.encode`) and `EmoModule`
+(`JavaScriptValuesBuffer.deinit`) async-return crashes were not tripped, which is
+worth noting only because they have been the background noise of the last three
+rounds.
+
+**The example app's own flow**, driven through the UI rather than the self-test:
+tapping `circle` produced `ellipse` / `circle r 72.3 at (120.0, 102.0)` / native
+7.7 ms / waited 47 ms, and tapping `scribble` produced `rejected` with the "nothing
+fitted — which for this model is a result rather than a miss" note. The section
+renders the stroke as grey ink dots with the fitted shape drawn over it in blue,
+built from `outline` and one rotated `View` per segment, so the port is exercised
+visually on every tap rather than only in the self-test.
+
+**The canvas is a real drag surface** — a `View` with touch-responder handlers
+collecting `locationX`/`locationY`, with the sample buttons beside it feeding the
+identical call. A finger drag on the simulator was exercised and recognized:
+`drawn · 2 points` → `line`, geometry `(66.0, 169.7) → (152.3, 151.0)`. But the
+simulator's synthesized pan delivers a grant, one move and a release rather than a
+continuous path, so **only a 2-point drag was verified through the gesture
+surface**; the multi-point path is what the buttons exercise. A real finger on
+real hardware was not tested, and neither was Android, which as with Gist and
+Redact **has never been compiled** — there is no Android SDK on this machine.
+
+No accuracy measurement of any kind was made. Six synthetic strokes is a smoke
+test; upstream publishes no accuracy figure for this model and neither does this
+repo. The 15° rotation snap was not directly observed either — every sample that
+snapped landed on 0°, 72° or 90°, all already multiples of 15.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -1625,6 +1967,25 @@ that neither upstream SDK makes:
 | Blank input | Text unchanged, no load | Text unchanged, no load | Neither upstream SDK guards it. Same decision, taken on both halves together. |
 | Verified | Yes, on a simulator | **No — not even compiled**; no Android SDK on the machine | Same position as Gist. |
 
+Shapes' is the only table here with **no capability gap at all** — the two SDKs
+expose the same recognizer with the same one option — so what is in it is the
+platform machinery plus the one thing this package added on both halves:
+
+| | iOS | Android | Why |
+| --- | --- | --- | --- |
+| `ProgressEvent.fraction` | A real fraction | `0` entering a phase, `1` leaving it | Kotlin `Shapes.download()` takes no progress handler. For a 1.3 MB download the difference is close to academic. |
+| `isSupported` | Always true | False on an ABI LiteRT does not ship | The Core ML export has no device constraint; the LiteRT one has two ABIs and a `libShapesAndroid.so` behind JNI. |
+| Download size | **0.2 MB** (`shapes.mlmodelc`) | 1.3 MB (`shapes.tflite`) | Two exports of one model at revision `v0.3.0`. The smallest pair in the family. |
+| `modelRevision` / `modelRepo` | Read from the catalog | Constants in the module | `ai.desertant:shapes` publishes `Shapes`, `Shape`, `Point`, `Options` and `ShapesException`, and its `companion object` is empty. |
+| `defaultMinimumConfidence` | Mirrored | Mirrored | `0` is a default argument in a Swift initializer and a Kotlin data class, so neither platform can read it. |
+| `Shapes.kinds` | Not readable | Not readable | The only vocabulary in this repo neither SDK publishes: `ShapeKind` is `internal`, `Shape` has associated values, Kotlin's is a sealed class. Lives in TypeScript; an exhaustive Swift `switch` is what stops it going stale. |
+| `outline` / `isClosed` | `Shape.outline`, `cgOutline`, `CGPath` | **Nothing** | Ported to TypeScript rather than bridged, because this is the rendering path and refusing it on Android would leave the package unable to draw its own output. The opposite call to `Redact.displayName`, deliberately. |
+| An unknown shape class | Fails the **build** | `ERR_INFERENCE_FAILED` | A Swift `switch` over a public enum is exhaustive at compile time; a Kotlin sealed class from a Maven artifact is not. Upstream's own decoder answers `null` here; both halves of this package refuse instead, because `null` already means "rejected". |
+| A non-finite coordinate | `ERR_INVALID_ARGUMENT` | `ERR_INVALID_ARGUMENT` | Neither upstream SDK refuses; the preprocessor drops the point and classifies what is left, producing `NaN` geometry. |
+| `minimumConfidence` out of range | `ERR_INVALID_ARGUMENT` | `ERR_INVALID_ARGUMENT` | Upstream clamps `95` to `1.0` (rejects everything) and `NaN` to `0` (rejects nothing), silently. |
+| Fewer than two points | `null`, no load | `null`, no load | Upstream's own answer on both platforms, not this package's. |
+| Verified | Yes, on a simulator | **No — not even compiled**; no Android SDK on the machine | Same position as Gist and Redact. |
+
 Tongue's table is the only one where the *Apple* column is the constrained one,
 and the only one with no progress row at all -- it emits none:
 
@@ -1666,8 +2027,9 @@ and the only one with no progress row at all -- it emits none:
 
 `DESERT_ANT_CORE_VERSION` in `packages/core/ios/DesertAntCore.podspec` — now
 the only place the Swift package's version is named — the `ai.desertant:clear`,
-`ai.desertant:emo`, `ai.desertant:ear`, `ai.desertant:gist` and
-`ai.desertant:tongue` coordinates in the five `android/build.gradle` files, and the
+`ai.desertant:emo`, `ai.desertant:ear`, `ai.desertant:gist`,
+`ai.desertant:redact`, `ai.desertant:shapes` and
+`ai.desertant:tongue` coordinates in the seven `android/build.gradle` files, and the
 `coreVersion` constants in each model's Swift and Kotlin module files must move
 together. The Apple and
 Android native cores share an FFI payload schema (see the comments in Desert
@@ -1707,6 +2069,34 @@ same `SWIFT_INCLUDE_PATHS` entry, and the failure without it is the identical
 two incidents: **any desert-ant-core product that depends on swift-numerics needs
 that line**, and the way to know before building is to read the `models` array in
 `Package.swift` rather than to wait for the error.
+
+Shapes inherits the same swift-numerics coupling, and it is the case that turns
+the rule from a pattern into something you can read off the manifest before you
+build. `Package.swift` carries a comment above its entry saying it outright:
+
+```swift
+// The geometric fitters and snapping replace `simd` (Apple-only) with a
+// portable V2, so their transcendental math comes from swift-numerics.
+.init(
+    name: "Shapes",
+    dependencies: [.product(name: "RealModule", package: "swift-numerics")]
+),
+```
+
+`Sources/Shapes` then imports `RealModule` in `Geometry.swift`, `Shape.swift`,
+`Fitter.swift` and `Snapping.swift` for `Double.cos`, `Double.sin` and
+`Double.atan2`. So `packages/shapes/ios/DesertAntShapes.podspec` carries the same
+`SWIFT_INCLUDE_PATHS` entry Gist's and Redact's do — written before the first
+compile, from reading that array rather than from meeting the error — and the pod
+built on the first attempt. Three products in, the rule is settled: **read the
+`models` array in `Package.swift`; if the target names swift-numerics, the pod
+needs the line.**
+
+The Maven coordinate list grows with it: `ai.desertant:shapes:3.1.0` joins the
+others in the `android/build.gradle` files that must move with
+`DESERT_ANT_CORE_VERSION`. Shapes' FFI payload is a point count and `f64` x/y
+pairs in, a present flag plus a kind tag and that kind's fields out — a wire
+schema like the rest, so a mismatched pair is a wire bug that builds cleanly.
 
 The other Tongue coupling is the one that is currently unsatisfiable:
 `DESERT_ANT_PRODUCTS` in the same podspec must gain `'Tongue'` the moment

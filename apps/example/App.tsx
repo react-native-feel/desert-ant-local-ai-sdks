@@ -18,6 +18,14 @@ import {
   restore,
   type Redaction,
 } from '@desert-ant-labs/react-native-redact';
+import {
+  Shapes,
+  isClosed,
+  outline,
+  type Point as CanvasPoint,
+  type Recognition as ShapeRecognition,
+  type Shape as FittedShape,
+} from '@desert-ant-labs/react-native-shapes';
 import { Tongue, type Detection as TextDetection } from '@desert-ant-labs/react-native-tongue';
 import { Uhm, type UhmResult } from '@desert-ant-labs/react-native-uhm';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
@@ -67,6 +75,15 @@ import {
  * what Voz wrote. Two independent models agreeing is worth more than either
  * alone, and where they disagree, the disagreement is the interesting output.
  *
+ * And one that is in neither medium. Shapes reads a *stroke* -- a list of x, y
+ * points off the screen -- so its section at the bottom is a canvas rather than a
+ * field: draw with a finger and the wobbly loop comes back an exact circle. It is
+ * the only model here with no text and no audio anywhere near it, and the only
+ * one whose whole output is geometry, so it is also the only section that draws
+ * rather than prints. The canvas is the real demo; the row of buttons beside it
+ * feeds the same recognizer synthetic strokes generated in code, which is what
+ * makes the self-test reproducible and what a simulator can tap.
+ *
  * The whole point of the file APIs is visible here: the recording never becomes
  * a JavaScript array. `recorder.uri` goes into Clear, an enhanced `uri` comes
  * out, that same `uri` goes into Voz, and text comes back. Only then does
@@ -97,6 +114,7 @@ export default function App() {
   const tongue = useRef<Tongue | null>(null);
   const gist = useRef<Gist | null>(null);
   const redact = useRef<Redact | null>(null);
+  const shapes = useRef<Shapes | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -219,6 +237,29 @@ export default function App() {
   // until a redaction has been asked for.
   const [roundTrip, setRoundTrip] = useState<boolean | null>(null);
 
+  // Shapes is 0.2 MB for the Core ML export, which is the smallest download in
+  // this whole family by a factor of twenty-five -- a twenty-fifth of Emo, a
+  // two-hundredth of Uhm. There is less to justify here than anywhere else, so it
+  // loads on mount and `loading` is the honest starting state.
+  const [shapesState, setShapesState] = useState<ModelState>(
+    Shapes.isSupported ? 'loading' : 'unsupported'
+  );
+  // The stroke being drawn, in canvas coordinates. Kept in state rather than a
+  // ref because the ink is the feedback: a canvas that shows nothing until the
+  // finger lifts feels broken whatever the model does afterwards.
+  const [stroke, setStroke] = useState<CanvasPoint[]>([]);
+  const [recognized, setRecognized] = useState<ShapeRecognition | null>(null);
+  // Which stroke produced the result on screen: 'drawn', or the name of the
+  // synthetic sample. Worth showing, because the two are the same call and it
+  // should not be possible to tell them apart from the answer.
+  const [strokeSource, setStrokeSource] = useState<string | null>(null);
+  // Measured around the call as well as reported natively, for the same reason
+  // Ear's, Gist's and Redact's are: `recognized.processingSec` is what the model
+  // cost and this is what the caller waited for. For this model the gap between
+  // them is the interesting number -- upstream advertises the pass at under ten
+  // milliseconds, which is small enough that the bridge hop is visible next to it.
+  const [shapeMs, setShapeMs] = useState<number | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -274,6 +315,12 @@ export default function App() {
         `labels=${Redact.labels.length} default=${Redact.defaultLabels.length} ` +
         `displayNames=${Object.keys(Redact.labelDisplayNames).length}` +
         `${Redact.unsupportedReason ? ` reason=${Redact.unsupportedReason}` : ''}`
+    );
+    console.log(
+      `[shapes] isSupported=${Shapes.isSupported} nativeCore=${Shapes.nativeCoreVersion} ` +
+        `revision=${Shapes.modelRevision} repo=${Shapes.modelRepo} ` +
+        `minConfidence=${Shapes.defaultMinimumConfidence} kinds=${Shapes.kinds.join('/')}` +
+        `${Shapes.unsupportedReason ? ` reason=${Shapes.unsupportedReason}` : ''}`
     );
   }, []);
 
@@ -361,6 +408,13 @@ export default function App() {
       // to wait for a tap before it will mask anything is the wrong demo of it.
       if (Redact.isSupported) void prepareRedact();
 
+      // Shapes is 0.2 MB. That is not a typo and it is not a stub: the classifier
+      // is tiny because the geometry is done by a fitter rather than by the
+      // network. Nothing in this app is cheaper to have ready, and a canvas that
+      // needed a tap before it would recognize anything would be the wrong demo
+      // of a model whose whole point is that it answers while you draw.
+      if (Shapes.isSupported) void prepareShapes();
+
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
       if (cancelled || !Voz.isSupported) return;
@@ -416,6 +470,8 @@ export default function App() {
       gist.current = null;
       redact.current?.release();
       redact.current = null;
+      shapes.current?.release();
+      shapes.current = null;
     };
   }, []);
 
@@ -848,6 +904,104 @@ export default function App() {
       setBusy(null);
     }
   }, [transcript]);
+
+  /**
+   * Get Shapes ready: 0.2 MB for the Core ML export and a session build in
+   * milliseconds.
+   *
+   * Like Emo, Ear and Redact it never announces itself through `busy` -- and here
+   * that is not even a judgement call. A twelfth of a megabyte over a cable
+   * modem is gone before a banner could render.
+   */
+  const prepareShapes = useCallback(async () => {
+    if (shapes.current) return;
+    setShapesState('loading');
+    try {
+      const t0 = Date.now();
+      const model = await Shapes.load();
+      shapes.current = model;
+      setShapesState('ready');
+      console.log(`[shapes] ready in ${Date.now() - t0}ms downloaded=${model.isDownloaded()}`);
+    } catch (e) {
+      console.log(`[shapes] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setShapesState('absent');
+    }
+  }, []);
+
+  /**
+   * Recognize one stroke and put the fitted shape on screen.
+   *
+   * Called from the canvas when a finger lifts and from the sample buttons, with
+   * no debounce and no timer: a stroke is a discrete event, unlike a text field
+   * that changes on every keystroke, so there is nothing to coalesce. Emo, Gist
+   * and Redact all debounce for that reason and this one has no reason to.
+   *
+   * `source` is only for the label on screen. Both paths are the same call with
+   * the same arguments, which is the point of having both: a synthetic stroke is
+   * not a special case the model knows about.
+   */
+  const runShapes = useCallback(async (points: CanvasPoint[], source: string) => {
+    const model = shapes.current;
+    if (!model) return;
+    setStroke(points);
+    setStrokeSource(source);
+    try {
+      const t0 = Date.now();
+      const result = await model.recognize(points);
+      setShapeMs(Date.now() - t0);
+      setRecognized(result);
+      console.log(
+        `[shapes] ${source} (${points.length} pts) -> ${result.shape?.kind ?? 'no shape'} ` +
+          `in ${Date.now() - t0}ms, native ${(result.processingSec * 1000).toFixed(1)}ms` +
+          (result.shape ? ` ${describeShape(result.shape)}` : ' (rejected)')
+      );
+    } catch (e) {
+      console.log(`[shapes] recognize FAILED: ${describe(e)}`);
+      setError(describe(e));
+      // The same Fast Refresh hazard Emo, Tongue, Gist and Redact hit, for the
+      // same reason: a model called from a gesture rather than from a tap on a
+      // button this file owns can outlive its native half during development.
+      shapes.current?.release();
+      shapes.current = null;
+      void prepareShapes();
+    }
+  }, [prepareShapes]);
+
+  /**
+   * The canvas gesture. Points are collected in the view's own coordinates, which
+   * is exactly what the model wants -- it is scale- and translation-invariant, so
+   * there is no normalization to do and nothing to convert.
+   *
+   * Two points closer than 1.5 px apart are dropped. That is not thinning for the
+   * model's benefit -- it resamples to uniform arc length itself and reads a fixed
+   * 256-point window, so extra points cost it nothing -- it is so that a finger
+   * held still does not add a hundred identical dots to the ink this component
+   * renders.
+   */
+  const strokeRef = useRef<CanvasPoint[]>([]);
+
+  const beginStroke = useCallback((x: number, y: number) => {
+    strokeRef.current = [{ x, y }];
+    setRecognized(null);
+    setShapeMs(null);
+    setStrokeSource(null);
+    setStroke(strokeRef.current);
+  }, []);
+
+  const extendStroke = useCallback((x: number, y: number) => {
+    const points = strokeRef.current;
+    const last = points[points.length - 1];
+    if (last && Math.hypot(x - last.x, y - last.y) < 1.5) return;
+    strokeRef.current = [...points, { x, y }];
+    setStroke(strokeRef.current);
+  }, []);
+
+  const endStroke = useCallback(() => {
+    const points = strokeRef.current;
+    if (points.length < 2) return;
+    void runShapes(points, 'drawn');
+  }, [runShapes]);
 
   /**
    * Name the language of whatever is in the Tongue field.
@@ -2137,6 +2291,196 @@ export default function App() {
       failures.push(`redact: ${describe(e)}`);
     }
 
+    // --- Shapes. The first model here whose input is neither audio nor text, and
+    //     the leg where that shows: everything below is geometry.
+    //
+    //     Nothing here asserts which class a given stroke produces. The
+    //     classifier and its calibrated gates are upstream's, and "a wobbly loop
+    //     must come back an ellipse" is an answer key written from this file's
+    //     opinion rather than a property of the model -- a legitimate revision
+    //     could tighten a gate and turn that into a red self-test on a working
+    //     build. What IS asserted is the shape of the answer, the invariants a
+    //     fit has to satisfy whatever class it picked, the two invariances
+    //     upstream actually claims, and this package's own refusals. What the
+    //     model decided is logged, in full, next to them.
+    try {
+      const sketcher = shapes.current;
+      if (!sketcher) {
+        console.log('[shapes] self-test skipped — model not prepared');
+      } else {
+        const results: { name: string; result: ShapeRecognition }[] = [];
+        for (const sample of SHAPE_SAMPLES) {
+          const points = sample.stroke();
+          const t0 = Date.now();
+          const result = await sketcher.recognize(points);
+          const waited = Date.now() - t0;
+          results.push({ name: sample.name, result });
+          console.log(
+            `[shapes] ${sample.name.padEnd(9)} ${String(points.length).padStart(3)} pts -> ` +
+              `${(result.shape?.kind ?? 'rejected').padEnd(9)} ` +
+              `waited ${waited}ms native ${(result.processingSec * 1000).toFixed(1)}ms ` +
+              (result.shape ? describeShape(result.shape) : '')
+          );
+
+          // Bound once, so the union narrows through the closures below. A
+          // property access does not stay narrowed inside a callback.
+          const fitted = result.shape;
+          if (!fitted) continue;
+
+          // The invariants. Every one of these has to hold for any class, so
+          // none of them encodes an expected answer.
+          const drawn = outline(fitted, 48);
+          const finite = drawn.every((pt) => Number.isFinite(pt.x) && Number.isFinite(pt.y));
+          if (!finite) failures.push(`shapes: ${sample.name} produced a non-finite coordinate`);
+
+          const counts: Record<string, number> = { line: 2, rectangle: 4, triangle: 3 };
+          const expected = counts[fitted.kind];
+          if (expected !== undefined && drawn.length !== expected) {
+            failures.push(`shapes: a ${fitted.kind} has ${drawn.length} points, expected ${expected}`);
+          }
+          if (fitted.kind === 'ellipse' && fitted.semiMajor < fitted.semiMinor) {
+            failures.push('shapes: an ellipse reported a semi-minor axis larger than its major');
+          }
+          if (fitted.kind === 'star') {
+            const { center, outerRadius, innerRadius, pointCount } = fitted;
+            if (pointCount < 3) failures.push(`shapes: a star with ${pointCount} points`);
+            if (drawn.length !== pointCount * 2) {
+              failures.push('shapes: a star outline is not twice its point count');
+            }
+            // The alternation, which is the one thing the ported `outline` has to
+            // get right for a star and the thing a bad port would get wrong.
+            const alternates = drawn.every((pt, i) => {
+              const radius = Math.hypot(pt.x - center.x, pt.y - center.y);
+              return Math.abs(radius - (i % 2 === 0 ? outerRadius : innerRadius)) < 1e-6;
+            });
+            if (!alternates) failures.push('shapes: a star outline does not alternate its radii');
+          }
+          if (fitted.kind === 'ellipse' && Math.abs(fitted.semiMajor - fitted.semiMinor) < 1e-9) {
+            // A snapped circle: every sample has to sit exactly one radius out,
+            // which pins the ported ellipse parametrization against arithmetic.
+            const { center, semiMajor } = fitted;
+            const worst = Math.max(
+              ...drawn.map((pt) => Math.abs(Math.hypot(pt.x - center.x, pt.y - center.y) - semiMajor))
+            );
+            console.log(`[shapes]   snapped to a circle; outline error ${worst.toExponential(1)}`);
+            if (worst > 1e-9) failures.push('shapes: a circle outline is not circular');
+          }
+
+          // The fit has to be where the stroke was. A generous box -- half the
+          // stroke's own size in every direction -- so this catches a fit that
+          // landed somewhere else entirely without pretending to measure accuracy.
+          const box = bounds(points);
+          const padX = Math.max(box.width * 0.5, 8);
+          const padY = Math.max(box.height * 0.5, 8);
+          const inside = drawn.every(
+            (pt) =>
+              pt.x >= box.minX - padX && pt.x <= box.maxX + padX &&
+              pt.y >= box.minY - padY && pt.y <= box.maxY + padY
+          );
+          if (!inside) failures.push(`shapes: the ${sample.name} fit landed outside the stroke`);
+          if (isClosed(fitted) !== (fitted.kind !== 'line')) {
+            failures.push('shapes: isClosed disagrees with the kind');
+          }
+        }
+
+        const found = results.filter((r) => r.result.shape).length;
+        console.log(
+          `[shapes] ${found}/${results.length} samples fitted; ` +
+            `rejected ${results.filter((r) => !r.result.shape).map((r) => r.name).join(', ') || 'none'}`
+        );
+
+        // Determinism. The same stroke twice has to give the same answer -- there
+        // is no sampling anywhere in this model, so anything else would be a bug
+        // in the session rather than a property of the network.
+        const twice = SHAPE_SAMPLES[0]!.stroke();
+        const a = await sketcher.recognize(twice);
+        const b = await sketcher.recognize(twice);
+        const same = JSON.stringify(a.shape) === JSON.stringify(b.shape);
+        console.log(`[shapes] same stroke twice -> identical: ${same}`);
+        if (!same) failures.push('shapes: the same stroke gave two different answers');
+
+        // The two invariances upstream claims, checked as claims rather than as
+        // answer keys: a shape moved and a shape resized is the same shape. Only
+        // flagged when both runs found something and they disagree -- a stroke
+        // that falls off a gate at one scale is a model decision, not a failure
+        // of this app.
+        const moved = twice.map((pt) => ({ x: pt.x + 37, y: pt.y - 11 }));
+        const scaled = twice.map((pt) => ({ x: pt.x * 1.7, y: pt.y * 1.7 }));
+        const movedResult = await sketcher.recognize(moved);
+        const scaledResult = await sketcher.recognize(scaled);
+        console.log(
+          `[shapes] invariance: base=${a.shape?.kind ?? 'none'} ` +
+            `translated=${movedResult.shape?.kind ?? 'none'} ` +
+            `scaled x1.7=${scaledResult.shape?.kind ?? 'none'}`
+        );
+        if (a.shape && movedResult.shape && a.shape.kind !== movedResult.shape.kind) {
+          failures.push('shapes: translating a stroke changed its class');
+        }
+        if (a.shape && scaledResult.shape && a.shape.kind !== scaledResult.shape.kind) {
+          failures.push('shapes: scaling a stroke changed its class');
+        }
+
+        // A stroke that cannot be a stroke. Upstream answers this with "no shape"
+        // on both platforms rather than an error, and this package answers it
+        // without loading the model at all.
+        const empty = await sketcher.recognize([]);
+        const single = await sketcher.recognize([{ x: 10, y: 10 }]);
+        console.log(
+          `[shapes] empty -> ${empty.shape ?? 'null'}; one point -> ${single.shape ?? 'null'}`
+        );
+        if (empty.shape || single.shape) {
+          failures.push('shapes: a stroke of fewer than two points produced a shape');
+        }
+
+        // This package's own refusals, both of them things neither upstream SDK
+        // checks. A NaN coordinate is dropped rather than caught by upstream's
+        // preprocessor, and an out-of-range confidence is silently clamped.
+        const refusals: [string, () => Promise<unknown>][] = [
+          ['a NaN coordinate', () => sketcher.recognize([{ x: 0, y: 0 }, { x: NaN, y: 4 }])],
+          ['an Infinity coordinate', () => sketcher.recognize([{ x: 0, y: 0 }, { x: 1, y: Infinity }])],
+          ['minimumConfidence 95', () => sketcher.recognize(twice, { minimumConfidence: 95 })],
+          ['minimumConfidence -0.1', () => sketcher.recognize(twice, { minimumConfidence: -0.1 })],
+          ['minimumConfidence NaN', () => sketcher.recognize(twice, { minimumConfidence: NaN })],
+        ];
+        for (const [what, call] of refusals) {
+          try {
+            await call();
+            failures.push(`shapes: ${what} was accepted`);
+          } catch (e) {
+            const code = e instanceof DesertAntError ? e.code : 'not a DesertAntError';
+            if (code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`shapes: ${what} raised ${code}`);
+            }
+          }
+        }
+        console.log(
+          '[shapes] refused NaN and Infinity coordinates and minimumConfidence 95/-0.1/NaN ' +
+            'with ERR_INVALID_ARGUMENT'
+        );
+
+        // The gate, exercised from the other end: a floor of 1 is a floor no
+        // classifier clears, so everything comes back rejected. Reported rather
+        // than asserted at 0 -- what the default gates accept is the model's
+        // business -- but a floor of exactly 1 rejecting everything is arithmetic.
+        const gated = await sketcher.recognize(twice, { minimumConfidence: 1 });
+        console.log(`[shapes] minimumConfidence 1 -> ${gated.shape?.kind ?? 'rejected'}`);
+
+        // Latency, over every sample, which is the number worth quoting. Upstream
+        // advertises "under 10 ms per stroke"; this measures both what the model
+        // cost and what the caller waited for, because the gap between them is
+        // the bridge and this is the model small enough for that to be visible.
+        const natives = results.map((r) => r.result.processingSec * 1000);
+        console.log(
+          `[shapes] native per stroke: min ${Math.min(...natives).toFixed(1)}ms ` +
+            `median ${median(natives).toFixed(1)}ms max ${Math.max(...natives).toFixed(1)}ms ` +
+            `over ${natives.length} strokes`
+        );
+      }
+    } catch (e) {
+      console.log(`[shapes] self-test FAILED: ${describe(e)}`);
+      failures.push(`shapes: ${describe(e)}`);
+    }
+
     // --- Uhm. The only model here that is loaded by the time a self-test can run
     //     without anyone tapping anything, so this leg is the one that always has
     //     something to say.
@@ -2430,7 +2774,8 @@ export default function App() {
         Clear cleans it, Ear names the language, Voz reads it, Clips cuts it, Uhm finds
         the ums — and Tongue names the language again, from the words rather than the
         sound, Gist says what those words are about, and Redact takes the people out
-        of them before they go anywhere
+        of them before they go anywhere. Then one that reads neither: Shapes turns a
+        stroke you draw into a shape.
       </Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -3339,8 +3684,173 @@ export default function App() {
           />
         ) : null}
       </View>
+
+      <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Shapes</Text>
+
+        {shapesState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Shapes.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {shapesState === 'loading' ? (
+          <Text style={styles.note}>Preparing — 0.2 MB, so this is usually over already.</Text>
+        ) : null}
+
+        {shapesState === 'absent' ? (
+          <Button
+            label="Prepare Shapes (0.2 MB)"
+            onPress={() => void prepareShapes()}
+            disabled={busy !== null}
+            tone="ghost"
+          />
+        ) : null}
+
+        {shapesState === 'ready' ? (
+          <>
+            <Text style={styles.note}>
+              Draw one stroke in the box with a finger. A wobbly loop comes back an
+              exact circle, a crooked box a square, a scribble nothing at all —
+              which is the half worth watching, because a whiteboard that turns a
+              scribble into a triangle is worse than one that leaves it alone. Grey
+              is what you drew; blue is what came back.
+            </Text>
+            {/* The canvas is the honest demo of this model: it reads a gesture, so
+                a gesture is what it should be given. The buttons below feed the
+                same recognizer strokes generated in code -- which is what makes
+                the self-test reproducible, and what a simulator can tap. Both
+                paths are one call with one set of arguments. */}
+            <View
+              style={styles.canvas}
+              onStartShouldSetResponder={() => true}
+              onMoveShouldSetResponder={() => true}
+              onResponderGrant={(event) =>
+                beginStroke(event.nativeEvent.locationX, event.nativeEvent.locationY)
+              }
+              onResponderMove={(event) =>
+                extendStroke(event.nativeEvent.locationX, event.nativeEvent.locationY)
+              }
+              onResponderRelease={endStroke}
+              onResponderTerminate={endStroke}>
+              {stroke.length === 0 && !recognized ? (
+                <Text style={styles.canvasHint}>draw here</Text>
+              ) : null}
+              <Ink points={stroke} />
+              {recognized?.shape ? <Fit shape={recognized.shape} /> : null}
+            </View>
+            <View style={styles.phrases}>
+              {SHAPE_SAMPLES.map((sample) => (
+                <Pressable
+                  key={sample.name}
+                  onPress={() => void runShapes(sample.stroke(), sample.name)}
+                  style={({ pressed }) => [
+                    styles.phrase,
+                    strokeSource === sample.name && styles.phraseSelected,
+                    pressed && styles.buttonPressed,
+                  ]}>
+                  <Text
+                    style={[
+                      styles.phraseText,
+                      strokeSource === sample.name && styles.phraseTextSelected,
+                    ]}>
+                    {sample.name}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+          </>
+        ) : null}
+
+        {recognized ? (
+          <>
+            <Row label="Stroke" value={`${strokeSource ?? 'drawn'} · ${stroke.length} points`} />
+            <Row label="Shape" value={recognized.shape ? recognized.shape.kind : 'rejected'} />
+            {recognized.shape ? (
+              <Row label="Geometry" value={describeShape(recognized.shape)} />
+            ) : null}
+            {/* Two numbers, not one, and the gap between them is the point: the
+                model is advertised at under ten milliseconds, which is small
+                enough that the bridge hop shows up beside it. */}
+            <Row
+              label="Native"
+              value={`${(recognized.processingSec * 1000).toFixed(1)} ms`}
+            />
+            <Row label="Waited" value={shapeMs === null ? '—' : `${shapeMs} ms`} />
+            <Row label="Revision" value={recognized.modelRevision ?? '—'} />
+            {!recognized.shape ? (
+              <Text style={styles.note}>
+                Nothing fitted — which for this model is a result rather than a
+                miss. The classifier has to clear its class's calibrated
+                confidence gate AND the geometric fit has to clear its residual
+                gate, so a confident guess that does not actually fit is still
+                thrown away.
+              </Text>
+            ) : null}
+          </>
+        ) : null}
+      </View>
     </ScrollView>
   );
+}
+
+/**
+ * The stroke as it was drawn: one small dot per point.
+ *
+ * Dots rather than a line because there is no SVG in this app and no wish to add
+ * one for a demo -- and because dots show the thing a polyline would hide, which
+ * is that a real stroke's points are unevenly spaced (fast on the straights, slow
+ * on the curves). That unevenness is exactly what upstream's uniform arc-length
+ * resampling exists to undo before the model sees it.
+ */
+function Ink({ points }: { points: CanvasPoint[] }) {
+  // Every second point past a hundred, so a long stroke does not become a
+  // thousand views. The model gets all of them; only the ink is thinned.
+  const step = points.length > 100 ? Math.ceil(points.length / 100) : 1;
+  return (
+    <>
+      {points
+        .filter((_, index) => index % step === 0)
+        .map((point, index) => (
+          <View key={index} style={[styles.inkDot, { left: point.x - 1.5, top: point.y - 1.5 }]} />
+        ))}
+    </>
+  );
+}
+
+/**
+ * The fitted shape, drawn from `outline` -- the same call an app would make.
+ *
+ * Each segment is one rotated View, which is the whole trick that lets this file
+ * draw vector geometry with no drawing library: a segment is a 2 px bar centered
+ * on the midpoint of its two endpoints and rotated to their angle.
+ */
+function Fit({ shape }: { shape: FittedShape }) {
+  const points = outline(shape, 48);
+  const closed = isClosed(shape);
+  const last = closed ? points.length : points.length - 1;
+  const segments = [];
+  for (let i = 0; i < last; i += 1) {
+    const a = points[i]!;
+    const b = points[(i + 1) % points.length]!;
+    const length = Math.hypot(b.x - a.x, b.y - a.y);
+    if (length < 0.01) continue;
+    segments.push(
+      <View
+        key={i}
+        style={[
+          styles.fitSegment,
+          {
+            left: (a.x + b.x) / 2 - length / 2,
+            top: (a.y + b.y) / 2 - 1,
+            width: length,
+            transform: [{ rotate: `${Math.atan2(b.y - a.y, b.x - a.x)}rad` }],
+          },
+        ]}
+      />
+    );
+  }
+  return <>{segments}</>;
 }
 
 /**
@@ -3600,6 +4110,212 @@ function describe(error: unknown) {
     : String((error as Error)?.message ?? error);
 }
 
+/**
+ * A deterministic wobble.
+ *
+ * A linear congruential generator seeded per sample, rather than `Math.random`,
+ * so "the rough rectangle" is the same rough rectangle on every launch. That is
+ * what makes the self-test's numbers comparable between runs and what lets a
+ * disagreement between two builds mean something.
+ */
+function wobble(seed: number): () => number {
+  let state = seed >>> 0;
+  return () => {
+    state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+    return state / 0x100000000 - 0.5;
+  };
+}
+
+/**
+ * Six synthetic strokes, in the canvas's own coordinates.
+ *
+ * They are drawn the way a hand draws: unevenly spaced points, a few pixels of
+ * jitter, and a little overshoot past the start where a loop closes. That is not
+ * decoration -- a perfect analytic circle is an easier input than a real one, and
+ * a demo that fed the model perfect inputs would prove nothing about what it does
+ * with a finger.
+ *
+ * The last one is the one to watch. A scribble is what this model is asked to
+ * *reject*, and a recognizer that never rejects anything is worse than useless on
+ * a whiteboard -- so there is a sample for it, and the self-test logs what
+ * happened without asserting an answer.
+ */
+const SHAPE_SAMPLES: { name: string; stroke: () => CanvasPoint[] }[] = [
+  {
+    name: 'circle',
+    stroke: () => {
+      const jitter = wobble(0x5eed01);
+      const points: CanvasPoint[] = [];
+      // Slightly past a full turn, the way a hand closes a loop.
+      for (let i = 0; i <= 104; i += 1) {
+        const t = (i / 96) * 2 * Math.PI;
+        points.push({
+          x: 120 + 70 * Math.cos(t) + jitter() * 6,
+          y: 102 + 70 * Math.sin(t) + jitter() * 6,
+        });
+      }
+      return points;
+    },
+  },
+  {
+    name: 'rectangle',
+    stroke: () => polygonStroke([
+      { x: 45, y: 35 },
+      { x: 196, y: 35 },
+      { x: 196, y: 172 },
+      { x: 45, y: 172 },
+    ], 28, 6, 0x5eed02, true),
+  },
+  {
+    name: 'triangle',
+    stroke: () => polygonStroke([
+      { x: 120, y: 28 },
+      { x: 208, y: 172 },
+      { x: 32, y: 172 },
+    ], 34, 6, 0x5eed03, true),
+  },
+  {
+    name: 'line',
+    stroke: () => polygonStroke([
+      { x: 28, y: 152 },
+      { x: 214, y: 56 },
+    ], 44, 5, 0x5eed04, false),
+  },
+  {
+    name: 'star',
+    stroke: () => {
+      const jitter = wobble(0x5eed05);
+      const vertices: CanvasPoint[] = [];
+      for (let i = 0; i < 10; i += 1) {
+        const angle = -Math.PI / 2 + (i * Math.PI) / 5;
+        const radius = i % 2 === 0 ? 76 : 31;
+        vertices.push({ x: 120 + radius * Math.cos(angle), y: 104 + radius * Math.sin(angle) });
+      }
+      const points = polygonStroke(vertices, 12, 5, 0x5eed05, true);
+      return points.map((pt) => ({ x: pt.x + jitter() * 1.5, y: pt.y + jitter() * 1.5 }));
+    },
+  },
+  {
+    name: 'scribble',
+    stroke: () => {
+      // A bounded random walk with a hard turn every few steps: no consistent
+      // curvature, no closed outline, nothing for a fitter to agree with.
+      const jitter = wobble(0x5eed06);
+      const points: CanvasPoint[] = [{ x: 60, y: 60 }];
+      let angle = 0;
+      for (let i = 0; i < 90; i += 1) {
+        angle += jitter() * 2.4 + (i % 7 === 0 ? jitter() * 4 : 0);
+        const previous = points[points.length - 1]!;
+        points.push({
+          x: Math.min(230, Math.max(20, previous.x + Math.cos(angle) * 11)),
+          y: Math.min(190, Math.max(20, previous.y + Math.sin(angle) * 11)),
+        });
+      }
+      return points;
+    },
+  },
+];
+
+/**
+ * Walk a polygon's edges, laying down jittered points as it goes.
+ *
+ * `perEdge` points per edge and `amplitude` pixels of wobble, plus -- when the
+ * figure is closed -- a short overshoot past the starting corner, because that is
+ * what a hand does and because a stroke that stops exactly on its own first point
+ * is a cleaner input than the model will ever get.
+ */
+function polygonStroke(
+  vertices: CanvasPoint[],
+  perEdge: number,
+  amplitude: number,
+  seed: number,
+  closed: boolean
+): CanvasPoint[] {
+  const jitter = wobble(seed);
+  const points: CanvasPoint[] = [];
+  const edges = closed ? vertices.length : vertices.length - 1;
+  for (let e = 0; e < edges; e += 1) {
+    const a = vertices[e]!;
+    const b = vertices[(e + 1) % vertices.length]!;
+    for (let i = 0; i < perEdge; i += 1) {
+      const t = i / perEdge;
+      points.push({
+        x: a.x + (b.x - a.x) * t + jitter() * amplitude,
+        y: a.y + (b.y - a.y) * t + jitter() * amplitude,
+      });
+    }
+  }
+  if (closed) {
+    const a = vertices[0]!;
+    const b = vertices[1]!;
+    for (let i = 0; i < 4; i += 1) {
+      const t = i / perEdge;
+      points.push({
+        x: a.x + (b.x - a.x) * t + jitter() * amplitude,
+        y: a.y + (b.y - a.y) * t + jitter() * amplitude,
+      });
+    }
+  }
+  return points;
+}
+
+/** A one-line summary of a fitted shape's geometry, for a log line and a row. */
+function describeShape(shape: FittedShape): string {
+  const n = (value: number) => value.toFixed(1);
+  const deg = (radians: number) => `${((radians * 180) / Math.PI).toFixed(0)}°`;
+  switch (shape.kind) {
+    case 'line':
+      return `(${n(shape.from.x)}, ${n(shape.from.y)}) → (${n(shape.to.x)}, ${n(shape.to.y)})`;
+    case 'rectangle': {
+      const [a, b, c] = shape.corners;
+      if (!a || !b || !c) return `${shape.corners.length} corners`;
+      const w = Math.hypot(b.x - a.x, b.y - a.y);
+      const h = Math.hypot(c.x - b.x, c.y - b.y);
+      const square = Math.abs(w - h) < 1e-6 ? ' (square)' : '';
+      return `${n(w)} × ${n(h)}${square} at ${deg(Math.atan2(b.y - a.y, b.x - a.x))}`;
+    }
+    case 'triangle': {
+      const [a, b, c] = shape.vertices;
+      if (!a || !b || !c) return `${shape.vertices.length} vertices`;
+      const sides = [
+        Math.hypot(b.x - a.x, b.y - a.y),
+        Math.hypot(c.x - b.x, c.y - b.y),
+        Math.hypot(a.x - c.x, a.y - c.y),
+      ];
+      return `sides ${sides.map(n).join(' / ')}`;
+    }
+    case 'ellipse': {
+      const circle = Math.abs(shape.semiMajor - shape.semiMinor) < 1e-9;
+      return circle
+        ? `circle r ${n(shape.semiMajor)} at (${n(shape.center.x)}, ${n(shape.center.y)})`
+        : `axes ${n(shape.semiMajor)} / ${n(shape.semiMinor)} at ${deg(shape.rotation)}`;
+    }
+    case 'star':
+      return `${shape.pointCount} points, r ${n(shape.outerRadius)} / ${n(shape.innerRadius)} ` +
+        `at ${deg(shape.rotation)}`;
+  }
+}
+
+/** The stroke's bounding box, for the "the fit landed where the stroke was"
+ *  invariant in the self-test. */
+function bounds(points: CanvasPoint[]) {
+  const xs = points.map((p) => p.x);
+  const ys = points.map((p) => p.y);
+  const minX = Math.min(...xs);
+  const maxX = Math.max(...xs);
+  const minY = Math.min(...ys);
+  const maxY = Math.max(...ys);
+  return { minX, maxX, minY, maxY, width: maxX - minX, height: maxY - minY };
+}
+
+function median(values: number[]): number {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 0
+    ? ((sorted[middle - 1] ?? 0) + (sorted[middle] ?? 0)) / 2
+    : sorted[middle] ?? 0;
+}
+
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <View style={styles.row}>
@@ -3722,6 +4438,25 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   emojiGlyph: { fontSize: 28 },
+  canvas: {
+    height: 210,
+    marginTop: 8,
+    borderWidth: 1,
+    borderColor: '#d0d7de',
+    borderStyle: 'dashed',
+    borderRadius: 12,
+    backgroundColor: '#fbfcfd',
+    overflow: 'hidden',
+  },
+  canvasHint: { position: 'absolute', left: 14, top: 12, fontSize: 13, opacity: 0.35 },
+  inkDot: {
+    position: 'absolute',
+    width: 3,
+    height: 3,
+    borderRadius: 1.5,
+    backgroundColor: '#8b949e',
+  },
+  fitSegment: { position: 'absolute', height: 2, borderRadius: 1, backgroundColor: '#1f6feb' },
   wordText: { fontWeight: '600' },
   wordTime: { fontSize: 11, opacity: 0.5, fontVariant: ['tabular-nums'] },
 });
