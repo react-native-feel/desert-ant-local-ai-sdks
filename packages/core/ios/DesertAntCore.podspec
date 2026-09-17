@@ -51,7 +51,7 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # that. Checked against those two lines before any of the three pods was written,
 # because the failure mode is the build rather than the import.
 #
-# `Align`, added last, is the one product in this list that does NOT reach the
+# `Align`, added eleventh, is the one product in this list that does NOT reach the
 # manifest through `modelProducts`, and it is worth saying so because the check to
 # run on it is a different line. Align is Apple-only (Core ML, Speech,
 # AVFoundation) and so lives outside desert-ant-core's `models` array entirely --
@@ -61,6 +61,43 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # `products + modelProducts + alignProducts + vozProducts`, and `alignProducts` is
 # in that sum. Read at Package.swift line 546 before the pod was written, because
 # the failure mode is the build rather than the import.
+#
+# `Title`, added last, is the twelfth and completes the catalog. It reaches the
+# manifest a third way again -- neither `modelProducts`' usual route nor Align's
+# and Voz's bespoke arrays. It is Apple-only like those two, but unlike them it
+# stays INSIDE the `models` array with `appleOnly: true`, and `modelProducts`
+# branches on that flag: an `appleOnly` model maps to
+# `[.library(name: model.name, targets: [model.name])]` alone -- one library, no
+# `TitleAndroid`, no `TitleNode`, no `TitleWeb`. So `Title` resolves through the
+# same `products + modelProducts + ...` sum as Clear and Emo, and naming it here
+# is safe for the same reason. Read off Package.swift before the pod was written.
+#
+# Naming it also brings in a `Title` module whose generating half was COMPILED
+# OUT, and that is worth stating here because this file is where the linking is
+# decided. Title is MLX-backed, and MLX is behind desert-ant-core's `MLX` package
+# TRAIT. `spm_dependency` below takes `url:`, `requirement:` and `products:` and
+# nothing else -- react-native 0.86.3's scripts/cocoapods/spm.rb declares exactly
+# `def dependency(pod_spec, url:, requirement:, products:)` -- so there is no
+# argument to pass a trait through. Nor is there anywhere to put one afterwards:
+# xcodeproj 1.27.0 has no trait attribute on any package-reference class (the
+# string does not occur in the gem at all), and Xcode 26.4.1 mentions
+# `enabledTraits` only inside PackageDescription's own `.swiftinterface`, with no
+# `xcodebuild` flag for it. Traits are enabled by a consuming `Package.swift` or
+# by `swift build --traits`, and a CocoaPods app is neither.
+#
+# The consequence is bounded and is NOT a link failure: the `Title` product
+# resolves and links fine, `Card` and the `TitleModel` catalog entry are there,
+# and `Titles` simply has no public initializer. `packages/title/ios` is written
+# against that reality and its generating half is guarded by
+# `#if canImport(MLXLMCommon)`, so if the trait ever becomes reachable it lights
+# up with no change here.
+#
+# Enabling it via a vendored local wrapper package was considered and rejected:
+# a trait is a property of the PACKAGE, so switching `MLX` on for this one pod
+# switches it on for all twelve models, and an app installing only Shapes would
+# clone mlx-swift, swift-transformers and swift-syntax and build host macro
+# plugins. That is exactly the cost upstream's manifest says the trait exists to
+# avoid.
 #
 # `Tongue` is deliberately NOT in this list, and it is the one model in the
 # family that is missing from it. desert-ant-core v3.1.0 declares the product --
@@ -80,7 +117,7 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # When upstream adds those two words, adding `'Tongue'` here is the whole change
 # on this side: `packages/tongue/ios` is already written against the module and
 # guarded by `#if canImport(Tongue)`, so it lights up on its own.
-DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear', 'Gist', 'Redact', 'Shapes', 'Align'].freeze
+DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear', 'Gist', 'Redact', 'Shapes', 'Align', 'Title'].freeze
 
 Pod::Spec.new do |s|
   s.name           = 'DesertAntCore'

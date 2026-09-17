@@ -31,6 +31,11 @@ import {
   type Recognition as ShapeRecognition,
   type Shape as FittedShape,
 } from '@desert-ant-labs/react-native-shapes';
+import {
+  Title,
+  cardShape,
+  type Card as TitleCardResult,
+} from '@desert-ant-labs/react-native-title';
 import { Tongue, type Detection as TextDetection } from '@desert-ant-labs/react-native-tongue';
 import { Uhm, type UhmResult } from '@desert-ant-labs/react-native-uhm';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
@@ -121,6 +126,7 @@ export default function App() {
   const redact = useRef<Redact | null>(null);
   const shapes = useRef<Shapes | null>(null);
   const align = useRef<Align | null>(null);
+  const titleModel = useRef<Title | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -285,6 +291,23 @@ export default function App() {
   // `refineSec` is the only part of it Align is responsible for.
   const [alignMs, setAlignMs] = useState<number | null>(null);
 
+  // Title is the twelfth model and the only one whose central call cannot run in
+  // this build at all -- generation is behind desert-ant-core's `MLX` package
+  // trait, and a CocoaPods app has no way to enable a SwiftPM trait. So this
+  // section has two states where the others have one: what the *catalog* half can
+  // do (download, verify, inspect ~280 MB) and what the *model* half can do
+  // (nothing here). `Title.canDownloadWeights` is the first, `Title.isSupported`
+  // the second, and the section is built around the gap between them.
+  const [titleState, setTitleState] = useState<ModelState>(
+    Title.canDownloadWeights ? 'absent' : 'unsupported'
+  );
+  const [titleCard, setTitleCard] = useState<TitleCardResult | null>(null);
+  const [titleFolder, setTitleFolder] = useState<{ bytes: number; missing: number } | null>(null);
+  // The refusal, held in state so the screen shows it rather than only the log.
+  // This is the one model in the app where the error IS the demo.
+  const [titleRefusal, setTitleRefusal] = useState<string | null>(null);
+  const [titleMs, setTitleMs] = useState<number | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -358,6 +381,21 @@ export default function App() {
         `maxBuffered=${Align.defaultMaxBufferedSeconds}` +
         `${Align.unsupportedReason ? ` reason=${Align.unsupportedReason}` : ''}`
     );
+    // Two booleans on one line, which is the whole story of this package:
+    // `canDownload=true isSupported=false`. The reason is neither the device nor
+    // the OS -- it is that this binary was built without desert-ant-core's `MLX`
+    // package trait, so upstream's `Titles` actor has no public initializer.
+    console.log(
+      `[title] isSupported=${Title.isSupported} canDownload=${Title.canDownloadWeights} ` +
+        `mlxTrait=${Title.mlxTraitEnabled} nativeCore=${Title.nativeCoreVersion} ` +
+        `id=${Title.modelId} revision=${Title.modelRevision} pinned=${Title.revisionIsPinned} ` +
+        `repo=${Title.modelRepo} files=${Title.modelFiles.length} ` +
+        `weights=${Title.weightsFileName} osFloor=${Title.osFloorIOS} ` +
+        `maxTokens=${Title.defaultMaxTokens}` +
+        `${Title.unsupportedReason ? ` reason=${Title.unsupportedReason}` : ''}`
+    );
+    console.log(`[title] files=${Title.modelFiles.join(' ')}`);
+    console.log(`[title] summary="${Title.modelSummary}"`);
   }, []);
 
   // Created once with no source, then pointed at each new file with `replace`.
@@ -458,6 +496,25 @@ export default function App() {
       // mistake as pulling Voz's 490 MB. The section below asks.
       if (Align.isSupported) void prepareAlign();
 
+      // Title does NOT load on mount, and it is the clearest case in the app for
+      // not doing so: ~280 MB, for a model this build cannot run. What happens
+      // here is the free half -- `create()` touches no network, so asking whether
+      // the folder is already on disk costs nothing. Written as a block rather
+      // than an early return, because the bare `return` that used to guard these
+      // probes took every later one down with it.
+      if (!cancelled && Title.canDownloadWeights) {
+        const titleProbe = Title.create();
+        const titleDownloaded = titleProbe.isDownloaded();
+        const titleMissing = titleProbe.missingFiles();
+        titleProbe.release();
+        console.log(
+          `[title] isDownloaded=${titleDownloaded} missing=${titleMissing.length}/${Title.modelFiles.length}`
+        );
+        if (titleDownloaded && !cancelled) {
+          void prepareTitle(false);
+        }
+      }
+
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
       if (cancelled || !Voz.isSupported) return;
@@ -517,6 +574,8 @@ export default function App() {
       shapes.current = null;
       align.current?.release();
       align.current = null;
+      titleModel.current?.release();
+      titleModel.current = null;
     };
   }, []);
 
@@ -1104,6 +1163,102 @@ export default function App() {
     } finally {
       setBusy(null);
       setProgress(null);
+    }
+  }, []);
+
+  /**
+   * Download Title's model folder: ~280 MB in seven files.
+   *
+   * Behind a tap, and the *only* model in this app behind a tap for which the tap
+   * buys something that cannot then be used. That is worth demonstrating rather
+   * than hiding: the catalog half of this package genuinely works -- the folder
+   * downloads, verifies against the store's manifest, and reports its path -- and
+   * that path is exactly what upstream's own `Titles(directory:)` takes. An app
+   * whose native code has the `MLX` trait can use this package to put the files
+   * there. This app cannot, and says so under the button.
+   */
+  const prepareTitle = useCallback(async (announce = true) => {
+    if (titleModel.current) return;
+    setError(null);
+    setTitleState('loading');
+    if (announce) setBusy('Downloading the Title model folder (~280 MB)');
+    try {
+      const t0 = Date.now();
+      const model = await Title.load({
+        onProgress: (event) => {
+          setProgress(event);
+          if (event.fraction >= 1) console.log(`[title] ${event.phase} complete`);
+        },
+      });
+      titleModel.current = model;
+      const bytes = model.installedBytes();
+      const missing = model.missingFiles();
+      setTitleFolder({ bytes, missing: missing.length });
+      setTitleState('ready');
+      console.log(
+        `[title] folder ready in ${Date.now() - t0}ms — ${bytes} bytes, ` +
+          `${Title.modelFiles.length - missing.length}/${Title.modelFiles.length} files, ` +
+          `downloaded=${model.isDownloaded()} dir=${model.resolvedDirectory()}`
+      );
+      if (missing.length > 0) {
+        console.log(`[title] MISSING after resolve: ${missing.join(' ')}`);
+      }
+    } catch (e) {
+      console.log(`[title] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setTitleState('absent');
+    } finally {
+      setBusy(null);
+      setProgress(null);
+    }
+  }, []);
+
+  /**
+   * Ask Title for a card, and show what comes back.
+   *
+   * On this build what comes back is a refusal, and that is the point of the
+   * button. The alternative designs were both worse: not offering the call at all
+   * would hide the gap, and stubbing it would ship a method that silently returns
+   * nothing. So the call is made for real, the `ERR_UNSUPPORTED_PLATFORM` is
+   * caught, and its sentence is put on screen where it names the `MLX` trait.
+   *
+   * If the trait is ever enabled, nothing in this function changes: the same call
+   * returns a card and the same code path renders it.
+   */
+  const runTitle = useCallback(async (text: string) => {
+    const model = titleModel.current;
+    if (!model) return;
+    setError(null);
+    setTitleCard(null);
+    setTitleRefusal(null);
+    setBusy('Writing a card');
+    try {
+      const t0 = Date.now();
+      const card = await model.describe(text);
+      const waited = Date.now() - t0;
+      setTitleMs(waited);
+      setTitleCard(card);
+      const shape = cardShape(card);
+      console.log(
+        `[title] describe ok in ${waited}ms — "${card.title}" / "${card.description}" ` +
+          `empty=${card.isEmpty} native=${(card.processingSec * 1000).toFixed(0)}ms ` +
+          `revision=${card.modelRevision} runtime=${card.modelRuntime}`
+      );
+      console.log(
+        `[title] shape: ${shape.titleWordCount} words (inRange=${shape.titleWordsInRange}) ` +
+          `${shape.descriptionSentenceCount} sentences ` +
+          `(inRange=${shape.descriptionSentencesInRange}) ` +
+          `endsWithPunctuation=${shape.titleEndsWithPunctuation} ` +
+          `emoji=${shape.hasEmoji} hashtag=${shape.hasHashtag} ` +
+          `matchesPublishedShape=${shape.matchesPublishedShape}`
+      );
+    } catch (e) {
+      // `describe` already prefixes the code, so this is not doubled up.
+      const code = e instanceof DesertAntError ? e.code : 'unknown';
+      setTitleRefusal(describe(e));
+      console.log(`[title] describe refused (${code}): ${describe(e)}`);
+    } finally {
+      setBusy(null);
     }
   }, []);
 
@@ -3024,6 +3179,215 @@ export default function App() {
       console.log(`[align] self-test FAILED: ${describe(e)}`);
     }
 
+    // --- Title. The only leg here whose model never runs, and the assertions are
+    //     written around that rather than in spite of it.
+    //
+    //     What CAN be asserted, and is: that the twelfth pod builds, links and
+    //     registers; that every `@JS` property reads and every one of them agrees
+    //     with desert-ant-core's catalog rather than with a constant in
+    //     TypeScript; that the seven declared files are the seven the Hub carries;
+    //     that the two booleans genuinely differ, which is the shape of this
+    //     package; that the argument refusals fire before any native call; and --
+    //     where the folder has been downloaded -- that the store's own
+    //     verification agrees with a file-by-file check of it.
+    //
+    //     What CANNOT be asserted is anything about a card, because no card can be
+    //     produced: generation is behind desert-ant-core's `MLX` package trait,
+    //     and a CocoaPods app has no way to enable a SwiftPM trait. So the
+    //     generating assertion here is the *refusal* -- that `describe` throws
+    //     ERR_UNSUPPORTED_PLATFORM with a sentence naming the trait, rather than
+    //     returning an empty card. That is worth asserting on its own: a model
+    //     that quietly answered nothing would look like a model that had nothing
+    //     to say.
+    try {
+      // Read before anything is constructed, because a `@JS var` that fails to
+      // bind is the failure most likely to be silent.
+      console.log(
+        `[title] catalog: id=${Title.modelId} repo=${Title.modelRepo} ` +
+          `revision=${Title.modelRevision} pinned=${Title.revisionIsPinned} ` +
+          `weights=${Title.weightsFileName} osFloor=${Title.osFloorIOS} ` +
+          `core=${Title.nativeCoreVersion} maxTokens=${Title.defaultMaxTokens}`
+      );
+
+      if (!Title.canDownloadWeights) {
+        console.log(`[title] self-test skipped — ${Title.unsupportedReason}`);
+      } else {
+        // The gap this package exists to describe. Both of these being true would
+        // mean the trait had been enabled and the rest of this leg is wrong; both
+        // being false would mean the pod had not bound at all.
+        if (Title.isSupported && !Title.mlxTraitEnabled) {
+          failures.push('title: isSupported is true with the MLX trait off');
+        }
+        if (Title.isSupported !== Title.mlxTraitEnabled) {
+          // On Apple these are the same question, since the catalog half always
+          // answers yes here. If they ever diverge the reason is worth seeing.
+          failures.push(
+            `title: isSupported=${Title.isSupported} but mlxTrait=${Title.mlxTraitEnabled}`
+          );
+        }
+        if (!Title.isSupported && !Title.unsupportedReason?.includes('MLX')) {
+          failures.push('title: the refusal does not name the MLX trait');
+        }
+
+        // The file manifest, checked against the seven names upstream's
+        // `Sources/Title/Catalog.swift` declares. Written out here rather than
+        // counted, because the point is that this list lives in the binary and
+        // not in this file -- if upstream renames one, this fails loudly instead
+        // of downloading six files and calling it complete.
+        const expectedFiles = [
+          'model.safetensors',
+          'model.safetensors.index.json',
+          'config.json',
+          'generation_config.json',
+          'tokenizer.json',
+          'tokenizer_config.json',
+          'chat_template.jinja',
+        ];
+        const files = Title.modelFiles;
+        if (files.length !== expectedFiles.length || expectedFiles.some((f) => !files.includes(f))) {
+          failures.push(`title: declared files are ${files.join(' ')}`);
+        }
+        if (!files.includes(Title.weightsFileName ?? '')) {
+          failures.push('title: the artifact is not among the declared files');
+        }
+        if (Title.modelRevision !== 'v0.1.0' || !Title.revisionIsPinned) {
+          failures.push(`title: revision is ${Title.modelRevision}, pinned=${Title.revisionIsPinned}`);
+        }
+        if (Title.osFloorIOS !== 17) {
+          failures.push(`title: osFloor is ${Title.osFloorIOS}, not MLX's 17`);
+        }
+
+        const probe = titleModel.current ?? Title.create();
+        const owned = titleModel.current === null;
+
+        // Refusals, all of which are raised before a native call is made, so this
+        // half of the leg runs on a device that has never downloaded the folder.
+        for (const [what, run] of [
+          ['an empty passage', () => probe.describe('')],
+          ['a whitespace passage', () => probe.describe('   \n\t ')],
+        ] as const) {
+          try {
+            await run();
+            failures.push(`title: ${what} was accepted`);
+          } catch (e) {
+            const code = e instanceof DesertAntError ? e.code : 'unknown';
+            if (code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`title: ${what} raised ${code}`);
+            }
+          }
+        }
+        for (const [what, bad] of [
+          ['a zero token cap', { maxTokens: 0 }],
+          ['a negative token cap', { maxTokens: -8 }],
+          ['a fractional token cap', { maxTokens: 1.5 }],
+          ['a blank directory', { directory: '   ' }],
+        ] as const) {
+          try {
+            Title.create(bad as never).release();
+            failures.push(`title: ${what} was accepted`);
+          } catch (e) {
+            const code = e instanceof DesertAntError ? e.code : 'unknown';
+            if (code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`title: ${what} raised ${code}`);
+            }
+          }
+        }
+        console.log(
+          '[title] refused an empty passage, a whitespace passage, zero/negative/fractional ' +
+            'token caps, and a blank directory'
+        );
+
+        // The refusal that is the model's, not the arguments'. Asserted as a
+        // CODE rather than as a message, because a code is what an app branches
+        // on, and asserted at all because the alternative outcome -- an empty
+        // card -- would be indistinguishable from a model with nothing to say.
+        try {
+          await probe.describe(TITLE_SAMPLE);
+          if (!Title.isSupported) {
+            failures.push('title: describe returned a card with the MLX trait off');
+          }
+        } catch (e) {
+          const code = e instanceof DesertAntError ? e.code : 'unknown';
+          if (Title.isSupported) {
+            failures.push(`title: describe raised ${code} on a build that can generate`);
+          } else if (code !== 'ERR_UNSUPPORTED_PLATFORM') {
+            failures.push(`title: a missing MLX trait raised ${code}, not ERR_UNSUPPORTED_PLATFORM`);
+          } else {
+            console.log(`[title] describe refused as designed: ${describe(e)}`);
+          }
+        }
+
+        // The half that works. Only meaningful once the folder is here, so this
+        // is a skip rather than a failure on a fresh install -- the download is
+        // ~280 MB and belongs behind the button, not inside a smoke test.
+        const missing = probe.missingFiles();
+        const bytes = probe.installedBytes();
+        console.log(
+          `[title] folder: downloaded=${probe.isDownloaded()} ` +
+            `missing=${missing.length}/${files.length} bytes=${bytes} ` +
+            `dir="${probe.resolvedDirectory()}"`
+        );
+        if (probe.isDownloaded()) {
+          // Two independent checks of the same fact: the store's verified
+          // manifest says the model is available, and a file-by-file existence
+          // check says nothing is absent. They are computed by different code and
+          // disagreeing would mean one of them is lying.
+          //
+          // This is not a hypothetical. The first run of this leg after the
+          // download reported `isDownloaded=true missing=7/7 bytes=0 dir=""` on a
+          // freshly created (un-prepared) model, because the filesystem side had
+          // no folder to look in while `isDownloaded` was reading the managed
+          // cache. `folderPath()` in ios/TitleModelObject.swift now falls back to
+          // the store's own `installedModels()`, and these three lines are what
+          // caught it.
+          if (missing.length > 0) {
+            failures.push(`title: isDownloaded but missing ${missing.join(' ')}`);
+          }
+          if (bytes <= 0) {
+            failures.push('title: isDownloaded but the folder measures zero bytes');
+          }
+          if (probe.resolvedDirectory().length === 0) {
+            failures.push('title: isDownloaded but resolvedDirectory is empty');
+          }
+        } else {
+          console.log(
+            `[title] folder checks skipped — the ~280 MB is not on this device. ` +
+              `missingFiles reports all ${missing.length}, which is the truthful answer.`
+          );
+          if (missing.length !== files.length) {
+            failures.push(
+              `title: nothing downloaded but only ${missing.length} of ${files.length} files report missing`
+            );
+          }
+        }
+
+        // `cardShape` is pure arithmetic, so it runs with no model at all -- the
+        // one part of this package's *output* handling that can be exercised
+        // here. Checked against a card the model would have written, not one it
+        // did.
+        const shaped = cardShape({
+          title: 'Filming a two-person podcast on iPhone',
+          description: 'Two phones, one lav mic, and a clap at the top to sync them in the edit.',
+        });
+        console.log(
+          `[title] cardShape on a specimen card: ${shaped.titleWordCount} words, ` +
+            `${shaped.descriptionSentenceCount} sentences, ` +
+            `matchesPublishedShape=${shaped.matchesPublishedShape}`
+        );
+        if (!shaped.matchesPublishedShape) {
+          failures.push('title: cardShape rejected a card of the published shape');
+        }
+        if (cardShape({ title: 'Too short', description: 'x' }).matchesPublishedShape) {
+          failures.push('title: cardShape accepted a two-word title');
+        }
+
+        if (owned) probe.release();
+      }
+    } catch (e) {
+      failures.push(`title: ${describe(e)}`);
+      console.log(`[title] self-test FAILED: ${describe(e)}`);
+    }
+
     // --- Clear: file in, file out (the primary API), then the in-memory one.
     try {
       const model = clear.current ?? Clear.create();
@@ -4331,6 +4695,91 @@ export default function App() {
           </>
         ) : null}
       </View>
+
+      <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Title</Text>
+
+        {/* The two booleans, on screen, because the gap between them is what this
+            section is about. Every other model in this app answers "supported" or
+            "not"; this one downloads 280 MB it cannot use. */}
+        <Row label="Can download" value={Title.canDownloadWeights ? 'yes' : 'no'} />
+        <Row label="Can generate" value={Title.isSupported ? 'yes' : 'NO'} />
+        <Row label="MLX trait" value={Title.mlxTraitEnabled ? 'enabled' : 'off'} />
+        <Row label="Revision" value={`${Title.modelRevision ?? '—'}${Title.revisionIsPinned ? ' (tag)' : ''}`} />
+        <Row label="Files" value={`${Title.modelFiles.length}`} />
+
+        {!Title.isSupported ? (
+          <Text style={styles.note}>
+            {Title.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {titleState === 'unsupported' ? null : (
+          <>
+            <Text style={styles.note}>
+              The catalog half still works, and it is not a consolation prize:
+              the ~280 MB folder downloads, verifies, and reports its path — which
+              is exactly the folder upstream&apos;s own `Titles(directory:)` takes.
+              A native caller built with the trait can use this package to put the
+              files there.
+            </Text>
+
+            {titleState === 'absent' ? (
+              <Button
+                label="Download the model folder (~280 MB)"
+                onPress={() => void prepareTitle()}
+                disabled={busy !== null}
+                tone="ghost"
+              />
+            ) : null}
+
+            {titleState === 'loading' ? (
+              <Text style={styles.note}>Downloading — seven files, ~280 MB.</Text>
+            ) : null}
+
+            {titleState === 'ready' && titleFolder ? (
+              <>
+                <Row
+                  label="On disk"
+                  value={`${(titleFolder.bytes / 1_000_000).toFixed(1)} MB`}
+                />
+                <Row
+                  label="Complete"
+                  value={`${Title.modelFiles.length - titleFolder.missing} / ${Title.modelFiles.length} files`}
+                />
+                <Button
+                  label="Write a card for the sample passage"
+                  onPress={() => void runTitle(TITLE_SAMPLE)}
+                  disabled={busy !== null}
+                  tone="ghost"
+                />
+              </>
+            ) : null}
+          </>
+        )}
+
+        {/* The refusal, rendered as an outcome rather than swallowed as an error.
+            On this build it is what the button above produces, every time. */}
+        {titleRefusal ? <Text style={styles.note}>{titleRefusal}</Text> : null}
+
+        {titleCard ? (
+          <>
+            <Text style={styles.transcript}>{titleCard.title}</Text>
+            <Text style={styles.note}>{titleCard.description}</Text>
+            <Row label="Words in title" value={`${cardShape(titleCard).titleWordCount}`} />
+            <Row
+              label="Published shape"
+              value={cardShape(titleCard).matchesPublishedShape ? 'yes' : 'NO'}
+            />
+            <Row
+              label="Generate"
+              value={`${(titleCard.processingSec * 1000).toFixed(0)} ms`}
+            />
+            <Row label="Waited" value={titleMs === null ? '—' : `${titleMs} ms`} />
+            <Row label="Runtime" value={titleCard.modelRuntime ?? '—'} />
+          </>
+        ) : null}
+      </View>
     </ScrollView>
   );
 }
@@ -4402,6 +4851,28 @@ function Fit({ shape }: { shape: FittedShape }) {
  * translations should rank the same emoji. That is the claim that separates this
  * model from a keyword table, and it is cheap to check by tapping.
  */
+/**
+ * The passage this app asks Title to name.
+ *
+ * The transcript sample, not a hand-written paragraph, and that is the point of
+ * it: the published pipeline for this model is Voz transcribes, Clips picks the
+ * moments, Title names them, and upstream's own actor carries `card(for clip:
+ * Clip)` and `cards(for clips: [Clip])` to make that join explicit. This app
+ * already has the first two stages and a real transcript to feed them, so the
+ * passage below is the text of one of the clips Clips ranks -- the closest this
+ * build can get to the real thing.
+ *
+ * It cannot get closer, because `describe` refuses on this build. What the
+ * constant is for today is that the refusal happens on *realistic* input rather
+ * than on a placeholder, which is what makes it a demonstration of the gap rather
+ * than of a bad argument.
+ */
+const TITLE_SAMPLE =
+  'We shot the whole thing on two phones. One on a tripod for the wide, one ' +
+  'handheld for the reverse, and a single lav mic split between them. The ' +
+  'trick is starting both recordings with a clap so you can line them up in ' +
+  'the edit without timecode.';
+
 /**
  * The locale this app asks Align for.
  *

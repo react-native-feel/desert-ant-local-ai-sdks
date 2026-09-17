@@ -1225,6 +1225,214 @@ and that is the one place in this whole family where tens of milliseconds change
 output rather than a number on a screen: a filler-trimmed word span is what an
 automatic cut is made from.
 
+## What Desert Ant ships for Title (v3.1.0)
+
+The twelfth model, which completes this repo's coverage of the stable Desert Ant
+catalog — and the only one whose central call this repo cannot make at all.
+
+`Sources/Title` is an actor, `Titles`, over a **350M-parameter Granite fine-tune
+quantized to 6 bits**. `describe(_ text: String)` substitutes the passage into one
+fixed prompt, decodes at most 96 tokens at temperature 0, and parses a `TITLE:` /
+`DESC:` reply into a two-field `Card`. It is the one model in the package that does
+**not** go through `InferenceSession`, and the reason is measured rather than
+architectural: writing a title is short autoregressive decode, which the Neural
+Engine is bandwidth-bound for. `Sources/Title/Catalog.swift` carries the numbers
+from the commit that deleted the Core ML path — Core ML's best showing was its CPU
+one at **213 ms to first token against MLX's 55 ms, 86 tok/s against 447, 1921 MB
+resident against 635**, and `CPU_AND_NE` could not build an execution plan from
+`model.mil` at all (error -14).
+
+Apple-only, and not by omission. `Package.swift` appends it to the `models` array
+with `appleOnly: true` and the reason above it — *"`Title` is MLX, which has no
+other platform, and a product promising an artifact that cannot load is worse than
+its absence"* — so `modelProducts` emits one library and no Android, Node or Web
+products. Upstream's manifest records `swift: live`, `kotlin: none`, `js: none`. So
+`packages/title` has no `android/` directory and its `expo-module.config.json`
+lists `"platforms": ["apple"]`.
+
+The artifact is also shaped unlike every other model here. It is an MLX model
+**folder** — `model.safetensors`, `model.safetensors.index.json`, `config.json`,
+`generation_config.json`, `tokenizer.json`, `tokenizer_config.json`,
+`chat_template.jinja` — rather than a compiled `<model>.mlmodelc` or
+`<model>.tflite` with sidecars around it. `TitleModel.artifact(for:)` answers
+`model.safetensors` because the shared declaration wants one runnable file, but MLX
+loads the directory whole.
+
+### The `MLX` trait is the whole story
+
+Generation lives behind `#if MLX`, the compilation condition SwiftPM defines for a
+package **trait** (SE-0450):
+
+```swift
+.trait(name: "MLX", description: "MLX-backed generation (the Title model). "
+    + "Apple platforms only; pulls mlx-swift-lm and swift-transformers into the graph.")
+```
+
+The reason it is a trait is the same one that keeps JavaScriptKit off every
+non-wasm graph in the same manifest: `MLXHuggingFace` exposes
+`#huggingFaceLoadModelContainer`, a **macro**, so it drags swift-syntax and host
+macro plugins in — and a package dependency cannot carry a platform condition.
+Every mlx product edge is declared `condition: .when(traits: ["MLX"])`, so SwiftPM
+prunes mlx-swift-lm and swift-transformers entirely when nothing enables the trait.
+It is deliberately not a *default* trait, because default traits are enabled
+implicitly by every consumer including the Linux and Android pipelines.
+
+Without the trait the target still compiles, and upstream states the intended
+consequence in the file header: *"`Card`, the prompt, and `parse` are portable and
+tested everywhere — but generation is absent: `Titles` has no public initializer,
+so a consumer that forgot the trait fails at compile time instead of
+mis-building."*
+
+**A React Native app cannot enable it.** A trait is enabled by a consuming
+`Package.swift` (`.package(url: ..., traits: ["MLX"])`) or by
+`swift build --traits MLX`, and by nothing else that exists today. Four routes were
+checked:
+
+| route | finding |
+| --- | --- |
+| React Native's SPM bridge | react-native 0.86.3's `scripts/cocoapods/spm.rb` declares `def dependency(pod_spec, url:, requirement:, products:)`. Four parameters, no traits; `add_spm_to_target` sets only `repositoryURL`, `requirement` and `product_name`. |
+| A `post_install` hook | **xcodeproj 1.27.0** — the gem CocoaPods writes `Pods.xcodeproj` with — contains the string `trait` nowhere in its source. Neither `XCRemoteSwiftPackageReference` nor `XCSwiftPackageProductDependency` has an attribute to set. |
+| Xcode | `grep -ril enabledTraits` over **Xcode 26.4.1 (17E202)** matches two files, both `SwiftPM.framework/…/PackageDescription.swiftmodule/*.swiftinterface` — the *manifest* API. No IDE framework mentions it; `xcodebuild -help` lists no trait flag among its fifteen package options. |
+| The command line | `swift build --traits MLX` exists and works, under `TRAIT OPTIONS`. It applies to the **root** package of a SwiftPM build; the root here is an Xcode app target built by `xcodebuild`. |
+
+One construction could have worked and was rejected on its merits: a local SwiftPM
+package vendored in this repo declaring `.package(url: desert-ant-core, traits:
+["MLX"])`, bridged by path — `spm.rb` does handle
+`XCLocalSwiftPackageReference`, and SwiftPM unions the traits its dependents
+request. The objection is that **a trait is a property of the package, not of one
+product**. There is exactly one `spm_dependency` in this repo, in
+`DesertAntCore.podspec`, shared by all twelve models; enabling `MLX` there enables
+it for every one of them. An app installing only Shapes — 0.2 MB, no transformer
+anywhere near it — would clone mlx-swift, mlx-swift-lm, swift-transformers and
+swift-syntax and build host macro plugins in order to link a model it does not use.
+That is precisely the cost the trait exists to avoid, and it would be paid to
+switch on a model that **still would not run here**: MLX is Metal on Apple silicon,
+and an iOS Simulator is not that.
+
+So `packages/title/ios` links a `Title` module whose generating half was compiled
+out. It is the Tongue pattern with a different cause and a much smaller blast
+radius: Tongue's product cannot be *named* without failing the build, whereas
+Title's product resolves, links, and simply has less in it. The generating branch
+is written and guarded by `#if canImport(MLXLMCommon)` — which is an exact proxy
+for the trait, since nothing else in the graph references those products — so the
+day the trait becomes reachable it compiles itself in, with no change to the
+podspec, the records or the TypeScript.
+
+### The portable half is less reachable than its comment suggests
+
+Upstream's header says the module still compiles because `Card`, the prompt and
+`parse` are portable. That is true about the `#if` and misleading about
+reachability: `static let prompt` and `static func parse(_:)` are both written with
+**no access modifier**, so both are internal to the `Title` module. `public actor
+Titles` has no public member at all without the trait.
+
+Of the portable half, only `Card` crosses the module boundary — and a `Card` with
+no way to make one is a struct. So this package binds no parser. Porting `parse`
+into TypeScript (the `outline` precedent from Shapes) was considered and dropped:
+it reads *raw model text*, and with generation absent no raw model text reaches
+this side of the bridge. It would have been decoration.
+
+The prompt is not restated either, and the rule is harder than it looks. Upstream's
+own docs record what happened when a copy drifted: the previous version of that
+property *"was a different string from the one training used"*, so the shipped
+model *"was served an unseen prompt on every call"*, and a rule the prompt spent
+four lines on had never appeared in a training example. The product page tells
+developers the same thing — *"use the SDK's own prompt: the model was trained on
+one instruction, and a reworded one gets worse output."*
+
+### What is left is the catalog, and it works
+
+`TitleModel` conforms to `ModelDeclaration`, which is entirely MLX-free: `resolve`,
+`isAvailable`, `distribution`, `supports` and `artifact` come from the shared
+extension in `Sources/ModelCatalog/ModelDeclaration.swift`. So the ~280 MB folder
+downloads, verifies against the store's manifest, and reports its path — and that
+path is exactly what upstream's own `Titles(directory:)` takes.
+
+That is worth being precise about, because the product page says *"Nothing is
+downloaded. Ship the model files in a folder with the app and pass that folder to
+`Titles`."* True of upstream's SDK, which never fetches. Not true of the catalog:
+`TitleModel.distribution` names `desert-ant-labs/title` at `v0.1.0` with a
+seven-file Apple manifest, and all seven exist at that tag. This package uses that
+path, which is the difference between it being installable today and being a stub.
+
+### Two booleans, because there is a working half and a missing half
+
+Every other package in this repo answers one question. `packages/title` answers
+two, and the TypeScript gate differs accordingly:
+
+- `canDownloadWeights` is about the **platform** — `TitleModel.supports(.current)`.
+  True on Apple.
+- `isSupported` is about the **build** — that AND `canImport(MLXLMCommon)`. False.
+
+`Title.create()` gates on the first, which is the one place this package
+deliberately diverges from its eleven siblings: refusing to construct a model
+because the build cannot generate would hide a working download behind a missing
+generator.
+
+`describe` throws `ERR_UNSUPPORTED_PLATFORM` with a sentence naming the trait. It
+does **not** return an empty card, and that is the most important decision in the
+package. An empty card is a *documented ordinary outcome* upstream — parsing is
+tolerant by design and `Card.isEmpty` is the only failure signal a caller gets — so
+a stub returning one would compile, pass a smoke test, ship, and never be flagged
+downstream.
+
+### `cardShape` is the Align move, applied to a format instead of a delta
+
+`timestampShift` exists because Align's claim is a measurable delta and taking the
+published number on trust would be a choice. Title's claim is a *format*, published
+in one sentence — *"A title of three to eight words with no final punctuation, and
+a description of one or two sentences, from one call"* — alongside an unusually
+frank caveat: the model *"is in internal testing and its card carries no quality
+figures … sometimes opens a description with a stock phrase its own instruction
+forbids. Read the output before it reaches a user."*
+
+`cardShape` is that reading, automated: word count, terminal punctuation, sentence
+count, emoji, hashtags. Pure TypeScript, no model, no bridge hop. Its thresholds
+come from the product page and the code says so, because they could not be read off
+the binary — they live inside the internal prompt.
+
+It is not a quality score and does not claim to be. A card can pass every check and
+describe the wrong passage.
+
+### Title emits one progress phase and invents none
+
+`loadingModel`, with a true byte fraction from `DownloadProgress` over the seven
+files. There is deliberately no `generating` phase: upstream's decode loop is
+`for await generation in stream` over `MLXLMCommon.generate`, which yields text
+chunks and no denominator. A phase that could only ever report `0` and `1` would be
+a progress bar pretending to be one, so `ModelPhase` gained nothing for the twelfth
+model — the second time in this repo, after Tongue, that the honest answer was to
+add none.
+
+### iOS 17 is Title's fault, and every other model pays it
+
+MLX has no build below iOS 17 / macOS 14, and — unlike Clips' iOS 18 — that is a
+**dependency** floor rather than an artifact one. `@available` is per-declaration
+and cannot satisfy a manifest-level constraint: SwiftPM refuses to resolve `MLXLLM`
+(macOS 14) into a macOS 13 package. `platforms:` also cannot vary by trait. So
+`desert-ant-core`'s whole package floor rose unconditionally, and Package.swift is
+blunt about the cost:
+
+> That costs iOS 16 / macOS 13 for Apple consumers that never enable MLX —
+> accepted deliberately: no known Apple consumer sits below iOS 17.
+
+Emo, Clear and Redact would each run on iOS 16. They are on 17 because of this
+model. `Sources/Title/Catalog.swift` declares `osFloor = OSFloor.mlx`, so for once
+the pod floor, the package floor and the model floor are the same number, and
+`Title.osFloorIOS` reads it off the catalog rather than restating it.
+
+### Where Title sits next to the others
+
+At the end of the published pipeline, and upstream makes the join explicit rather
+than implied: `Titles` carries `card(for clip: Clip)` and `cards(for clips:
+[Clip])`, and `Sources/Title` depends on `Transcript` for exactly that reason. Voz
+transcribes, Clips ranks the moments, Title names them — the product page sells it
+in those words, and `Card` is deliberately *not* a field on `Clip` because
+"selection and card writing are separate stages on separate silicon".
+
+This repo has Voz and Clips working and produces a real ranked clip list. The join
+is still one model short, and the missing model is the one behind the trait.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -2163,6 +2371,106 @@ downloaded and built Core ML sessions concurrently on a memory-pressured machine
 `downloaded=true`, so neither is a measure of a 0.7 MB download. No isolated load
 figure was taken.
 
+### Title, as far as this build can take it
+
+The twelfth pod in the same app, and the only one in this repo whose central call
+is unreachable by construction rather than by circumstance. Driven on an iPhone 17
+Pro Max simulator running iOS 26.4.
+
+What was verified:
+
+```
+[title] isSupported=false canDownload=true mlxTrait=false nativeCore=3.1.0
+        id=title revision=v0.1.0 pinned=true repo=desert-ant-labs/title files=7
+        weights=model.safetensors osFloor=17 maxTokens=96
+[title] files=model.safetensors model.safetensors.index.json config.json
+        generation_config.json tokenizer.json tokenizer_config.json chat_template.jinja
+[title] folder ready in 153653ms — 293658528 bytes, 7/7 files, downloaded=true
+[title] refused an empty passage, a whitespace passage, zero/negative/fractional token caps, and a blank directory
+[title] describe refused as designed: ERR_UNSUPPORTED_PLATFORM
+[title] folder: downloaded=true missing=0/7 bytes=293658528 dir="…/title/v0.1.0"
+[title] cardShape on a specimen card: 6 words, 1 sentences, matchesPublishedShape=true
+```
+
+- **The pod builds and links** as the twelfth, with no duplicate symbols.
+  `DESERT_ANT_PRODUCTS` gained `'Title'` and nothing else changed; no
+  `_NumericsShims` include path was added, because Title's dependencies are
+  `Transcript` plus `mlxProducts` and the latter is pruned without the trait. The
+  second negative case for the swift-numerics rule, after Align.
+- **Every `@JS` property reads off the catalog**, not out of TypeScript — the id,
+  the repo, the pinned revision, the seven file names, the artifact, the OS floor
+  and the core version all come from `TitleModel`.
+- **The download works and the bytes are exact.** 293,658,528 bytes in 7 files in
+  153.7 s, under
+  `…/desert-ant-models/desert-ant-labs/title/v0.1.0/` — and that total is the sum
+  of the seven files' `content-length`s on the Hub at that tag, checked
+  independently with `curl -I` before the pod was written: 286,449,872 + 45,758 +
+  2,103 + 147 + 7,153,802 + 428 + 6,418. The last path component is the tag rather
+  than a branch, which is the opposite of Align's illustration of the same
+  mechanism.
+- **The two booleans differ, and the self-test asserts the pair.** A build where
+  both were true would mean the trait had been enabled; one where both were false
+  would mean the pod had not bound.
+- **Every refusal fires before a native call**: empty passage, whitespace passage,
+  `maxTokens` of 0, -8 and 1.5, and a blank `directory`, all
+  `ERR_INVALID_ARGUMENT`.
+- **`describe` refuses rather than returning an empty card**, with the folder
+  complete on disk and a real clip transcript as the passage:
+  `ERR_UNSUPPORTED_PLATFORM`, `GenerationUnavailableException`, sentence naming the
+  trait. This is the assertion the package exists to make — an empty `Card` is a
+  documented ordinary outcome upstream, so a stub would have been invisible to
+  every other check in this repo.
+- **No crash attributable to Title.** One `EXC_BAD_ACCESS` across the session, in
+  the first self-test run, symbolicating to `ShapesModule._decorateModule`
+  closure #2 → `JavaScriptValuesBuffer.deinit` → `jsi::Value::~Value()` on
+  `com.apple.root.user-initiated-qos.cooperative`. That is limit 4 again, in a new
+  site — Shapes joins Ear, Clear and Emo on the list — tripped by a leg that runs
+  after Title's. Title's two async entry points return `Void` by construction. The
+  final run produced no crash.
+
+The `[selftest]` pass/fail summary did **not** print in the final run, and that is
+reported rather than rounded up: Title's leg finished clean and the legs after it
+were still working twenty-five minutes later on a contended machine where Redact's
+`load()` reported 1,379 s and Uhm's 1,401 s. The claim made here is the narrow one
+— every Title assertion passed and no `title:` failure was pushed in any of the
+three runs — not the broader one the earlier packages could make.
+
+**A real bug was found on the device and fixed**, by an assertion written for
+exactly this and by nothing else: `isDownloaded()` and `missingFiles()` must agree.
+On a freshly created, un-prepared model with the folder already in the managed
+cache, the first run reported `isDownloaded=true missing=7/7 bytes=0 dir=""` —
+`isDownloaded` asks `TitleModel.isAvailable`, which consults the store, while the
+filesystem side had no path to look in. `folderPath()` now falls back to
+`ModelDistribution.installedModels()`, the store's own list of cached revisions, so
+the two read the same bookkeeping. The identical probe after the fix reports
+`downloaded=true missing=0/7 bytes=293658528` with a real path. No compiler and no
+unit test produces that state; it needs a downloaded 280 MB folder and a handle
+that has not resolved it.
+
+**What was not verified is the model, and it is not verifiable from here.** No card
+has ever been written. Generation is behind the `MLX` trait, and the four routes to
+enabling one were checked rather than assumed:
+
+| probe | answer |
+| --- | --- |
+| `spm_dependency` in react-native 0.86.3 | `def dependency(pod_spec, url:, requirement:, products:)` — no traits parameter |
+| `grep -ril trait` over xcodeproj 1.27.0 | **no matches** anywhere in the gem |
+| `grep -ril enabledTraits` over Xcode 26.4.1 (17E202) | two files, both `PackageDescription.swiftmodule/*.swiftinterface` |
+| `xcodebuild -help` | fifteen package options, no trait flag |
+| `swift build --help` | `--traits` exists — for the *root* package of a SwiftPM build |
+
+And even with the trait, this run could not have produced a card: MLX is Metal on
+Apple silicon and an iOS Simulator is not that. Whether a physical device would
+have is untested — none was available, and nothing in this repo claims one would
+have worked.
+
+So no latency, no card, no token rate and no quality figure is quoted anywhere for
+Title; upstream's 213 ms / 55 ms and 86 tok/s / 447 tok/s remain attributed to
+upstream. The 153.7 s download is also a ceiling under contention rather than a
+throughput measurement — it ran while eleven other models were loading on a
+memory-pressured machine, where Redact reported a 1,379 s `load()` — so what it
+proves is that every byte arrived, which the byte count does independently.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -2187,7 +2495,7 @@ and no `@Record`/`@SharedObject` to lean on.
 These are consequences of the upstream SDKs. They are documented in the
 TypeScript types rather than papered over.
 
-These are Clear's; Voz, Clips, Uhm and Align have no Android half to differ from.
+These are Clear's; Voz, Clips, Uhm, Align and Title have no Android half to differ from.
 
 | | iOS | Android | Why |
 | --- | --- | --- | --- |
@@ -2290,6 +2598,23 @@ the OS version instead -- which is the split that actually matters for this mode
 | Downloads | Two: 0.7 MB + Apple's recognizer | n/a | n/a | Only the first is desert-ant-core's. `isDownloaded()` answers only the first. |
 | Progress | `loadingModel`, `transcribing` | n/a | n/a | Both fractions are real -- the catalog's bytes, Apple's `Progress`, and `result.range.end / durationSec`. Refinement itself reports nothing because `refine` takes no handler. |
 | Verified | **Binding and refusals only** | Not reachable to test | Not built | A simulator reports Apple's speech assets as `unsupported` and installs none, so no transcript was ever refined. See "Align, as far as a simulator can take it". |
+
+Title's table is the only one in this document whose constrained axis is the
+**build** rather than the platform or the OS. There is no Android column, and the
+iOS column splits on a compile-time condition nobody in a CocoaPods app can set:
+
+| | With the `MLX` trait | Without it (every build here) | Android / web | Why |
+| --- | --- | --- | --- | --- |
+| The pod | Builds and links | **Builds and links** | Not built at all | `Title`'s generating half is `#if MLX`; the rest of the module compiles either way, so the product resolves and links regardless. |
+| `canDownloadWeights` | True | **True** | False, module is `null` | `TitleModel.supports(.current)` — a catalog question, and the catalog is MLX-free. |
+| `isSupported` | True | **False**, with a reason | False | That AND `canImport(MLXLMCommon)`. Without the trait SwiftPM prunes mlx-swift-lm entirely, so the import fails and `Titles` has no public initializer. |
+| `load` / `prepare` | Downloads ~280 MB | **Downloads ~280 MB** | `ERR_UNSUPPORTED_PLATFORM` | `resolve` comes from `ModelDeclaration`, which knows nothing about MLX. This is the half that works. |
+| `describe` | A `Card` | `ERR_UNSUPPORTED_PLATFORM` | `ERR_UNSUPPORTED_PLATFORM` | Not an empty card. An empty card is a documented ordinary outcome upstream, so a stub returning one would never be flagged. |
+| `cardShape` | Pure TypeScript | Pure TypeScript | Pure TypeScript | No model, no bridge. The only part of this package's output handling that runs everywhere. |
+| The config plugin | Raises the app to 17 | Raises the app to 17 | Touches no `build.gradle` | MLX's floor, which is also the package floor. Nothing to narrow on Android: Title binds no native library there. |
+| Progress | `loadingModel` | `loadingModel` | n/a | One phase, a true byte fraction. No `generating` phase, because upstream's decode stream has no denominator. |
+| `modelRevision` | `v0.1.0` (a tag) | `v0.1.0` (a tag) | `null` | Read from the catalog. `revisionIsPinned` is computed, and here it is **true** — the opposite of Align's. |
+| Verified | **Never built** | Catalog half end to end | Not built | No way to enable the trait from a CocoaPods app; see "Title, as far as this build can take it". |
 
 ## Constraints an app inherits
 
@@ -2430,3 +2755,44 @@ The other Tongue coupling is the one that is currently unsatisfiable:
 desert-ant-core exports the product, and not a release earlier — naming it before
 then fails the build outright rather than degrading. `packages/tongue/ios` is
 written against that future and compiles either way.
+
+Title's coupling is the only one in this document that is not to a version number
+at all, and it is not to a branch either. It is to a **build flag nobody in this
+toolchain can set**.
+
+The ordinary half is ordinary: `DESERT_ANT_PRODUCTS` gains `'Title'`, and the line
+to check before adding it is a third one again. Gist, Redact and Shapes reach the
+manifest through `modelProducts`; Align and Voz through their own `alignProducts`
+and `vozProducts`; Title through `modelProducts` *while being Apple-only*, because
+it stays inside the `models` array with `appleOnly: true` and `modelProducts`
+branches on that flag to emit one library and no Android, Node or Web products. It
+adds no Maven coordinate, because there is no Android half, and no
+`SWIFT_INCLUDE_PATHS` entry, because its dependencies are `Transcript` plus
+`mlxProducts` and `mlxProducts` is pruned without the trait — so there is no
+swift-numerics C module to find. The negative case, read off `Package.swift` before
+the pod was written, for the second time after Align.
+
+The other half has no version to pin and no tag to wait for.
+`Sources/Title/Title.swift` gates generation on `#if MLX`, and SwiftPM defines that
+condition only when a consumer enables the `MLX` **trait** — which a consuming
+`Package.swift` or `swift build --traits` can do and a CocoaPods app cannot, by
+four separate mechanisms all checked above. The coupling is therefore to
+react-native's `spm.rb` signature, to xcodeproj's object model, and to whether
+`xcodebuild` ever grows a trait flag, none of which move with
+`DESERT_ANT_CORE_VERSION`.
+
+Three things follow. `Title.mlxTraitEnabled` is computed from
+`canImport(MLXLMCommon)` rather than hardcoded, so it flips on its own the day any
+of those three changes; the example app prints it on every launch and shows it in
+the UI beside `isSupported`. The generating code is written and guarded by that
+same condition in `ios/TitleModelObject.swift`, so nothing on this side needs
+editing when it does — not the podspec, not the records, not the TypeScript. And
+until then `describe` raises `ERR_UNSUPPORTED_PLATFORM` naming the trait, rather
+than returning the empty `Card` that would be indistinguishable from a model
+declining to answer.
+
+There is a fourth coupling worth naming because it is easy to miss: **every model
+in this repo is on iOS 17 because of Title.** MLX's floor is a dependency floor,
+`platforms:` cannot vary by trait, and `@available` cannot satisfy a manifest-level
+constraint — so `desert-ant-core`'s whole package floor rose unconditionally, and
+Emo, Clear and Redact lost iOS 16 for a model they do not link.

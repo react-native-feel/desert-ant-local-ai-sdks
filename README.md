@@ -5,7 +5,7 @@ on-device models. Desert Ant ships Swift, Kotlin and JavaScript/WebAssembly SDKs
 from [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core); this
 repository is the React Native one they do not.
 
-Eleven models so far. Five of them compose into one pipeline: **Clear** cleans a
+**Twelve models — every stable model Desert Ant ships.** Five of them compose into one pipeline: **Clear** cleans a
 recording up — denoise, dereverb, loudness-normalize — **Ear** names the language
 it is in, **Voz** reads it back as a transcript with word-level timestamps,
 **Clips** picks the moments worth cutting, and **Uhm** finds every "um" in the
@@ -21,7 +21,16 @@ triangle, ellipse or star — or nothing, when what was drawn was not a shape. A
 the eleventh answers no question at all: **Align** takes the transcript Apple's
 own `SpeechAnalyzer` produced and moves its word boundaries, by tens of
 milliseconds, so a caption highlights the word you are hearing and a cut lands
-between two of them. Entirely offline.
+between two of them. And the twelfth closes the loop the first five open:
+**Title** takes any passage of text — one of the clips Clips just picked, a note, an
+email — and writes a three-to-eight-word factual title and a one- or two-sentence
+description for it. Entirely offline.
+
+Title is the one package here that arrives **half-lit**, and it says so on the tin:
+the model is MLX-backed, MLX is behind a SwiftPM *package trait*, and a CocoaPods
+app has no way to enable one. The ~280 MB folder downloads, verifies and reports
+its path; `describe()` throws `ERR_UNSUPPORTED_PLATFORM` naming the trait rather
+than returning an empty card. [The whole account is in its README](packages/title#the-mlx-trait-and-why-half-of-this-package-is-dark).
 
 ```ts
 import { Clear } from '@desert-ant-labs/react-native-clear';
@@ -35,6 +44,7 @@ import { Gist, channelTopics } from '@desert-ant-labs/react-native-gist';
 import { Redact, restore } from '@desert-ant-labs/react-native-redact';
 import { Shapes, outline } from '@desert-ant-labs/react-native-shapes';
 import { Align, timestampShift } from '@desert-ant-labs/react-native-align';
+import { Title, cardShape } from '@desert-ant-labs/react-native-title';
 
 const { uri } = await (await Clear.load()).enhance({ uri: recording.uri });
 
@@ -83,6 +93,16 @@ refined.words[0];
 //   refined: true }   — Apple's numbers and Align's, side by side
 timestampShift(refined.words).meanAbsSec;      // how far they disagreed, on YOUR audio
 Uhm.reconcileWords(refined.words, fillers);    // now the cut lands on silence
+
+if (Title.canDownloadWeights) {
+  const title = await Title.load();             // ~280 MB
+  title.resolvedDirectory();                    // the folder `Titles(directory:)` takes
+  if (Title.isSupported) {                      // false in every RN build today
+    const card = await title.describe(moments[0].text);
+    card.title;        // "Filming a two-person podcast on iPhone"
+    cardShape(card).matchesPublishedShape;      // did it keep its own format?
+  }
+}
 ```
 
 Ear sits ahead of Voz rather than beside it, and that is the point of it: Voz does
@@ -162,6 +182,27 @@ recognizer, which is hundreds of megabytes and is not Desert Ant's to ship. And 
 is the only one that resolves a **branch** rather than a tag, which is a real risk
 a consumer inherits; `Align.revisionIsPinned` reports it rather than hiding it.
 
+Title is where the catalog ends and where this repo meets a wall that is neither a
+device nor a download. It is the only Desert Ant model that does not run through
+`InferenceSession`: writing a title is short autoregressive decode, which upstream
+measured 5.7–8.3× faster on the GPU than on the Neural Engine, so it runs on MLX —
+a 350M Granite fine-tune quantized to 6 bits, in a 280 MB model folder rather than
+a compiled graph. MLX drags a macro-bearing dependency in, so upstream put it
+behind a SwiftPM **package trait**, and a trait is enabled by a consuming
+`Package.swift` or `swift build --traits` and by nothing else. React Native's
+`spm_dependency` takes no traits argument; xcodeproj has no attribute for one;
+Xcode 26.4.1 knows the word only inside PackageDescription's own `.swiftinterface`.
+So this package links a `Title` module whose generating half was compiled out, and
+it is built around that honestly: two booleans instead of one
+(`canDownloadWeights` is true, `isSupported` is false), a download that genuinely
+works and hands back the folder path upstream's own `Titles(directory:)` wants, a
+`describe` that refuses loudly rather than returning the empty card that would look
+like a model with nothing to say, and `cardShape` — pure TypeScript — to check a
+card against the format the model page publishes. Nothing is faked and nothing is
+reimplemented. Title is also the reason every model in this repo needs **iOS 17**:
+MLX's floor is a dependency floor, so `desert-ant-core`'s whole package floor rose
+to meet it and Emo, Clear and Redact lost iOS 16 for a model they do not link.
+
 ## Packages
 
 | Package | What it is |
@@ -177,15 +218,16 @@ a consumer inherits; `Align.revisionIsPinned` reports it rather than hiding it.
 | [`@desert-ant-labs/react-native-redact`](packages/redact) | The Redact model: text in, the same text with every person masked by a numbered placeholder out — plus the mapping to put them back. 27 languages. iOS + Android. |
 | [`@desert-ant-labs/react-native-shapes`](packages/shapes) | The Shapes model: one hand-drawn stroke in, a clean line, rectangle, triangle, ellipse or star out — snapped to circles, squares and axes. 0.2 MB. iOS + Android. |
 | [`@desert-ant-labs/react-native-align`](packages/align) | The Align model: an audio file in, Apple's transcript out with word boundaries refined to the word — and Apple's original timings beside them. 0.7 MB. **iOS 26+ only.** |
+| [`@desert-ant-labs/react-native-title`](packages/title) | The Title model: any passage of text in, a 3–8 word factual title and a 1–2 sentence description out. 280 MB, MLX. **iOS only — and generation is blocked on a SwiftPM package trait a CocoaPods app cannot enable; the ~280 MB download works.** |
 | [`@desert-ant-labs/react-native-core`](packages/core) | Types, error codes and lifecycle contracts shared by every model SDK here — and the single native bridge to the `desert-ant-core` Swift package. |
-| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue, Gist and Redact — a roll-up of what the sample transcript is about, and the same transcript with its people masked — a canvas you draw one stroke on for Shapes, and an Align section that refines the word timestamps in a speech sample and shows Apple's numbers next to Align's. A dev build. |
+| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue, Gist and Redact — a roll-up of what the sample transcript is about, and the same transcript with its people masked — a canvas you draw one stroke on for Shapes, an Align section that refines the word timestamps in a speech sample and shows Apple's numbers next to Align's, and a Title section that downloads the 280 MB model folder and then shows the refusal `describe` raises, because that refusal is the honest demo of a model behind a trait nobody here can enable. A dev build. |
 
 ## How it is built
 
 The native work is **not** a reimplementation. Each package is a thin Expo module
 over Desert Ant's own platform SDKs:
 
-- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Gist`, `Redact`, `Shapes` and `Align` products of the `desert-ant-core`
+- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Gist`, `Redact`, `Shapes`, `Align` and `Title` products of the `desert-ant-core`
   Swift package, pulled in through React Native's `spm_dependency` bridge — that
   package ships as SPM only, with no podspec and no XCFramework. The bridge is
   declared exactly once, by the `DesertAntCore` pod, because two pods each
@@ -208,7 +250,15 @@ over Desert Ant's own platform SDKs:
   `desert-ant-core`'s manifest through `modelProducts`: being Apple-only it lives
   outside the `models` array in its own `alignProducts`, which the `products:`
   sum does include — the same sum `tongueProducts` is missing from.
-  **Tongue is
+  **Title** reaches it a third way again: it is Apple-only like Align and Voz, but
+  unlike them it stays *inside* the `models` array with `appleOnly: true`, and
+  `modelProducts` branches on that flag to emit one library and no Android, Node or
+  Web products. It needs no `_NumericsShims` line either — its dependencies are
+  `Transcript` plus `mlxProducts`, and `mlxProducts` is pruned when the `MLX` trait
+  is off, which it always is here. Naming `'Title'` links a module whose generating
+  half was compiled out: the product resolves, `Card` and the catalog are there, and
+  `Titles` has no public initializer. That is a *different* failure from Tongue's
+  and a much smaller one. **Tongue is
   the one model not in that list**, and not by choice: desert-ant-core v3.1.0
   declares a `Tongue` product and never adds it to the manifest's `products:`
   array, so naming it fails the build rather than the import. Its Apple sources
@@ -235,8 +285,11 @@ over Desert Ant's own platform SDKs:
   classifier and so Apple-only by construction — and **Align** is Apple-only by
   design rather than by omission: upstream's manifest records its Kotlin and
   JavaScript SDKs as `none`, and `Package.swift` keeps its target outside the
-  `models` array so it gets no Android, Node or Web products at all. `packages/align`
-  has no `android/` directory.
+  `models` array so it gets no Android, Node or Web products at all, and **Title**
+  is Apple-only for the hardest reason of the three: it is MLX, and MLX is Apple
+  silicon. `Package.swift` marks it `appleOnly: true` with the reason above it —
+  *"a product promising an artifact that cannot load is worse than its absence."*
+  Neither `packages/align` nor `packages/title` has an `android/` directory.
 
 The Apple half is written against the **Expo Modules 2.0** macros (`@ExpoModule`,
 `@JS`, `@SharedObject`, `@Record`, `@Event`), which ship for Swift in
@@ -323,7 +376,26 @@ device on the way to that answer — Apple's assets must be reserved before they
 be asked about, and reserved under the identifier
 `SpeechTranscriber.supportedLocale(equivalentTo:)` returns rather than the one the
 caller passed. So no latency, no word count and no boundary movement is quoted
-anywhere for Align; upstream's 106.4 ms → 20.2 ms is attributed to upstream. Each
+anywhere for Align; upstream's 106.4 ms → 20.2 ms is attributed to upstream. Title
+is the twelfth pod, and it is the only one in this repo that is **half-lit by
+construction** rather than by circumstance. Verified on the same simulator: the pod
+builds and links as the twelfth in the app, every `@JS` property reads off
+desert-ant-core's catalog (`id=title revision=v0.1.0 pinned=true files=7
+weights=model.safetensors osFloor=17 maxTokens=96`), all seven declared file names
+match the Hub at that tag, and the two booleans genuinely differ —
+`canDownload=true isSupported=false mlxTrait=false`. **The ~280 MB download works and the bytes are exact**: 293,658,528 bytes in 7/7 files in 153.7 s, which is the byte-for-byte sum of the seven files' `content-length`s on the Hub at `v0.1.0`, under a directory whose last component is the tag. All
+six argument refusals fire before a native call (empty passage, whitespace passage,
+zero / negative / fractional token caps, blank directory), and `describe` raises
+`ERR_UNSUPPORTED_PLATFORM` with a sentence naming the `MLX` trait rather than
+returning an empty card. A real bug was found on the device and fixed on the way there — `isDownloaded()` and `missingFiles()` disagreed about whether a 280 MB folder existed, because one reads the managed cache and the other had no path to look in; the self-test assertion written for exactly that caught it. **What is not verified is the model**: no card has ever
+been written, in this repo or anywhere reachable from it, because the trait cannot
+be enabled from a CocoaPods build — react-native's `spm_dependency` has no traits
+parameter, xcodeproj 1.27.0 has no trait attribute on any package-reference class,
+and Xcode 26.4.1 mentions `enabledTraits` only inside PackageDescription's own
+`.swiftinterface`. Even with the trait it would not have run here: MLX is Metal on
+Apple silicon and a simulator is not that. So no latency, no card and no quality
+figure is quoted for Title anywhere; upstream's 213 ms / 55 ms Core ML-versus-MLX
+numbers are attributed to upstream. Each
 package's
 README says exactly what was and was not exercised.
 
@@ -333,7 +405,7 @@ README says exactly what was and was not exercised.
 | --- | --- |
 | Expo SDK | 57+ (`expo-modules-core` 57 is where the 2.0 macros live) |
 | React Native | 0.75+ for `spm_dependency`; 0.83 in the example |
-| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue, Gist, Redact, Shapes or Align alone. **Align itself needs iOS 26 at runtime** — `SpeechAnalyzer` is iOS 26 — but its pod builds at 17 and reports `isSupported: false` below 26, so installing it does not raise anyone else's floor |
+| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue, Gist, Redact, Shapes, Align or Title alone — and **17.0 is Title's floor**: MLX has no build below it, a dependency floor `@available` cannot localize, so `desert-ant-core`'s whole package rose to meet it and every model here pays it. **Title's own `describe` is unavailable in any React Native build**, on any iOS, because the `MLX` package trait cannot be enabled from CocoaPods; the download works. **Align itself needs iOS 26 at runtime** — `SpeechAnalyzer` is iOS 26 — but its pod builds at 17 and reports `isSupported: false` below 26, so installing it does not raise anyone else's floor |
 | Xcode | 26 (`desert-ant-core` is `swift-tools-version: 6.2`) |
 | Android | API 24+; `arm64-v8a` and `x86_64` only for Clear, Emo, Ear, Gist, Redact and Shapes — Tongue needs no native library and runs on any ABI |
 | Expo Go | Not supported — these are native modules, so use a dev build |
@@ -343,13 +415,16 @@ Clear's, Emo's, Ear's, Gist's, Redact's and Shapes' also narrow the Android ABIs
 to the two LiteRT ships — so add
 whichever packages you use to `plugins` in your app config. The plugins only ever
 raise, and the six that touch `build.gradle` defer to each other's block, so they
-compose (there is a test that asserts it over all 720 orderings). Tongue's and
-Align's touch `build.gradle` not at all, deliberately: Tongue has no native
+compose (there is a test that asserts it over all 720 orderings). Tongue's,
+Align's and Title's touch `build.gradle` not at all, deliberately: Tongue has no native
 library, so narrowing an app's ABIs on its behalf would take away devices it can
-serve, and Align has no Android half to narrow. Align's plugin also declines to
-raise iOS past 17 even though the model needs 26, for the same reason: an app is
-given one deployment target, and taking it to 26 would cost every other installed
-model its iOS 17–25 devices.
+serve, and neither Align nor Title has an Android half to narrow at all. Align's plugin also
+declines to raise iOS past 17 even though the model needs 26, for the same reason:
+an app is given one deployment target, and taking it to 26 would cost every other
+installed model its iOS 17–25 devices. Title's 17.0 is the one number in this
+family where the pod floor, the package floor and the model's own artifact floor
+are the same — MLX's — which is exactly why every other plugin here has to raise to
+at least it.
 
 ## Develop
 

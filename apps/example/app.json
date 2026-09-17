@@ -32,7 +32,8 @@
       "@desert-ant-labs/react-native-gist",
       "@desert-ant-labs/react-native-redact",
       "@desert-ant-labs/react-native-shapes",
-      "@desert-ant-labs/react-native-align"
+      "@desert-ant-labs/react-native-align",
+      "@desert-ant-labs/react-native-title"
     ],
     "scheme": "clearexample"
   }

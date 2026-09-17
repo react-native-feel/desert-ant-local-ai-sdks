@@ -19,6 +19,7 @@
     "@desert-ant-labs/react-native-redact": "0.1.0",
     "@desert-ant-labs/react-native-shapes": "0.1.0",
     "@desert-ant-labs/react-native-tongue": "0.1.0",
+    "@desert-ant-labs/react-native-title": "0.1.0",
     "@desert-ant-labs/react-native-uhm": "0.1.0",
     "@desert-ant-labs/react-native-voz": "0.1.0",
     "expo": "^57.0.0",

@@ -1,0 +1,53 @@
+{
+  "name": "@desert-ant-labs/react-native-title",
+  "version": "0.1.0",
+  "description": "Title on-device titles and descriptions for any passage of text: a 3-8 word factual title and a one- to two-sentence description, written on the device. Apple silicon only, through MLX.",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "build",
+    "src",
+    "ios",
+    "plugin/build",
+    "app.plugin.js",
+    "expo-module.config.json",
+    "README.md"
+  ],
+  "keywords": [
+    "react-native",
+    "expo",
+    "expo-modules",
+    "on-device",
+    "title",
+    "description",
+    "summarization",
+    "text-generation",
+    "mlx",
+    "desert-ant-labs"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "expo-module build && expo-module build plugin",
+    "clean": "expo-module clean",
+    "lint": "expo-module lint",
+    "test": "expo-module test",
+    "prepare": "expo-module prepare",
+    "expo-module": "expo-module"
+  },
+  "dependencies": {
+    "@desert-ant-labs/react-native-core": "0.1.0"
+  },
+  "peerDependencies": {
+    "expo": ">=57.0.0",
+    "react": "*",
+    "react-native": "*"
+  },
+  "devDependencies": {
+    "@expo/config-plugins": "^57.0.9",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.20.1",
+    "expo": "^57.0.0",
+    "expo-module-scripts": "^56.0.3"
+  }
+}
