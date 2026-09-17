@@ -5,6 +5,7 @@ import {
   type ProgressEvent,
 } from '@desert-ant-labs/react-native-clear';
 import { Clips, type Clip } from '@desert-ant-labs/react-native-clips';
+import { Ear, type Detection } from '@desert-ant-labs/react-native-ear';
 import { Emo, type EmojiSkinTone, type EmoSuggestion } from '@desert-ant-labs/react-native-emo';
 import { Uhm, type UhmResult } from '@desert-ant-labs/react-native-uhm';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
@@ -30,10 +31,17 @@ import {
 } from 'react-native';
 
 /**
- * One recording, four models, in the order they compose: record, enhance it on
- * device with Clear, transcribe the enhanced audio with Voz, hand that
- * transcript to Clips to find the moments worth cutting, and run Uhm over the
- * same audio to find every "um" in it.
+ * One recording, five models, in the order they compose: record, enhance it on
+ * device with Clear, ask Ear what language it is in, transcribe the enhanced
+ * audio with Voz, hand that transcript to Clips to find the moments worth
+ * cutting, and run Uhm over the same audio to find every "um" in it.
+ *
+ * Ear's place in that order is the point of it. Voz does not detect what it is
+ * hearing -- audio outside its 25 languages comes back as confident nonsense
+ * rather than an error -- and its own documentation says to establish the
+ * language some other way first. Ear is that other way, and this app does the
+ * comparison out loud: it identifies the recording, checks the answer against
+ * `Voz.supportedLanguages`, and says so when the two disagree.
  *
  * Then a fifth that is not in that chain at all. Emo reads text, not audio, so it
  * has its own field at the bottom: type a phrase and the emoji that fit it come
@@ -67,6 +75,7 @@ export default function App() {
   const clips = useRef<Clips | null>(null);
   const uhm = useRef<Uhm | null>(null);
   const emo = useRef<Emo | null>(null);
+  const ear = useRef<Ear | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -115,6 +124,17 @@ export default function App() {
   // number is small enough to run per keystroke.
   const [emoMs, setEmoMs] = useState<number | null>(null);
 
+  // Ear is ~9 MB, so like Clear, Uhm and Emo it loads on mount rather than
+  // behind a tap -- `loading` is the honest starting state.
+  const [earState, setEarState] = useState<ModelState>(
+    Ear.isSupported ? 'loading' : 'unsupported'
+  );
+  const [heard, setHeard] = useState<Detection | null>(null);
+  // Measured in JavaScript as well as reported natively, because the two answer
+  // different questions: `heard.processingSec` is what the model cost, and this
+  // is what the caller waited for. The gap is the bridge hop.
+  const [earMs, setEarMs] = useState<number | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -135,6 +155,13 @@ export default function App() {
       `[uhm] isSupported=${Uhm.isSupported} nativeCore=${Uhm.nativeCoreVersion} ` +
         `revision=${Uhm.modelRevision?.slice(0, 7)} ` +
         `bias=${JSON.stringify(Uhm.biasThresholds)} types=${Uhm.fillerTypes.join('/')}`
+    );
+    console.log(
+      `[ear] isSupported=${Ear.isSupported} nativeCore=${Ear.nativeCoreVersion} ` +
+        `revision=${Ear.modelRevision} repo=${Ear.modelRepo} ` +
+        `windows=${Ear.defaultWindows} margin=${Ear.reliableMargin} ` +
+        `confusable=${Ear.confusableLanguages.join('/')}` +
+        `${Ear.unsupportedReason ? ` reason=${Ear.unsupportedReason}` : ''}`
     );
     console.log(
       `[emo] isSupported=${Emo.isSupported} nativeCore=${Emo.nativeCoreVersion} ` +
@@ -205,6 +232,12 @@ export default function App() {
       if (cancelled || !Emo.isSupported) return;
       void prepareEmo();
 
+      // Ear is ~9 MB. It loads on mount for the same reason Clear does, and for
+      // one more: it is the step that runs *before* the transcriber, so a
+      // recording that finishes before it is ready has nothing to route on.
+      if (cancelled || !Ear.isSupported) return;
+      void prepareEar();
+
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
       if (cancelled || !Voz.isSupported) return;
@@ -238,6 +271,8 @@ export default function App() {
       uhm.current = null;
       emo.current?.release();
       emo.current = null;
+      ear.current?.release();
+      ear.current = null;
     };
   }, []);
 
@@ -344,6 +379,109 @@ export default function App() {
       console.log(`[emo] prepare FAILED: ${describe(e)}`);
       setError(describe(e));
       setEmoState('absent');
+    }
+  }, []);
+
+  /**
+   * Get Ear ready: ~9 MB and a session build in a second or two. Like Emo it
+   * never announces itself through `busy` -- it is small enough that a global
+   * banner would be gone before it was read.
+   */
+  const prepareEar = useCallback(async () => {
+    if (ear.current) return;
+    setEarState('loading');
+    try {
+      const t0 = Date.now();
+      const model = await Ear.load();
+      ear.current = model;
+      setEarState('ready');
+      console.log(`[ear] ready in ${Date.now() - t0}ms downloaded=${model.isDownloaded()}`);
+      // Asked once, after loading, because the list is a sidecar that comes down
+      // with the weights rather than a constant -- and because it is the one
+      // call in this SDK that iOS can answer and Android cannot.
+      try {
+        const languages = await model.supportedLanguages();
+        console.log(`[ear] ${languages.length} languages, e.g. ${languages.slice(0, 12).join(' ')}`);
+        const missing = Voz.supportedLanguages.filter((l) => !languages.includes(l));
+        console.log(
+          `[ear] Voz covers ${Voz.supportedLanguages.length}, Ear names ${languages.length}; ` +
+            `Voz languages Ear cannot name: ${missing.length === 0 ? 'none' : missing.join(' ')}`
+        );
+      } catch (e) {
+        // Expected on Android: `ai.desertant:ear` exposes no reader for the list.
+        console.log(`[ear] supportedLanguages unavailable: ${describe(e)}`);
+      }
+    } catch (e) {
+      console.log(`[ear] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setEarState('absent');
+    }
+  }, []);
+
+  /**
+   * Name the language of a recording, and say whether Voz can be trusted with it.
+   *
+   * This is the whole reason Ear is in the chain, and the check is not
+   * decorative. Voz does not detect what it is hearing: audio in a language
+   * outside its 25 comes back as fluent, confident nonsense rather than as an
+   * error, so the only way to catch it is to ask a model whose job is asking.
+   *
+   * The branch is on `isReliable`, never on `confidence`. They disagree exactly
+   * where it matters -- the detector reads Norwegian as Swedish in about 40% of
+   * clips and is *sure* when it does -- so a probability threshold would pass the
+   * one answer a calibrated rule rejects.
+   */
+  const runIdentify = useCallback(async (uri: string) => {
+    const model = ear.current;
+    if (!model) return null;
+    setError(null);
+    setBusy('Identifying language');
+    try {
+      const t0 = Date.now();
+      const detection = await model.identify({ uri });
+      const elapsed = Date.now() - t0;
+      setEarMs(elapsed);
+      setHeard(detection);
+      console.log(
+        `[ear] identify ok in ${elapsed}ms (native ${(detection.processingSec * 1000).toFixed(0)}ms) — ` +
+          `${detection.language ?? 'none'} at ${detection.confidence.toFixed(2)} ` +
+          `reliable=${detection.isReliable} windows=${detection.windows} ` +
+          `revision=${detection.modelRevision}`
+      );
+      console.log(
+        `[ear]   candidates: ${detection.candidates
+          .slice(0, 5)
+          .map((c) => `${c.language} ${c.probability.toFixed(3)}`)
+          .join(', ')}`
+      );
+      // The two reasons an answer can be unreliable, told apart rather than
+      // lumped together -- a caller showing "we are not sure" wants to know
+      // which, because only one of them gets better with more audio.
+      if (!detection.isReliable && detection.language) {
+        const nordic = Ear.confusableLanguages.includes(detection.language);
+        const runnerUp = detection.candidates[1]?.probability ?? 0;
+        console.log(
+          nordic
+            ? `[ear]   unreliable because ${detection.language} is one of the Nordic three, ` +
+                'which the detector confuses confidently'
+            : `[ear]   unreliable because the margin is ` +
+                `${(detection.confidence - runnerUp).toFixed(3)} < ${Ear.reliableMargin}`
+        );
+      }
+      if (detection.language && !Voz.supportedLanguages.includes(detection.language)) {
+        console.log(
+          `[ear]   Voz does not cover ${detection.language} — it would transcribe this anyway, ` +
+            'and the result would be confident nonsense'
+        );
+      }
+      return detection;
+    } catch (e) {
+      console.log(`[ear] identify FAILED: ${describe(e)}`);
+      setError(describe(e));
+      return null;
+    } finally {
+      setBusy(null);
+      setProgress(null);
     }
   }, []);
 
@@ -521,8 +659,25 @@ export default function App() {
       }
     }
 
-    // Voz first, so the fillers can be reconciled against a transcript of the
+    // Ear before Voz, because that is the order the two are meant to run in:
+    // Voz cannot tell you it is out of its depth, so something has to ask first.
+    // It runs on whatever audio exists, enhanced or not -- language survives the
+    // noise that Clear removes.
+    let language: Detection | null = null;
+    if (ear.current) {
+      language = await runIdentify(enhanced ?? uri);
+    } else {
+      console.log('[ear] skipped — not ready yet when the recording finished');
+    }
+
+    // Voz next, so the fillers can be reconciled against a transcript of the
     // same audio in one pass.
+    //
+    // Note what this deliberately does NOT do: it does not refuse to transcribe
+    // when Ear is unsure or names a language Voz does not cover. Ear's answer is
+    // information for the person reading the screen, and gating the rest of the
+    // demo on it would hide the models behind each other. A real app routing
+    // unattended work would gate; a demo showing what each model says should not.
     let spoken: Transcript | null = null;
     if (enhanced && voz.current) {
       // `runTranscribe` answers undefined when its model went away mid-call.
@@ -545,7 +700,23 @@ export default function App() {
       // step -- and skipping it quietly looks exactly like the model failing.
       console.log('[uhm] skipped — not ready yet when the recording finished');
     }
-  }, [recorder]);
+
+    // One line tying the run together, because the interesting failure is a
+    // combination rather than any single step: a transcript that exists, from a
+    // language the transcriber does not cover, that nobody flagged.
+    console.log(
+      `[run] language=${language?.language ?? 'unknown'} ` +
+        `reliable=${language?.isReliable ?? false} ` +
+        `transcribed=${spoken !== null} ` +
+        `trustworthy=${
+          spoken === null
+            ? 'n/a'
+            : language !== null &&
+              language.isReliable &&
+              Voz.supportedLanguages.includes(language.language ?? '')
+        }`
+    );
+  }, [recorder, runIdentify]);
 
   /**
    * Rank the transcript's best moments.
@@ -648,11 +819,192 @@ export default function App() {
     const noisy = syntheticSpeech(sampleRate, 2);
     let enhancedForVoz: string | null = null;
 
-    // Uhm goes first because it is the only model loaded without anyone tapping
-    // anything, and because each leg awaits the one before it: a leg that hangs
-    // rather than throwing takes every later leg down with it, and its own
-    // try/catch cannot help. Putting the always-ready one at the front means the
-    // self-test always reports something.
+    // The models loaded on mount go first, because each leg awaits the one
+    // before it: a leg that hangs rather than throwing takes every later leg
+    // down with it, and its own try/catch cannot help. Putting the always-ready
+    // ones at the front means the self-test always reports something. Ear leads
+    // because it is the cheapest of them -- ~9 MB and a quarter of a second.
+
+    // --- Ear. Loaded on mount like Uhm, and cheaper, so it runs first.
+    //
+    //     The synthetic tone is the honest case to assert on here: a 200 Hz sine
+    //     under hiss is not speech in any language, so what is being tested is
+    //     that the model loads, runs, and returns a well-formed ranking -- not
+    //     that it names a language, which would be meaningless. The invariants
+    //     are the ones that must hold whatever it heard.
+    //
+    //     A real recording dropped into the cache as `ear-sample.wav` turns this
+    //     into a real question, the same way `uhm-sample.wav` does for Uhm.
+    try {
+      const identifier = ear.current;
+      if (!identifier) {
+        console.log('[ear] self-test skipped — model not prepared');
+      } else {
+        const sample = new File(Paths.cache, 'ear-sample.wav');
+        const real = sample.exists;
+        let target = sample.uri;
+        if (!real) {
+          const synthetic = new File(Paths.cache, 'selftest-ear.wav');
+          synthetic.create({ overwrite: true });
+          await synthetic.write(encodeWav(noisy, sampleRate));
+          target = synthetic.uri;
+        }
+        console.log(`[ear] identifying ${real ? 'real speech' : 'synthetic audio'}: ${target.split('/').pop()}`);
+
+        const t0 = Date.now();
+        const detection = await identifier.identify({ uri: target });
+        console.log(
+          `[ear] identify(file) ok in ${Date.now() - t0}ms — ${detection.language ?? 'none'} ` +
+            `at ${detection.confidence.toFixed(3)} reliable=${detection.isReliable} ` +
+            `windows=${detection.windows} native=${(detection.processingSec * 1000).toFixed(0)}ms`
+        );
+        console.log(
+          `[ear]   top: ${detection.candidates
+            .slice(0, 5)
+            .map((c) => `${c.language} ${c.probability.toFixed(3)}`)
+            .join(', ')}`
+        );
+
+        // The invariants: ranked, normalized, the winner is the head of the list,
+        // and the two derived fields agree with the candidates they come from.
+        const ranked = detection.candidates.every(
+          (c, i) => i === 0 || c.probability <= detection.candidates[i - 1]!.probability
+        );
+        const bounded = detection.candidates.every((c) => c.probability >= 0 && c.probability <= 1);
+        const total = detection.candidates.reduce((sum, c) => sum + c.probability, 0);
+        const headAgrees =
+          detection.language === (detection.candidates[0]?.language ?? null) &&
+          Math.abs(detection.confidence - (detection.candidates[0]?.probability ?? 0)) < 1e-9;
+        if (!ranked) failures.push('ear: candidates are not in descending order');
+        if (!bounded) failures.push('ear: a probability is outside 0..1');
+        if (!headAgrees) failures.push('ear: language/confidence disagree with candidates[0]');
+        console.log(
+          `[ear] ranked=${ranked} bounded=${bounded} headAgrees=${headAgrees} ` +
+            `sum=${total.toFixed(3)}`
+        );
+
+        // `isReliable` is decided natively, so this does not recompute it -- it
+        // checks that the answer is *consistent* with the two rules it is made
+        // of, which is a different and much weaker claim, and the only one a
+        // caller can make without duplicating the calibration.
+        const runnerUp = detection.candidates[1]?.probability ?? 0;
+        const nordic =
+          detection.language !== null && Ear.confusableLanguages.includes(detection.language);
+        const wideEnough = detection.confidence - runnerUp >= Ear.reliableMargin;
+        const consistent = detection.isReliable === (wideEnough && !nordic);
+        if (!consistent) {
+          failures.push(
+            `ear: isReliable=${detection.isReliable} but margin=${(detection.confidence - runnerUp).toFixed(3)} nordic=${nordic}`
+          );
+        }
+        console.log(`[ear] isReliable consistent with margin and Nordic rule: ${consistent}`);
+
+        // Same audio through the in-memory path, which proves the native
+        // resample (48 kHz in, 16 kHz model) and the buffer copy.
+        const t1 = Date.now();
+        const fromSamples = await identifier.identifySamples(noisy, sampleRate);
+        console.log(
+          `[ear] identifySamples ok in ${Date.now() - t1}ms — ${fromSamples.language ?? 'none'} ` +
+            `from ${(noisy.length / sampleRate).toFixed(1)}s of 48 kHz audio`
+        );
+
+        // One window instead of three. On audio shorter than one window this
+        // must come back having listened to exactly one either way, which is the
+        // "fewer are used when the audio is shorter" rule stated as a test.
+        const single = await identifier.identify({ uri: target, windows: 1 });
+        console.log(
+          `[ear] windows=1 -> listened=${single.windows} (default run listened=${detection.windows}); ` +
+            `two seconds of audio is under one 30 s window, so both should be 1`
+        );
+        if (single.windows !== 1) failures.push(`ear: windows=1 listened to ${single.windows}`);
+
+        // The argument guards, which never reach native.
+        for (const bad of [0, -1, 1.5]) {
+          try {
+            await identifier.identify({ uri: target, windows: bad });
+            failures.push(`ear: windows=${bad} was accepted`);
+          } catch (e) {
+            if (!(e instanceof DesertAntError) || e.code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`ear: windows=${bad} raised ${describe(e)}`);
+            }
+          }
+        }
+        console.log('[ear] rejected 0, -1 and 1.5 windows with ERR_INVALID_ARGUMENT');
+
+        // A file that is not there. The point is the *code*: a missing file is a
+        // decode failure, not an inference failure, so an app can tell "your file
+        // is gone" from "the model broke".
+        try {
+          await identifier.identify({ uri: `${Paths.cache.uri}definitely-not-here.wav` });
+          failures.push('ear: a missing file was accepted');
+        } catch (e) {
+          const code = e instanceof DesertAntError ? e.code : 'not a DesertAntError';
+          console.log(`[ear] missing file -> ${code}`);
+          if (code !== 'ERR_AUDIO_DECODE_FAILED') {
+            failures.push(`ear: missing file raised ${code}`);
+          }
+        }
+
+        // The claim worth testing by hand, because it is the whole model: does it
+        // actually name the language, or does it only produce a well-formed
+        // ranking? Drop `ear-<code>.wav` files into the app's cache -- half a
+        // minute of speech each, which is what one window is -- and every one of
+        // them is a labelled question with a right answer.
+        //
+        // Nothing is asserted when the files are absent. A test that passes
+        // because its fixtures are missing is worse than no test.
+        const labelled = LANGUAGE_SAMPLES.map((code) => ({
+          code,
+          file: new File(Paths.cache, `ear-${code}.wav`),
+        })).filter(({ file }) => file.exists);
+        if (labelled.length === 0) {
+          console.log(
+            `[ear] no labelled samples in the cache — drop ear-<code>.wav files there ` +
+              `(${LANGUAGE_SAMPLES.join(', ')}) to check the answers rather than the shape`
+          );
+        } else {
+          let correct = 0;
+          for (const { code, file } of labelled) {
+            const answer = await identifier.identify({ uri: file.uri });
+            const right = answer.language === code;
+            if (right) correct += 1;
+            console.log(
+              `[ear]   ${code} -> ${answer.language ?? 'none'} ${answer.confidence.toFixed(3)} ` +
+                `${right ? 'OK' : 'WRONG'} reliable=${answer.isReliable} ` +
+                `windows=${answer.windows} ${(answer.processingSec * 1000).toFixed(0)}ms ` +
+                `runnerUp=${answer.candidates[1]?.language ?? '—'} ` +
+                `${(answer.candidates[1]?.probability ?? 0).toFixed(3)}`
+            );
+          }
+          console.log(`[ear] labelled samples: ${correct} of ${labelled.length} correct`);
+          if (correct < labelled.length) {
+            failures.push(`ear: ${labelled.length - correct} of ${labelled.length} samples misidentified`);
+          }
+        }
+
+        // The language list, which is the one call that is iOS-only.
+        try {
+          const languages = await identifier.supportedLanguages();
+          console.log(
+            `[ear] supportedLanguages -> ${languages.length} codes, ` +
+              `unique=${new Set(languages).size}, includes en/pt/ja=` +
+              `${['en', 'pt', 'ja'].every((l) => languages.includes(l))}`
+          );
+          if (languages.length < 90) {
+            failures.push(`ear: supportedLanguages returned ${languages.length}, expected ~99`);
+          }
+        } catch (e) {
+          const code = e instanceof DesertAntError ? e.code : 'not a DesertAntError';
+          console.log(`[ear] supportedLanguages -> ${code} (expected off iOS)`);
+          if (Platform.OS === 'ios') {
+            failures.push(`ear: supportedLanguages failed on iOS with ${code}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.log(`[ear] self-test FAILED: ${describe(e)}`);
+      failures.push(`ear: ${describe(e)}`);
+    }
 
     // --- Uhm. The only model here that is loaded by the time a self-test can run
     //     without anyone tapping anything, so this leg is the one that always has
@@ -940,7 +1292,8 @@ export default function App() {
     <ScrollView contentContainerStyle={styles.container}>
       <Text style={styles.title}>Desert Ant</Text>
       <Text style={styles.subtitle}>
-        Clear cleans it, Voz reads it, Clips cuts it, Uhm finds the ums
+        Clear cleans it, Ear names the language, Voz reads it, Clips cuts it, Uhm finds
+        the ums
       </Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -1209,6 +1562,100 @@ export default function App() {
       </View>
 
       <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Ear</Text>
+
+        {earState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Ear.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {earState === 'absent' ? (
+          <>
+            <Text style={styles.note}>
+              Preparing Ear failed. It is about 9 MB, so this is worth retrying.
+            </Text>
+            <Button
+              label="Retry (~9 MB)"
+              onPress={() => void prepareEar()}
+              disabled={busy !== null}
+              tone="ghost"
+            />
+          </>
+        ) : null}
+
+        {earState === 'loading' ? (
+          <Text style={styles.note}>Preparing — about 9 MB if it is not already here.</Text>
+        ) : null}
+
+        {earState === 'ready' && !heard ? (
+          <Text style={styles.note}>
+            Ready. Record something and Ear will name the language before Voz reads
+            it — which is the order they are meant to run in, because Voz cannot
+            tell you when it is out of its depth.
+          </Text>
+        ) : null}
+
+        {heard ? (
+          <>
+            <Row label="Language" value={heard.language ?? 'none'} />
+            <Row label="Confidence" value={heard.confidence.toFixed(2)} />
+            <Row label="Reliable" value={heard.isReliable ? 'yes' : 'no'} />
+            <Row label="Windows heard" value={`${heard.windows}`} />
+            <Row
+              label="Identification"
+              value={`${(heard.processingSec * 1000).toFixed(0)} ms${
+                earMs === null ? '' : ` (${earMs} ms with the bridge)`
+              }`}
+            />
+
+            {/* The two reasons an answer is unreliable are different problems,
+                so they get different sentences. More audio fixes one of them and
+                nothing fixes the other. */}
+            {!heard.isReliable && heard.language ? (
+              <Text style={styles.note}>
+                {Ear.confusableLanguages.includes(heard.language)
+                  ? `${heard.language} is one of Norwegian, Swedish and Danish, which the ` +
+                    'detector confuses with each other confidently rather than uncertainly. ' +
+                    'The confidence above does not reveal the problem, which is exactly why ' +
+                    'this flag exists and a threshold would not do.'
+                  : `The top two candidates are within ${Ear.reliableMargin} of each other, so ` +
+                    'the answer is a choice between them rather than a reading. More audio ' +
+                    'usually helps here.'}
+              </Text>
+            ) : null}
+
+            {/* The join this model exists for. Voz will happily transcribe audio
+                in a language it was never trained on and return fluent nonsense,
+                so the comparison is the useful output, not the code. */}
+            {heard.language && !Voz.supportedLanguages.includes(heard.language) ? (
+              <Text style={styles.note}>
+                Voz does not cover {heard.language}. It would transcribe this anyway and the
+                result would be confident nonsense — Voz does not detect what it is
+                hearing, which is what Ear is here to do.
+              </Text>
+            ) : null}
+
+            {heard.candidates.length > 0 ? (
+              <View style={styles.words}>
+                {heard.candidates.slice(0, 6).map((candidate, index) => (
+                  <View key={`${index}-${candidate.language}`} style={styles.filler}>
+                    <Text style={styles.wordText}>{candidate.language}</Text>
+                    <Text style={styles.wordTime}>{candidate.probability.toFixed(3)}</Text>
+                  </View>
+                ))}
+              </View>
+            ) : (
+              <Text style={styles.note}>
+                Nothing to listen to. On synthetic audio that is the right answer — a
+                tone under hiss is not speech in any language.
+              </Text>
+            )}
+          </>
+        ) : null}
+      </View>
+
+      <View style={styles.metrics}>
         <Text style={styles.sectionTitle}>Emo</Text>
 
         {emoState === 'unsupported' ? (
@@ -1324,6 +1771,16 @@ const SAMPLE_PHRASES = [
   'go for a run',
   'call mum on her birthday',
 ];
+
+/**
+ * The labelled fixtures the Ear leg looks for, as `ear-<code>.wav` in the app's
+ * cache.
+ *
+ * Six languages in four scripts, each about half a minute -- one full window, so
+ * the detector is answering with its real context rather than from padding.
+ * Generated on a Mac with `say` and `afconvert`; see packages/ear/README.md.
+ */
+const LANGUAGE_SAMPLES = ['en', 'es', 'pt', 'fr', 'de', 'ja'];
 
 /** How far along a model is. Shared by the two that download on demand. */
 type ModelState = 'unsupported' | 'absent' | 'loading' | 'ready';

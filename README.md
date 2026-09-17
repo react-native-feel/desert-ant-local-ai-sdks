@@ -5,12 +5,12 @@ on-device models. Desert Ant ships Swift, Kotlin and JavaScript/WebAssembly SDKs
 from [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core); this
 repository is the React Native one they do not.
 
-Five models so far. Four of them compose into one pipeline: **Clear** cleans a
-recording up — denoise, dereverb, loudness-normalize — **Voz** reads it back as a
-transcript with word-level timestamps, **Clips** picks the moments worth cutting,
-and **Uhm** finds every "um" in the same audio without reading a word of it. The
-fifth, **Emo**, reads text rather than audio: a phrase in, the emoji that fit it
-out. Entirely offline.
+Six models so far. Five of them compose into one pipeline: **Clear** cleans a
+recording up — denoise, dereverb, loudness-normalize — **Ear** names the language
+it is in, **Voz** reads it back as a transcript with word-level timestamps,
+**Clips** picks the moments worth cutting, and **Uhm** finds every "um" in the
+same audio without reading a word of it. The sixth, **Emo**, reads text rather
+than audio: a phrase in, the emoji that fit it out. Entirely offline.
 
 ```ts
 import { Clear } from '@desert-ant-labs/react-native-clear';
@@ -18,8 +18,13 @@ import { Voz } from '@desert-ant-labs/react-native-voz';
 import { Clips } from '@desert-ant-labs/react-native-clips';
 import { Uhm } from '@desert-ant-labs/react-native-uhm';
 import { Emo } from '@desert-ant-labs/react-native-emo';
+import { Ear } from '@desert-ant-labs/react-native-ear';
 
 const { uri } = await (await Clear.load()).enhance({ uri: recording.uri });
+
+const heard = await (await Ear.load()).identify({ uri });
+// heard -> { language: 'pt', confidence: 0.99, isReliable: true, ... }
+
 const { words } = await (await Voz.load()).transcribe({ uri });
 
 const clips = await Clips.load();
@@ -33,6 +38,13 @@ const clean = Uhm.reconcileWords(words, fillers);  // word spans that miss the u
 const emoji = await (await Emo.load()).suggest('Pay my bills');
 // emoji[0] -> { emoji: '💰', confidence: 0.62 }
 ```
+
+Ear sits ahead of Voz rather than beside it, and that is the point of it: Voz does
+not detect what it is hearing, so audio outside its 25 languages comes back as
+confident nonsense rather than as an error. `isReliable` is the field to branch
+on — it is false both when the top two candidates are too close *and* for
+Norwegian, Swedish and Danish, which the detector confuses with each other
+confidently, where no confidence threshold could catch it.
 
 Uhm is the one that does not sit in the chain: it reads the waveform, so it runs
 on the same file the others do but waits for none of them. What it wants a
@@ -52,24 +64,26 @@ is the one you can call on every keystroke.
 | [`@desert-ant-labs/react-native-voz`](packages/voz) | The Voz model: file in, transcript with word timings out. **iOS only.** |
 | [`@desert-ant-labs/react-native-clips`](packages/clips) | The Clips model: transcript in, ranked highlights with playable spans out. **iOS 18+ only.** |
 | [`@desert-ant-labs/react-native-uhm`](packages/uhm) | The Uhm model: audio in, frame-precise filler-word spans out. No transcript needed. **iOS only.** |
+| [`@desert-ant-labs/react-native-ear`](packages/ear) | The Ear model: audio in, the language it is spoken in out, across 99. iOS + Android. |
 | [`@desert-ant-labs/react-native-emo`](packages/emo) | The Emo model: short text in, ranked emoji with confidences out, 22 languages. iOS + Android. |
 | [`@desert-ant-labs/react-native-core`](packages/core) | Types, error codes and lifecycle contracts shared by every model SDK here — and the single native bridge to the `desert-ant-core` Swift package. |
-| [`apps/example`](apps/example) | Record → enhance → transcribe → rank highlights → find the fillers, plus a text field for Emo, on a dev build. |
+| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field for Emo, on a dev build. |
 
 ## How it is built
 
 The native work is **not** a reimplementation. Each package is a thin Expo module
 over Desert Ant's own platform SDKs:
 
-- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm` and `Emo` products of the `desert-ant-core`
+- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo` and `Ear` products of the `desert-ant-core`
   Swift package, pulled in through React Native's `spm_dependency` bridge — that
   package ships as SPM only, with no podspec and no XCFramework. The bridge is
   declared exactly once, by the `DesertAntCore` pod, because two pods each
   linking the same package duplicates its thirteen shared objects and fails to
   link; see [`packages/core`](packages/core#the-desertantcore-pod).
-- **Android** depends on `ai.desertant:clear` and `ai.desertant:emo` from Maven
-  Central, which bring LiteRT and the shared native core with them. Those two are
-  the only models with an Android half: **Voz** drives Core ML directly and
+- **Android** depends on `ai.desertant:clear`, `ai.desertant:emo` and
+  `ai.desertant:ear` from Maven Central, which bring LiteRT and the shared native
+  core with them. Those three are the only models with an Android half: **Voz**
+  drives Core ML directly and
   upstream ships no artifact for it at all, **Clips** has LiteRT files declared
   but no published Android package to bind to yet, and **Uhm** has neither half —
   no LiteRT export of the detector, and a type labeller that is a SoundAnalysis
@@ -82,7 +96,7 @@ has no Kotlin implementation yet. Both answer to the same TypeScript surface.
 
 [`docs/architecture.md`](docs/architecture.md) is the long version: why Expo
 Modules rather than Nitro, what the buffer-marshaling constraint is and how it is
-resolved, which platform differences are real, and the three Expo Modules 2.0
+resolved, which platform differences are real, and the four Expo Modules 2.0
 limits that only showed up against a real toolchain and a real phone.
 
 **Status:** Clear is verified end to end on iOS on an iPhone 16 (iOS 26.3.1).
@@ -93,7 +107,11 @@ filler spans in eleven seconds of real speech, with the type labeller and
 `reconcileWords` both exercised — and the example app's own record, clean and
 detect flow returns them through the UI. Voz binds and reports correctly but its
 transcription has not been run; that needs ~490 MB of weights and a Neural
-Engine, which a simulator does not have. Emo is verified end to end on a simulator too: it
+Engine, which a simulator does not have. Ear is verified end to end on a simulator:
+it downloads, loads, names all 99 languages it knows, and identifies six
+half-minute recordings — English, Spanish, Portuguese, French, German and
+Japanese — correctly, every one above 0.98 and every one marked reliable. Emo is
+verified end to end on a simulator too: it
 downloads, loads in 7.6 s, and answers "Pay my bills" with 💰 at 0.64 in 5–16 ms
 — and the same phrase in Spanish and Japanese ranks 💰 first as well, which is
 the multilingual claim rather than a keyword table. Its skin-tone path is
@@ -107,13 +125,13 @@ README says exactly what was and was not exercised.
 | --- | --- |
 | Expo SDK | 57+ (`expo-modules-core` 57 is where the 2.0 macros live) |
 | React Native | 0.75+ for `spm_dependency`; 0.83 in the example |
-| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm or Emo alone |
+| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo or Ear alone |
 | Xcode | 26 (`desert-ant-core` is `swift-tools-version: 6.2`) |
 | Android | API 24+, `arm64-v8a` and `x86_64` only |
 | Expo Go | Not supported — these are native modules, so use a dev build |
 
 Each package's bundled config plugin raises the iOS deployment target — and
-Clear's and Emo's also narrow the Android ABIs to the two LiteRT ships — so add
+Clear's, Emo's and Ear's also narrow the Android ABIs to the two LiteRT ships — so add
 whichever packages you use to `plugins` in your app config. The plugins only ever
 raise, and the two that touch `build.gradle` defer to each other's block, so they
 compose.

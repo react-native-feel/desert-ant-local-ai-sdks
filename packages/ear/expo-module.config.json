@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["EarModule"]
+  },
+  "android": {
+    "modules": ["ai.desertant.rn.ear.EarModule"]
+  }
+}

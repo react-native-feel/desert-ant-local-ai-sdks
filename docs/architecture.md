@@ -261,6 +261,102 @@ and the other defers to it. This is the general shape of the composition rule th
 iOS plugins already followed — *only ever raise* — applied to a file where "raise"
 has no meaning and "write once, across all of us" does.
 
+## What Desert Ant ships for Ear (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Ear` in `desert-ant-core` | A ~9 MB `ear.mlmodelc` plus three sidecars: `languages.json`, `ear_meta.json` and `mel_filters.f32`. No `@available` and no `osFloor`, so its floor is the package's `iOS 17`. |
+| Kotlin | `ai.desertant:ear:3.1.0` on Maven Central | Plain AAR; `ai.desertant:core` comes transitively. Samples only -- `identify(samples, sampleRate, Options(windows))` -- with no file entry point. |
+| JavaScript | `@desert-ant-labs/ear` | LiteRT.js in the browser, a prebuilt native core in Node. **Neither is usable from React Native.** |
+
+Third model with both halves, after Clear and Emo, so `isSupported` means what it
+means for Emo: off Apple it is a statement about the *device*, not the catalog.
+LiteRT ships `arm64-v8a` and `x86_64`, and `unsupportedReason` is computed
+natively because only the Android half knows which ABIs the device reported.
+
+The frontend is worth noting because it explains the sidecars. Every platform
+runs the same graph shape -- log-mel in, language logits out -- because the mel
+frontend is Swift rather than part of the artifact, and that is not for symmetry:
+the frontend cannot run in float16, so folding it into the Core ML program would
+either drop the whole thing off the Neural Engine or destroy the features.
+Upstream measured a float16 frontend taking routing accuracy from 97.5% to 84.2%.
+Hence `mel_filters.f32` shipping as a table.
+
+### Clear's asymmetry, again -- and a smaller answer to it
+
+Swift has `identify(contentsOf:)` and `identify(path:)`; Kotlin has samples only.
+That is exactly the gap that shaped Clear, where half the Android module is a
+decoder this repo had to write.
+
+Ear needs less of one. Clear has to keep the channels apart and encode a file back
+out; Ear consumes one mono buffer and returns a few candidates, so
+`packages/ear/android/.../AudioFiles.kt` is the decode half alone, downmixing as
+it goes -- and it does not resample, because the Kotlin `identify` takes the rate
+as an argument and resamples internally.
+
+It is still a second decoder in this repo, which is a real cost. Sharing it would
+mean an Android artifact in `packages/core`, which is Apple-only today; that is
+the right fix if a third model needs a decoder, and overbuilt for the second. The
+memory limit is inherited from Clear's: the whole decoded file is resident. It
+bites slightly less here -- Ear listens to at most three thirty-second windows --
+but the windows are chosen by scanning the whole file, so the whole file still
+has to be decoded to choose them.
+
+### `isReliable` is the API, and it is not a threshold
+
+The field that matters is a boolean, not the confidence beside it, and the
+two genuinely disagree. `isReliable` is false when the top two candidates are
+within 0.25 of each other **or** when the answer is Norwegian, Swedish or Danish
+-- which the detector confuses with each other *confidently*, reading Norwegian
+as Swedish in roughly 40% of clips. The probability does not reveal that, so no
+margin test can catch it and no threshold a caller picks can either.
+
+It is decided natively on both platforms and forwarded, never recomputed here.
+Upstream's own calibration table is the argument for not second-guessing it:
+
+| margin | answered | of those, correct |
+| --- | --- | --- |
+| 0.00 | 100% | 93.2% |
+| 0.25 | 80.9% | **98.5%** |
+| 0.80 | 63.6% | 100% |
+
+The package's own test suite deliberately does *not* assert `isReliable` against
+a recomputed margin. A test like that would be asserting a second implementation
+into existence, which is the drift the native decision exists to prevent; the
+example app's self-test checks only *consistency* with the two rules, which is a
+much weaker claim and the only one a caller can make without duplicating the
+calibration.
+
+`Ear.confusableLanguages` is the one piece of upstream knowledge this package
+does duplicate, because `confusableLanguages` is `internal` in
+`Sources/Ear/Languages.swift` and neither SDK exposes it. It is here to explain a
+`false`, and nothing branches on it.
+
+### Ear reports no progress, so it emits one phase
+
+Upstream's `identify` takes no progress handler on either platform -- only
+`download` does. So an Ear emits `loadingModel` and nothing else, and no
+`identifying` phase was added to `ModelPhase` in `packages/core`. Inventing a
+fraction for a 250 ms call would mean making one up.
+
+That turned out to matter for more than tidiness. The progress path is also where
+a crash *appeared* to live before it was traced to the async-return encode (limit
+4 above), and `supportedLanguages` now loads with progress suppressed, since no
+caller of it has a progress bar to feed.
+
+### Where Ear sits in the chain
+
+Ahead of Voz, and the join is not decorative. `Voz.supportedLanguages` exists
+because Voz does **not** detect what it is hearing: audio outside its 25
+languages comes back as fluent, confident nonsense rather than as an error or a
+low score, and Voz's own documentation says to establish the language some other
+way first. Ear is that other way, and it names all 25 of Voz's languages, so the
+comparison is always meaningful.
+
+The example app does the comparison and reports it, but deliberately does **not**
+gate on it. A real app routing unattended work should; a demo that hid Voz
+behind Ear's opinion would be showing one model instead of two.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -342,9 +438,59 @@ toolchain and a real phone, and each one moved the design.
    neither success nor failure, and the app was gone. This is why `enhanceBuffer`
    returns metrics and `takeEnhancedAudio` hands over the audio.
 
-Limits 1 and 2 are compile-time and self-announcing. Limit 3 is not, and it cost
-most of the debugging: the first fix appeared not to work because the phone was
-locked, so `expo run:ios` silently kept running a stale build.
+4. **A `@JS async` function's return value can be encoded off the JavaScript
+   thread, which segfaults.** Found by Ear, and it generalizes limit 3 rather
+   than sitting beside it. `supportedLanguages` returned `[String]`; the crash is
+   inside `Array<String>.encode(_:in:)` on
+   `com.apple.root.user-initiated-qos.cooperative` rather than on
+   `com.facebook.react.runtime.JavaScript`:
+
+   ```
+   Thread: com.apple.root.user-initiated-qos.cooperative
+     hermesvm         createStringFromUtf8(...)
+     ExpoModulesJSI   static Array<A>.encode(_:in:)
+     DesertAntExample closure #5 in EarModule._decorateModule(object:in:)
+   ```
+
+   `@JavaScriptActor` on the function does not prevent it: the return value is
+   encoded after the actor hop the annotation governs.
+
+   Three things make it expensive to diagnose. It is a **race**, so it survived a
+   first call and a second before taking the process down. The damage it does to
+   the Hermes runtime **surfaces later and elsewhere** -- the first two crashes
+   seen here were inside an unrelated progress event, one in
+   `EventEmitter::emitEvent` and one in `EarProgressEvent.toObject`, which sent
+   the investigation after the event emitter for an hour. And the **narrow
+   reading is wrong**: the same run then crashed Clear the same way, in
+   `Record.encode(_:in:)` off the same thread, so this is not "arrays of
+   primitives only".
+
+   ```
+   Thread: com.apple.root.user-initiated-qos.cooperative
+     ExpoModulesCore  static Record.encode(_:in:)
+     DesertAntExample closure #6 in ClearModule._decorateModule(object:in:)
+   ```
+
+   That is the concrete explanation for something this repo had already recorded
+   as folklore -- "Clear's in-memory path hangs on this simulator". It does not
+   hang; it races, and loses.
+
+   Ear's fix is to take the encode off the async path entirely: `loadLanguages`
+   returns `Void` and the array is read back through a **synchronous** `@JS`
+   member, which runs on the JavaScript thread by construction. That is a general
+   shape and not a special case -- for any async call whose result is large or
+   whose encoding is not a single scalar, splitting "do the work" from "hand the
+   result over" is the safe arrangement here.
+
+   Why five model packages did not hit it earlier is a matter of exposure rather
+   than immunity: Uhm and Emo return `@Record`s and small arrays of them, Ear
+   returned 99 strings. Clear had it all along.
+
+Limits 1 and 2 are compile-time and self-announcing. Limits 3 and 4 are not, and
+they cost most of the debugging in their respective rounds. For limit 3 the first
+fix appeared not to work because the phone was locked, so `expo run:ios` silently
+kept running a stale build. For limit 4 the misdirection was in the crash reports
+themselves: two of the three named a component that was not at fault.
 
 ### Two pods cannot each bridge the same Swift package
 
@@ -620,6 +766,65 @@ error shape only observed here. The example app recovers instead — release the
 handle, re-prepare — which is the right response to any `suggest` failure an app
 did not cause.
 
+### Ear, end to end
+
+Same iOS 26.4 simulator. The module binds and reports every `@JS` property:
+
+```
+[ear] isSupported=true nativeCore=3.1.0 revision=v0.1.0 repo=desert-ant-labs/ear
+      windows=3 margin=0.25 confusable=no/sv/da
+[ear] ready in 7218ms downloaded=true        # ~6.9 s warm
+[ear] 99 languages, e.g. en zh de es ru ko fr ja pt tr pl ca
+[ear] Voz covers 25, Ear names 99; Voz languages Ear cannot name: none
+```
+
+That last line is the join checked rather than asserted: every language Voz can
+transcribe is one Ear can name, so the routing comparison is never vacuous.
+
+**Identification is correct on real speech**, which is the claim worth testing by
+hand. Six labelled samples, half a minute each -- one full window, so the
+detector answers with its real context rather than from padding -- generated with
+`say` and `afconvert` and dropped into the app's cache:
+
+| Sample | Answer | Confidence | Reliable | Runner-up |
+| --- | --- | --- | --- | --- |
+| `en` | **en** | 0.998 | yes | nn 0.000 |
+| `es` | **es** | 0.997 | yes | en 0.001 |
+| `pt` | **pt** | 0.996 | yes | es 0.002 |
+| `fr` | **fr** | 0.997 | yes | en 0.002 |
+| `de` | **de** | 0.998 | yes | en 0.001 |
+| `ja` | **ja** | 0.986 | yes | en 0.005 |
+
+Six of six, four scripts, every one above 0.98 with a runner-up at most 0.005.
+
+The synthetic case is the more interesting half of the same test. A 200 Hz tone
+under hiss is not speech in any language, and the model says so through the flag
+rather than through an error:
+
+```
+en 0.360, ja 0.192, ko 0.077, ru 0.044 — isReliable=false
+```
+
+a 0.17 margin against the 0.25 the rule requires. A confidence threshold at 0.3
+would have accepted it, which is the concrete form of "do not threshold
+`confidence`".
+
+Also exercised: `identifySamples` with a native 48 kHz to 16 kHz resample; the
+"fewer windows on short audio" rule, where `windows: 1` and the default both
+listen to one window on two seconds of audio; `windows` of 0, -1 and 1.5 rejected
+with `ERR_INVALID_ARGUMENT` before reaching native; and a missing file reported as
+`ERR_AUDIO_DECODE_FAILED` rather than as an inference failure, which is the
+distinction an app offering "your file is gone" versus "the model broke" needs.
+
+Latency is **~5.5 s per identification on the simulator**, and should not be read
+as the model's speed -- a simulator has no Neural Engine, so this is the CPU path
+against upstream's ~250 ms on device. It is stable across every call above,
+including the two-second synthetic clip, which is consistent with a fixed encoder
+cost rather than one that scales with the audio.
+
+The crash found along the way, and the one it then exposed in Clear, are limit 4
+in **Expo Modules 2.0 limits** above.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -654,6 +859,17 @@ These are Clear's; Voz, Clips and Uhm have no Android half to differ from.
 | `warm()` | Downloads *and* builds the session | Downloads only | LiteRT session construction is lazy inside the first `enhance`. |
 | Verified | Yes, on an iPhone 16 | No -- compiles only | No Android hardware was available. |
 
+Ear's are Clear's shape, because the file API is Apple's alone:
+
+| | iOS | Android | Why |
+| --- | --- | --- | --- |
+| `identify({ uri })` | Upstream's own `AudioIO` | A decoder in this package | Kotlin `Ear` takes samples only; there is no file entry point to call. |
+| `supportedLanguages()` | The 99 codes | `ERR_UNSUPPORTED_PLATFORM` | `ai.desertant:ear` publishes no reader for the `languages.json` sidecar. |
+| `ProgressEvent.fraction` | A real fraction | `0` entering a phase, `1` leaving it | Kotlin `Ear.download()` takes no progress handler. |
+| `isSupported` | Always true | False on an ABI LiteRT does not ship | The Core ML export has no device constraint; the LiteRT one has two ABIs. |
+| `modelRevision` / `modelRepo` / `reliableMargin` | Read from the catalog and the SDK | Constants in the module | `ai.desertant:ear` publishes `Ear`, `Detection`, `LanguageCandidate` and `Options`, and nothing to read them from. |
+| Verified | Yes, on a simulator | No -- compiles only | No Android hardware was available. |
+
 Emo's are shorter, because the two SDKs are symmetric:
 
 | | iOS | Android | Why |
@@ -686,8 +902,9 @@ Emo's are shorter, because the two SDKs are symmetric:
 ## Version coupling
 
 `DESERT_ANT_CORE_VERSION` in `packages/core/ios/DesertAntCore.podspec` — now
-the only place the Swift package's version is named — the `ai.desertant:clear` and
-`ai.desertant:emo` coordinates in the two `android/build.gradle` files, and the
+the only place the Swift package's version is named — the `ai.desertant:clear`,
+`ai.desertant:emo` and `ai.desertant:ear` coordinates in the three
+`android/build.gradle` files, and the
 `coreVersion` constants in each model's Swift and Kotlin module files must move
 together. The Apple and
 Android native cores share an FFI payload schema (see the comments in Desert
