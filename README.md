@@ -438,6 +438,22 @@ npx expo prebuild --clean
 npx expo run:ios       # or run:android — a dev build, not Expo Go
 ```
 
+### The one patched dependency
+
+`apps/example` pins **react-native 0.86.3**, whose `scripts/cocoapods/spm.rb`
+creates Swift-package objects with `project.new`. That is a counter-based UUID
+scheme with no collision check, and in a `post_install` hook the first UUID it
+hands back is the root `PBXProject`'s — so the new object overwrites it and Xcode
+refuses to open `Pods.xcodeproj` at all ("The project 'Pods' is damaged").
+**Without the fix no prebuild in this repo works**, which matters here more than
+in most apps because every model pod is bridged through `spm_dependency`.
+
+[`patches/react-native+0.86.3.patch`](apps/example/patches) backports the probe
+react-native 0.87.1 ships, and `patch-package` re-applies it on every
+`npm install`. It has an expiry date: moving the example app to 0.87.1+ makes it
+unnecessary, and the right response then is to delete the patch and the
+`patch-package` devDependency rather than regenerate them.
+
 ## License
 
 This wrapper is MIT. The models it loads are not: they ship under the

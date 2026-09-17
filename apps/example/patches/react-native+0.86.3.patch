@@ -1,0 +1,67 @@
+diff --git a/node_modules/react-native/scripts/cocoapods/spm.rb b/node_modules/react-native/scripts/cocoapods/spm.rb
+index d500bb9..3c247f0 100644
+--- a/node_modules/react-native/scripts/cocoapods/spm.rb
++++ b/node_modules/react-native/scripts/cocoapods/spm.rb
+@@ -53,6 +53,35 @@ class SPMManager
+ 
+   private
+ 
++  # PATCH, applied on install by patch-package (patches/react-native+0.86.3.patch).
++  #
++  # react-native 0.86.3's spm.rb creates package objects with `project.new`,
++  # whose UUID generator in Pod::Project is a counter-based scheme that skips
++  # collision checks. In a `post_install` hook the counter can be out of sync
++  # with the UUIDs already in the project, and the first UUID it hands back is
++  # `<prefix>00000000` -- which is the root PBXProject's. The new object
++  # overwrites it, and Xcode then refuses to open Pods.xcodeproj at all
++  # ("The project 'Pods' is damaged", -[XCSwiftPackageProductDependency
++  # _setSavedArchiveVersion:]: unrecognized selector).
++  #
++  # react-native 0.87.1 fixes this upstream with exactly the probe below, and the
++  # example app is pinned to 0.86.3 -- so this is a backport with an expiry date.
++  # Moving the example to 0.87.1+ makes it unnecessary: delete the patch file and
++  # the patch-package devDependency rather than re-generating them.
++  def new_object(project, klass)
++    # Pod::Project's counter-based UUID scheme restarts at zero in a post_install
++    # hook and hands back UUIDs that are already in use, silently overwriting
++    # existing objects (the root PBXProject, a shell script phase) and leaving a
++    # Pods.xcodeproj Xcode refuses to open. Use Xcode's own 96-bit random scheme,
++    # which is what Xcodeproj::Project does outside CocoaPods.
++    require 'securerandom'
++    uuid = SecureRandom.hex(12).upcase
++    uuid = SecureRandom.hex(12).upcase while project.objects_by_uuid.key?(uuid)
++    object = klass.new(project, uuid)
++    object.initialize_defaults
++    object
++  end
++
+   def log(msg)
+     ::Pod::UI.puts "[SPM] #{msg}"
+   end
+@@ -76,7 +105,7 @@ class SPMManager
+       pkg_class = Xcodeproj::Project::Object::XCLocalSwiftPackageReference
+       pkg = project.root_object.package_references.find { |p| p.class == pkg_class && p.relative_path == url }
+       if !pkg
+-        pkg = project.new(pkg_class)
++        pkg = new_object(project, pkg_class)
+         pkg.relative_path = url
+         log(" Adding local package to workspace: #{pkg.inspect}")
+         project.root_object.package_references << pkg
+@@ -85,7 +114,7 @@ class SPMManager
+       pkg_class = Xcodeproj::Project::Object::XCRemoteSwiftPackageReference
+       pkg = project.root_object.package_references.find { |p| p.class == pkg_class && p.repositoryURL == url }
+       if !pkg
+-        pkg = project.new(pkg_class)
++        pkg = new_object(project, pkg_class)
+         pkg.repositoryURL = url
+         pkg.requirement = requirement
+         log(" Adding remote package to workspace: #{pkg.inspect}")
+@@ -101,7 +130,7 @@ class SPMManager
+       next if ref
+ 
+       log(" Adding product dependency #{product_name} to #{target.name}")
+-      ref = project.new(ref_class)
++      ref = new_object(project, ref_class)
+       ref.package = pkg
+       ref.product_name = product_name
+       target.package_product_dependencies << ref
