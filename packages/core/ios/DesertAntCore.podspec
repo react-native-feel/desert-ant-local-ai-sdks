@@ -43,6 +43,13 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # this is code size, not hundreds of megabytes. Adding a model to the family
 # means adding it here.
 #
+# `Gist`, added last, is the case that proves the rule Tongue's absence states:
+# it is a member of the `models` array in desert-ant-core's Package.swift, so it
+# reaches the manifest through `modelProducts`, and `products: products +
+# modelProducts + alignProducts + vozProducts` does include that. Checked with
+# that line before the pod was written, because the failure mode is the build
+# rather than the import.
+#
 # `Tongue` is deliberately NOT in this list, and it is the one model in the
 # family that is missing from it. desert-ant-core v3.1.0 declares the product --
 # `tongueProducts` in its Package.swift -- and then never adds it to the
@@ -61,7 +68,7 @@ DESERT_ANT_CORE_VERSION = '3.1.0'
 # When upstream adds those two words, adding `'Tongue'` here is the whole change
 # on this side: `packages/tongue/ios` is already written against the module and
 # guarded by `#if canImport(Tongue)`, so it lights up on its own.
-DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear'].freeze
+DESERT_ANT_PRODUCTS = ['Clear', 'Voz', 'Clips', 'Uhm', 'Emo', 'Ear', 'Gist'].freeze
 
 Pod::Spec.new do |s|
   s.name           = 'DesertAntCore'

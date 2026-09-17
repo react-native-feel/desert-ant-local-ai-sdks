@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- The weights are fetched from Hugging Face on first use -- ~74 MB for the
+       default build, which is more than any other Android half in this repo
+       downloads. Everything else is on-device; no storage permission is needed
+       because the SDK only ever reads paths the app already owns, and Gist's
+       input is a string rather than a file. -->
+  <uses-permission android:name="android.permission.INTERNET" />
+</manifest>

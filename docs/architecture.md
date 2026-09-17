@@ -515,6 +515,133 @@ own bundle, `allBundles`, `allFrameworks`, and one level of nested `.bundle`,
 which is a superset of what `Bundle.module` checks -- and raises
 `ERR_MODEL_UNAVAILABLE` with a sentence when it finds nothing.
 
+## What Desert Ant ships for Gist (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Gist` in `desert-ant-core` | A ~74 MB `gist.mlmodelc` plus five sidecars: `gist_tokenizer.bin`, `gist_embedding.i8`, `gist_embedding.json`, `gist_config.json` and `taxonomy.json`. A second, ~15 MB English build lives under `en/` in the same repo at the same revision. No `@available` and no `osFloor`, so its floor is the package's `iOS 17`. |
+| Kotlin | `ai.desertant:gist:3.1.0` on Maven Central | Plain AAR; `ai.desertant:core` comes transitively. `Gist(context, directory)` — **no variant**, so the English build is Swift-only. |
+| JavaScript | `@desert-ant-labs/gist` | LiteRT.js in the browser, a prebuilt native core in Node. **Neither is usable from React Native.** |
+
+Fourth model with both halves, after Clear, Emo and Ear, so `isSupported` means
+what it means for those three: off Apple it is a statement about the *device*, not
+the catalog. LiteRT ships `arm64-v8a` and `x86_64`, and `unsupportedReason` is
+computed natively because only the Android half knows which ABIs the device
+reported.
+
+It is also the first model here whose *download* is the expensive half and whose
+inference is not, and the architecture is why. `Sources/Gist/Model.swift` is two
+streams and a head: a vocab-pruned potion embedding table gathered, dequantized,
+mean-pooled and L2-normalized; hashed word and character n-grams CRC-32'd into a
+fixed-dimension vector beside it; the concatenation through one MLP. No
+transformer, and the embedding table stays a **sidecar** rather than a tensor op
+inside the graph, because the potion stream is a lookup. So the artifact is 74 MB
+of mostly table and a forward pass is single-digit milliseconds — the opposite
+shape to Voz or Clips, and the reason this is the one text model in the family
+that does not load on mount.
+
+### Two builds, and only one platform can choose
+
+`GistVariant` is a real choice rather than a label: the two trained builds live in
+separate folders of one Hub repo (multilingual at the root, English under `en/`)
+and a variant is a path prefix, so selecting one never downloads the other.
+`Gist(variant:directory:)` takes it in Swift; `ai.desertant:gist`'s whole
+constructor is `Gist(context, directory)`, and its own KDoc says the English build
+is "currently selectable from the Swift SDK only".
+
+So `Gist.variants` is read off the binary and is **two entries on iOS and one on
+Android**, and a variant picker should be gated on that list rather than on
+`Platform.OS` — a released Kotlin SDK that gains the choice lights up with no
+change here. Asking for `english` on Android is refused with
+`ERR_UNSUPPORTED_PLATFORM` in both halves, rather than quietly loading 74 MB when
+15 was asked for, which is the failure a caller could not detect.
+
+### The threshold is not readable, so it is not reported
+
+`classify` returns the ranked topics above the model's tuned threshold **plus the
+top topic whatever its score**, on both platforms. That rule makes the answer
+always non-empty, which is right — a fixed 36-topic list means a subject outside
+it gets the nearest topic on it — and makes "did this clear the bar?" a real
+question.
+
+Neither SDK will answer it. `Model.threshold` is `internal` in Swift and
+`Gist.tagged` is `private` in Kotlin; the value lives in the weights'
+`gist_config.json` and is upstream's to retune. The two options were to copy the
+number, which would be right until the next revision and then silently wrong, or
+to report nothing. `Tagging.threshold` therefore echoes an explicit override and
+is `null` otherwise — the same refusal Ear makes for `supportedLanguages` on
+Android, for the same reason.
+
+What is derivable is stated in the types instead: topics are sorted descending and
+only the first is exempt, so **more than one topic means every one of them
+cleared the threshold**, and exactly one means it may be the nearest rather than a
+confident answer. That is a weaker claim than the number, and it is one this
+package can make without keeping a copy of upstream's calibration.
+
+### Blank input: the two SDKs disagree, and this package picks Kotlin's side
+
+`ai.desertant:gist` guards `classify` and `scores` with `if (text.isBlank())
+return emptyList()`, before it touches the model. `Sources/Gist` has no such
+guard: a blank string tokenizes to nothing, pools to zeros, and runs the head
+over an all-zero feature vector — and because `classify` always returns its top
+topic, it comes back naming a topic with nothing behind it.
+
+Kotlin's is the honest behaviour, so the Apple half was given the same guard. It
+is the one place in this repo where a native half deliberately differs from its
+own upstream, and it is worth the divergence twice over: the alternative is an
+answer that means nothing, and returning early means a text field wired straight
+to `classify` costs nothing while it is empty — including on a device that has
+never downloaded the 74 MB.
+
+### `channelTopics` is bound, not ported
+
+Upstream ships a channel roll-up as a **free function** on both platforms —
+`channelTopics(posts, options:)` in Swift, a top-level `fun` in Kotlin — that is
+pure, deterministic and involves no model: probability-weighted mass per topic
+with optional exponential recency decay, a share floor, and a minimum post count.
+
+It could trivially have been thirty lines of TypeScript. It is bound instead,
+because Swift and Kotlin already agree on it field for field and default for
+default, and a third implementation would be a third chance to differ on a
+calculation whose output nothing would flag as wrong. The six defaults are read
+off the native binary through `Gist.defaultRollupOptions` for the same reason.
+
+Two consequences shape the JavaScript surface. It is a module-level function
+rather than a method, so it answers on a device that has never downloaded a
+weight — the only call in this family with no model behind it. And it is
+**synchronous**, which is both the fast shape and the safe one: see limit 4.
+
+### Every async call returns `Void`, and that is the general rule applied
+
+Gist is the first package here written to limit 4's *conclusion* rather than
+patched after hitting it. `classify` and `scores` are `@JS async` functions that
+return nothing and store their result on the shared object keyed by the caller's
+job id; `takeTagging` and `takeDistribution` are synchronous `@JS` members that
+hand it over and remove it.
+
+Ear's fix was the same shape applied to one call whose result happened to be
+`[String]`. The architecture note above draws the general rule — split "do the
+work" from "hand the result over" whenever the result is large or its encoding is
+not a single scalar — and Gist's results are the largest in the family, since
+`scores` is the whole 36-topic taxonomy. Applying it to both calls rather than
+arguing about how many `@Record`s is too many is the cheaper decision: it costs
+one synchronous hop and removes the question.
+
+Keying on the job id rather than a single slot is what makes it correct rather
+than merely lucky. Every entry point in this family already carries one for
+progress routing; here it also means two concurrent `classify` calls on one model
+cannot take each other's answer.
+
+### Where Gist sits next to the others
+
+Not in the audio chain at all, and not in Emo's or Tongue's job either. Tongue
+answers *what language* a string is in; Gist answers *what it is about*, and
+neither needs the other. The join worth building is with **Clips**: given one
+transcript, Clips ranks which moments are worth cutting and Gist says what the
+whole thing is about — the two halves of describing a piece of content, from the
+same twelve lines, with one model that needs no audio and another that needs no
+weights for its roll-up.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -642,7 +769,12 @@ toolchain and a real phone, and each one moved the design.
 
    Why five model packages did not hit it earlier is a matter of exposure rather
    than immunity: Uhm and Emo return `@Record`s and small arrays of them, Ear
-   returned 99 strings. Clear had it all along.
+   returned 99 strings. Clear had it all along. **Emo has since been caught too**
+   — see "The async-return crash has two more sites" below — so "small arrays of
+   records are fine" was exposure as well, and the rule to design to is the
+   general one: an async call whose result is large, or whose encoding is not a
+   single scalar, should return `Void` and hand the result over synchronously.
+   Gist is the first package here written that way from the start.
 
 Limits 1 and 2 are compile-time and self-announcing. Limits 3 and 4 are not, and
 they cost most of the debugging in their respective rounds. For limit 3 the first
@@ -1035,6 +1167,119 @@ that runs Tongue's plugin at every position among Clear's, Emo's and Ear's and
 asserts the single `abiFilters` block those three agree on is left exactly as
 found.
 
+### Gist, end to end
+
+Driven on an iOS 26 simulator (iPhone 17 Pro Max) with a dev build, as the
+**eighth** pod in an app that already carried seven.
+
+The module binds and every `@JS` property reads before anything touches a model,
+including the two that are not scalars:
+
+```
+[gist] isSupported=true nativeCore=3.1.0 revision=v2.2.0 repo=desert-ant-labs/gist
+       topK=3 variants=multilingual/english default=multilingual
+       rollup={"topN":5,"floor":0.05,"minPosts":3,"halfLifeDays":0,"touch":0.15,"nowMillis":0}
+```
+
+`variants` is a `[String]` off a property getter and `defaultRollupOptions` a
+`[String: Double]` off another — both synchronous, both encoded on the JavaScript
+thread by construction, which is the point.
+
+**Loading.** ~74 MB plus the Core ML session build in **65.3 s** cold, measured on
+a model prepared by itself. The first attempt failed on a Hugging Face **HTTP
+429**, and that is worth recording rather than retrying past: it surfaced as
+`ERR_MODEL_UNAVAILABLE` naming the URL and the status, which is the code a caller
+would put a retry button behind, rather than as the `ERR_INFERENCE_FAILED` it
+would have been if the load had not been pulled out ahead of the tagging call.
+Two later launches loaded cached weights in **42.9 s** and **45.1 s**, both while
+Emo, Ear and Uhm were loading on the same mount — an upper bound under
+contention, not the session build's cost.
+
+**Tagging.** One headline in four languages, no language passed in:
+
+| | Top topics |
+| --- | --- |
+| `en` "How to start a podcast with just your iPhone" | **technology 0.931**, business 0.799, creator-economy 0.772 |
+| `es` "Cómo empezar un podcast solo con tu iPhone" | **technology 0.861**, business 0.746, creator-economy 0.636 |
+| `de` "Wie du nur mit deinem iPhone einen Podcast startest" | **business 0.591**, technology 0.588 |
+| `ja` "iPhoneだけでポッドキャストを始める方法" | **technology 0.621**, creator-economy 0.521 |
+
+Three of four lead with `technology`; the German phrasing puts `business` ahead by
+0.003. All four rank the same two or three topics, which is the multi-label claim
+rather than a near-miss, and the Japanese sentence shares no characters with the
+English one. Two other subjects through the app's own field: "Why our index fund
+beat the hedge fund over ten years" → **Personal Finance & Investing 0.800**, and
+"The best one-pan salmon recipe for a weeknight" → **Food & Cooking 0.915**, each
+a single topic — which is this model saying "nothing else cleared the bar", not
+that it is unsure.
+
+**Latency.** The first `classify` after a load costs **45.3 ms** natively; after
+that, **9–11 ms end to end from JavaScript**. `scores` is **3.6–4.1 ms**
+natively. Twelve transcript lines scored and rolled up ran in **74–88 ms** across
+six runs. On a simulator, with no Neural Engine — which matters less for an MLP
+head than for the transformers in this repo, but it is still not a device number.
+
+**The Clips join.** The twelve-line sample transcript this app ranks with Clips,
+rolled up through `scores` and `channelTopics`:
+
+```
+technology 13.9% x10   business 12.7% x8   self-improvement 6.8% x5   news-politics 5.2% x2
+```
+
+Ten of twelve lines touch `technology` and eight touch `business`. Shares sum to
+0.385 rather than 1 because the floor and `topN` drop the tail. Two posts return
+**0** topics — `minPosts` declining rather than being confident about two.
+
+Also green, on two consecutive self-test runs: the ranked / bounded / unique /
+named / capped invariants; `topK: 1` → one and `topK: 10` → three with the same
+winner; `threshold: 1` → exactly the one topic upstream always returns, echoed
+back; blank input → zero topics and no download; `scores` → 36 topics, all in
+`0..1` and a superset of `classify`'s; every argument guard refusing before
+native. Both runs end `[selftest] all prepared models passed`.
+
+**Not verified.** Android was not built — there is no Android SDK on this machine
+(`$ANDROID_HOME` has no `platforms` or `build-tools`), so unlike every other
+package here its Android half has not even been compiled. The `english` variant
+was never loaded; only the refusal path was exercised. And no accuracy claim is
+this package's: upstream's "the right topic is in the top three 91% of the time"
+over 572 human-labelled posts is upstream's measurement.
+
+### The async-return crash has two more sites, and neither is Gist's
+
+The full self-test ended twice with the process dying afterwards — once stuck with
+its busy indicator spinning, once gone — and the crash report names
+`hermes::vm::HadesGC::youngGenCollection` on
+`com.facebook.react.runtime.JavaScript`. That is a corrupted Hermes heap surfacing
+at the next collection: the downstream symptom limit 4 describes, not a site.
+
+The two crashes in the same session that *do* name a site name someone else:
+
+```
+Thread: com.apple.root.user-initiated-qos.cooperative
+  ExpoModulesCore  static Record.encode(_:in:)
+  DesertAntExample closure #6 in ClearModule._decorateModule(object:in:)
+```
+
+```
+Thread: com.apple.root.user-initiated-qos.cooperative
+  ExpoModulesJSI   JavaScriptValuesBuffer.deinit
+  DesertAntExample closure #2 in EmoModule._decorateModule(object:in:)
+```
+
+The first is the Clear defect already recorded above, reproduced by a crash that
+predates Gist being in the binary. The second is **new**: Emo's `suggest` returns
+`[EmoSuggestionRecord]` from a `@JS async` function, and this is that array being
+torn down off the JavaScript thread. The claim in the limit-4 note that "Uhm and
+Emo return `@Record`s and small arrays of them" as an explanation for their not
+hitting it was exposure, not immunity, and now has a counterexample. Emo's fix is
+Ear's and Gist's: return `Void`, hand the result over synchronously. It is not
+made here, because it is not this model's package.
+
+A Gist-only session afterwards ran **three `classify` calls and sixty `scores`
+calls plus five native `channelTopics`** through the example app with no other
+model touched, and the process stayed up. Evidence for the split shape, not proof
+of it — a race that did not fire is not a race that cannot.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -1089,6 +1334,19 @@ Emo's are shorter, because the two SDKs are symmetric:
 | `modelRevision` / `modelRepo` | Read from the catalog | Constants in the module | `ai.desertant:emo` publishes `Emo`, `EmoSuggestion` and `EmojiSkinTone`, and nothing to read them from. |
 | Verified | Yes, on a simulator | No -- compiles only | No Android hardware was available. |
 
+Gist's is the shortest of the cross-platform ones, and the only table in this
+document where the missing capability is a whole *model build*:
+
+| | iOS | Android | Why |
+| --- | --- | --- | --- |
+| `variant: 'english'` | Supported (~15 MB) | Throws `ERR_UNSUPPORTED_PLATFORM` | `Gist(context, directory)` is the entire Kotlin constructor; there is no variant to pass. `Gist.variants` reports the difference so a picker gates on the list, not the platform. |
+| `ProgressEvent.fraction` | A real fraction | `0` entering a phase, `1` leaving it | Kotlin `Gist.download()` takes no progress handler. It matters more here than for Ear: ~74 MB, not ~9. |
+| `isSupported` | Always true | False on an ABI LiteRT does not ship | The Core ML export has no device constraint; the LiteRT one has two ABIs. |
+| `modelRevision` / `modelRepo` | Read from the catalog | Constants in the module | `ai.desertant:gist` publishes `Gist`, `Topic`, `GistException`, `PostTopics`, `ChannelTopic`, `RollupOptions` and `channelTopics`, and nothing to read them from. |
+| `defaultTopK` | Mirrored | Mirrored | `topK: Int = 3` is a default argument in both signatures, so neither platform can read it. `variants`, `defaultVariant` and `defaultRollupOptions` *are* read. |
+| Blank input | Empty tagging, no load | Empty tagging, no load | Kotlin's own guard; the Apple half was given the same one deliberately — upstream Swift would name a topic with nothing behind it. |
+| Verified | Yes, on a simulator | **No — not even compiled**; no Android SDK on the machine | Every other package here at least builds on Android. |
+
 Tongue's table is the only one where the *Apple* column is the constrained one,
 and the only one with no progress row at all -- it emits none:
 
@@ -1130,8 +1388,8 @@ and the only one with no progress row at all -- it emits none:
 
 `DESERT_ANT_CORE_VERSION` in `packages/core/ios/DesertAntCore.podspec` — now
 the only place the Swift package's version is named — the `ai.desertant:clear`,
-`ai.desertant:emo`, `ai.desertant:ear` and `ai.desertant:tongue` coordinates in
-the four `android/build.gradle` files, and the
+`ai.desertant:emo`, `ai.desertant:ear`, `ai.desertant:gist` and
+`ai.desertant:tongue` coordinates in the five `android/build.gradle` files, and the
 `coreVersion` constants in each model's Swift and Kotlin module files must move
 together. The Apple and
 Android native cores share an FFI payload schema (see the comments in Desert
@@ -1145,6 +1403,21 @@ same three words, with nothing to fail. Upstream's `ModelCatalogTests` enforces
 that `TongueModel.sdkVersion`, `packages/tongue-node/package.json` and
 `packages/tongue-kotlin/build.gradle.kts` all say `3.1.0`; this repo's job is
 simply not to pin a Maven coordinate the podspec does not name.
+
+Gist adds one coupling of its own, and it is to a package neither half of this
+repo owns. `Sources/Gist/Channel.swift` imports **`RealModule`** from
+swift-numerics for `log` and `exp`, so that the roll-up compiles on Android and
+wasm as well as Apple — and `RealModule` depends on `_NumericsShims`, a *clang*
+target whose module map is a file in the SwiftPM checkout rather than something
+Xcode regenerates into `GeneratedModuleMaps-<platform>/`. Gist is the first
+product in `DESERT_ANT_PRODUCTS` with a transitive C module, and `import Gist`
+therefore fails to compile its pod with `missing required module
+'_NumericsShims'` until that checkout's `include` directory is on the pod's
+`SWIFT_INCLUDE_PATHS` — Swift forwards `-I` to the clang importer, and clang finds
+a `module.modulemap` by scanning its include paths. `packages/gist/ios/DesertAntGist.podspec`
+carries the line and the reasoning. It names another package's source layout,
+which is the part to dislike; it is also the narrowest fix available from a
+podspec, which CocoaPods evaluates before the SPM package is resolved at all.
 
 The other Tongue coupling is the one that is currently unsatisfiable:
 `DESERT_ANT_PRODUCTS` in the same podspec must gain `'Tongue'` the moment

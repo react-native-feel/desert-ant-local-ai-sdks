@@ -1,0 +1,9 @@
+{
+  "platforms": ["apple", "android"],
+  "apple": {
+    "modules": ["GistModule"]
+  },
+  "android": {
+    "modules": ["ai.desertant.rn.gist.GistModule"]
+  }
+}

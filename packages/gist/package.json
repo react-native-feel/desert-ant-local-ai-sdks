@@ -1,0 +1,58 @@
+{
+  "name": "@desert-ant-labs/react-native-gist",
+  "version": "0.1.0",
+  "description": "Gist on-device content topic tagging (text in, ranked topics from a fixed 36-topic taxonomy out, 101 languages) for React Native and Expo. iOS + Android.",
+  "main": "build/index.js",
+  "types": "build/index.d.ts",
+  "sideEffects": false,
+  "files": [
+    "build",
+    "src",
+    "ios",
+    "android",
+    "plugin/build",
+    "app.plugin.js",
+    "expo-module.config.json",
+    "README.md"
+  ],
+  "keywords": [
+    "react-native",
+    "expo",
+    "expo-modules",
+    "on-device",
+    "topic-classification",
+    "content-classification",
+    "tagging",
+    "multi-label",
+    "taxonomy",
+    "multilingual",
+    "model2vec",
+    "core-ml",
+    "litert",
+    "desert-ant-labs"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "expo-module build && expo-module build plugin",
+    "clean": "expo-module clean",
+    "lint": "expo-module lint",
+    "test": "expo-module test",
+    "prepare": "expo-module prepare",
+    "expo-module": "expo-module"
+  },
+  "dependencies": {
+    "@desert-ant-labs/react-native-core": "0.1.0"
+  },
+  "peerDependencies": {
+    "expo": ">=57.0.0",
+    "react": "*",
+    "react-native": "*"
+  },
+  "devDependencies": {
+    "@expo/config-plugins": "^57.0.9",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.20.1",
+    "expo": "^57.0.0",
+    "expo-module-scripts": "^56.0.3"
+  }
+}

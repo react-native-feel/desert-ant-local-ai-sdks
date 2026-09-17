@@ -7,6 +7,12 @@ import {
 import { Clips, type Clip } from '@desert-ant-labs/react-native-clips';
 import { Ear, type Detection } from '@desert-ant-labs/react-native-ear';
 import { Emo, type EmojiSkinTone, type EmoSuggestion } from '@desert-ant-labs/react-native-emo';
+import {
+  Gist,
+  channelTopics,
+  type ChannelTopic,
+  type Tagging,
+} from '@desert-ant-labs/react-native-gist';
 import { Tongue, type Detection as TextDetection } from '@desert-ant-labs/react-native-tongue';
 import { Uhm, type UhmResult } from '@desert-ant-labs/react-native-uhm';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
@@ -84,6 +90,7 @@ export default function App() {
   const emo = useRef<Emo | null>(null);
   const ear = useRef<Ear | null>(null);
   const tongue = useRef<Tongue | null>(null);
+  const gist = useRef<Gist | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -167,6 +174,28 @@ export default function App() {
     words: number;
   } | null>(null);
 
+  // Gist is ~74 MB for the default multilingual build, which puts it above Uhm's
+  // 45 and below Clips' 288 -- so it follows Voz and Clips rather than Emo and
+  // Ear: the app asks whether the weights are already here and otherwise waits
+  // for a tap. `absent` is therefore the honest starting state, not `loading`.
+  const [gistState, setGistState] = useState<ModelState>(
+    Gist.isSupported ? 'absent' : 'unsupported'
+  );
+  // Which build the next prepare loads. Two on iOS, one on Android, and the list
+  // is read off the native binary rather than off `Platform.OS` -- the Kotlin
+  // SDK's constructor takes no variant, so it reports one.
+  const [gistVariant, setGistVariant] = useState(Gist.defaultVariant);
+  const [topic, setTopic] = useState('');
+  const [tagged, setTagged] = useState<Tagging | null>(null);
+  // Measured around the call as well as reported natively, for the same reason
+  // Ear's is: `tagged.processingSec` is what the model cost and this is what the
+  // caller waited for.
+  const [gistMs, setGistMs] = useState<number | null>(null);
+  // What the whole sample transcript is about, rolled up from every line's
+  // distribution. The join with Clips: same twelve lines, one model ranking the
+  // moments and another naming the subject.
+  const [about, setAbout] = useState<ChannelTopic[] | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -207,6 +236,13 @@ export default function App() {
         `revision=${Emo.modelRevision} repo=${Emo.modelRepo} ` +
         `limit=${Emo.defaultLimit} tones=${Emo.skinTones.join('/')}` +
         `${Emo.unsupportedReason ? ` reason=${Emo.unsupportedReason}` : ''}`
+    );
+    console.log(
+      `[gist] isSupported=${Gist.isSupported} nativeCore=${Gist.nativeCoreVersion} ` +
+        `revision=${Gist.modelRevision} repo=${Gist.modelRepo} ` +
+        `topK=${Gist.defaultTopK} variants=${Gist.variants.join('/')} ` +
+        `default=${Gist.defaultVariant} rollup=${JSON.stringify(Gist.defaultRollupOptions)}` +
+        `${Gist.unsupportedReason ? ` reason=${Gist.unsupportedReason}` : ''}`
     );
   }, []);
 
@@ -260,28 +296,33 @@ export default function App() {
         }
       }
 
+      // Each model below is skipped on its own rather than with a bare `return`,
+      // which the earlier shape used and which turned out to be a bug: `Tongue`
+      // is unsupported on iOS today (its upstream product is not exported), so a
+      // `return` there took the Voz, Clips and Gist probes down with it and none
+      // of the three ever logged whether its weights were on the device.
+      // `cancelled` still ends the whole sequence, because that means the screen
+      // is gone.
+      if (cancelled) return;
+
       // Uhm is ~45 MB, so it loads on mount like Clear rather than behind a tap.
       // It is the fourth model and the only one that needs nothing from the other
       // three: give it audio and it answers.
-      if (cancelled || !Uhm.isSupported) return;
-      void prepareUhm(false);
+      if (Uhm.isSupported) void prepareUhm(false);
 
       // Emo is ~5 MB, the smallest model here by an order of magnitude, so it
       // loads on mount with less to justify than any of the others.
-      if (cancelled || !Emo.isSupported) return;
-      void prepareEmo();
+      if (Emo.isSupported) void prepareEmo();
 
       // Ear is ~9 MB. It loads on mount for the same reason Clear does, and for
       // one more: it is the step that runs *before* the transcriber, so a
       // recording that finishes before it is ready has nothing to route on.
-      if (cancelled || !Ear.isSupported) return;
-      void prepareEar();
+      if (Ear.isSupported) void prepareEar();
 
       // Tongue is 2 MB, and unlike every other model here those 2 MB are already
       // on the device -- they are inside the app binary. "Preparing" it is a file
       // read, so there is nothing to justify and nothing to ask permission for.
-      if (cancelled || !Tongue.isSupported) return;
-      void prepareTongue();
+      if (Tongue.isSupported) void prepareTongue();
 
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
@@ -302,6 +343,20 @@ export default function App() {
       if (clipsDownloaded && !cancelled) {
         void prepareClips(false);
       }
+
+      // Gist is ~74 MB for the default build, so it follows Voz and Clips rather
+      // than Emo, Ear and Tongue: ask whether it is already here, and otherwise
+      // leave it for an explicit tap. `create()` touches no network, so asking
+      // costs nothing -- and the answer is per variant, because each one caches
+      // its own slice of the repo.
+      if (cancelled || !Gist.isSupported) return;
+      const gistProbe = Gist.create({ variant: gistVariant });
+      const gistDownloaded = gistProbe.isDownloaded();
+      gistProbe.release();
+      console.log(`[gist] isDownloaded=${gistDownloaded} variant=${gistVariant}`);
+      if (gistDownloaded && !cancelled) {
+        void prepareGist(false);
+      }
     })();
 
     return () => {
@@ -320,6 +375,8 @@ export default function App() {
       ear.current = null;
       tongue.current?.release();
       tongue.current = null;
+      gist.current?.release();
+      gist.current = null;
     };
   }, []);
 
@@ -496,6 +553,131 @@ export default function App() {
       console.log(`[tongue] prepare FAILED: ${describe(e)}`);
       setError(describe(e));
       setTongueState('absent');
+    }
+  }, []);
+
+  /**
+   * Get Gist ready: ~74 MB for the multilingual build, ~15 MB for the English
+   * one, then a session build in a second or two.
+   *
+   * The only model here whose *download* is the expensive part and whose
+   * inference is not -- it is a static embedding table plus one MLP head, so the
+   * bytes are the cost and the forward pass is milliseconds. That is why this
+   * follows Voz and Clips behind a tap rather than Emo and Ear on mount, and why
+   * the button names the size.
+   */
+  const prepareGist = useCallback(async (announce = true, variant = gistVariant) => {
+    if (gist.current) return;
+    setError(null);
+    setGistState('loading');
+    if (announce) setBusy('Preparing Gist');
+    try {
+      const t0 = Date.now();
+      const model = await Gist.load({
+        variant,
+        onProgress: (event) => {
+          if (announce) setProgress(event);
+          if (event.fraction >= 1) console.log(`[gist] ${event.phase} complete`);
+        },
+      });
+      gist.current = model;
+      setGistState('ready');
+      console.log(
+        `[gist] ready in ${Date.now() - t0}ms variant=${model.variant} ` +
+          `downloaded=${model.isDownloaded()}`
+      );
+    } catch (e) {
+      console.log(`[gist] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setGistState('absent');
+    } finally {
+      if (announce) {
+        setBusy(null);
+        setProgress(null);
+      }
+    }
+  }, [gistVariant]);
+
+  /**
+   * Tag whatever is in the Gist field.
+   *
+   * Debounced at 150 ms like Emo's rather than called per keystroke like
+   * Tongue's. Tongue is synchronous and tens of microseconds; this is a promise
+   * over a forward pass, so the timer is worth its own latency -- and the number
+   * printed beside the result is the evidence either way.
+   *
+   * Blank input is an answer rather than an error and never reaches the weights,
+   * which is why this does not guard on it: `classify('')` comes back with no
+   * topics without loading anything.
+   */
+  const runTag = useCallback(async (text: string) => {
+    const model = gist.current;
+    if (!model) return;
+    if (text.trim().length === 0) {
+      setTagged(null);
+      setGistMs(null);
+      return;
+    }
+    try {
+      const t0 = Date.now();
+      const result = await model.classify(text, { topK: 5 });
+      setGistMs(Date.now() - t0);
+      setTagged(result);
+    } catch (e) {
+      console.log(`[gist] classify FAILED: ${describe(e)}`);
+      setError(describe(e));
+      // The same Fast Refresh hazard Emo and Tongue hit, for the same reason:
+      // this is the third model called from a timer rather than from a tap, so
+      // it is the third that can outlive its native half during development.
+      gist.current?.release();
+      gist.current = null;
+      void prepareGist(false);
+    }
+  }, [prepareGist]);
+
+  // Debounce the field into `runTag`. The cleanup cancels the pending timer on
+  // every keystroke, so only the last one in a burst reaches the model.
+  useEffect(() => {
+    if (gistState !== 'ready') return;
+    const timer = setTimeout(() => void runTag(topic), 150);
+    return () => clearTimeout(timer);
+  }, [topic, gistState, runTag]);
+
+  /**
+   * What the whole sample transcript is about.
+   *
+   * The join with Clips, on the same twelve lines: Clips ranks which moments are
+   * worth cutting, Gist says what the thing is *about*. One line at a time
+   * through `scores` -- the full distribution rather than the top three, because
+   * the roll-up wants every topic's mass -- and then one call to `channelTopics`,
+   * which runs no model at all.
+   *
+   * `channelTopics` is the only call in this app that needs neither weights nor a
+   * handle: it is pure arithmetic, bound from upstream rather than ported, and it
+   * would answer on a device that had never downloaded anything.
+   */
+  const runAbout = useCallback(async () => {
+    const model = gist.current;
+    if (!model) return;
+    setError(null);
+    setBusy('Reading the transcript');
+    try {
+      const t0 = Date.now();
+      const posts = [];
+      for (const line of SAMPLE_TRANSCRIPT) {
+        posts.push({ topics: (await model.scores(line)).scores });
+      }
+      const rolled = channelTopics(posts);
+      setAbout(rolled);
+      console.log(
+        `[gist] ${posts.length} lines scored in ${Date.now() - t0}ms -> ` +
+          rolled.map((t) => `${t.slug} ${(t.share * 100).toFixed(0)}% x${t.postCount}`).join(', ')
+      );
+    } catch (e) {
+      console.log(`[gist] channelTopics FAILED: ${describe(e)}`);
+      setError(describe(e));
+    } finally {
+      setBusy(null);
     }
   }, []);
 
@@ -1339,6 +1521,198 @@ export default function App() {
       failures.push(`tongue: ${describe(e)}`);
     }
 
+    // --- Gist. The other text model, and the one that answers a different
+    //     question about the same string Tongue just read: not what language it
+    //     is in, but what it is about.
+    //
+    //     Nothing here asserts a taxonomy slug. The 36 topics come down with the
+    //     weights and are free to be renamed or retuned at the next revision, so
+    //     an answer key written here would be a fixture of this package's
+    //     opinion rather than of the model's behaviour. What is asserted is the
+    //     shape -- ranked, bounded, unique, capped, named -- plus the one
+    //     semantic claim that does not depend on any particular slug: the same
+    //     subject in three languages should land on the same topic, which is the
+    //     multilingual claim and not something a keyword table could fake.
+    try {
+      const tagger = gist.current;
+      if (!tagger) {
+        console.log('[gist] self-test skipped — model not prepared (~74 MB, tap to load)');
+      } else {
+        const t0 = Date.now();
+        const tagging = await tagger.classify(GIST_SAMPLES[0]!.text);
+        console.log(
+          `[gist] classify ok in ${Date.now() - t0}ms — ${tagging.topics.length} topics, ` +
+            `variant=${tagging.variant} revision=${tagging.modelRevision} ` +
+            `native=${(tagging.processingSec * 1000).toFixed(1)}ms`
+        );
+        console.log(
+          `[gist]   "${GIST_SAMPLES[0]!.text}" -> ` +
+            tagging.topics.map((t) => `${t.slug} ${t.score.toFixed(3)}`).join(', ')
+        );
+
+        // The invariants: ranked, bounded, capped at topK, no slug twice, and
+        // every topic carrying the display name that comes out of taxonomy.json
+        // rather than a slug this package retyped.
+        const ranked = tagging.topics.every(
+          (t, i) => i === 0 || t.score <= tagging.topics[i - 1]!.score
+        );
+        const bounded = tagging.topics.every((t) => t.score >= 0 && t.score <= 1);
+        const unique = new Set(tagging.topics.map((t) => t.slug)).size === tagging.topics.length;
+        const named = tagging.topics.every((t) => t.name.length > 0 && t.name !== t.slug);
+        const capped = tagging.topics.length <= Gist.defaultTopK;
+        const headAgrees = tagging.topic?.slug === (tagging.topics[0]?.slug ?? undefined);
+        if (!ranked) failures.push('gist: topics are not in descending order');
+        if (!bounded) failures.push('gist: a score is outside 0..1');
+        if (!unique) failures.push('gist: the same slug came back twice');
+        if (!named) failures.push('gist: a topic has no display name');
+        if (!capped) failures.push(`gist: ${tagging.topics.length} topics for topK ${Gist.defaultTopK}`);
+        if (!headAgrees) failures.push('gist: topic disagrees with topics[0]');
+        console.log(
+          `[gist] ranked=${ranked} bounded=${bounded} unique=${unique} named=${named} ` +
+            `capped=${capped} headAgrees=${headAgrees} threshold=${tagging.threshold}`
+        );
+
+        // One subject, four languages. The claim is 101 languages from one model
+        // with no language setting to pass in, so the interesting output is
+        // whether the top topic survives translation.
+        const multilingual: string[] = [];
+        for (const sample of GIST_SAMPLES) {
+          const one = await tagger.classify(sample.text);
+          multilingual.push(one.topic?.slug ?? 'none');
+          console.log(
+            `[gist]   ${sample.code} "${sample.text}" -> ` +
+              one.topics.map((t) => `${t.slug} ${t.score.toFixed(3)}`).join(', ')
+          );
+        }
+        const agreed = new Set(multilingual).size;
+        console.log(
+          `[gist] one subject in ${GIST_SAMPLES.length} languages -> ` +
+            `${multilingual.join('/')} (${agreed} distinct top topic${agreed === 1 ? '' : 's'})`
+        );
+        if (agreed > 2) {
+          failures.push(`gist: four translations of one sentence gave ${agreed} different topics`);
+        }
+
+        // topK caps without changing the winner, and a threshold of 1 leaves
+        // exactly the one topic upstream always returns.
+        const one_ = await tagger.classify(GIST_SAMPLES[0]!.text, { topK: 1 });
+        const many = await tagger.classify(GIST_SAMPLES[0]!.text, { topK: 10 });
+        const strict = await tagger.classify(GIST_SAMPLES[0]!.text, { threshold: 1 });
+        console.log(
+          `[gist] topK 1 -> ${one_.topics.length}, topK 10 -> ${many.topics.length}, ` +
+            `threshold 1 -> ${strict.topics.length} (upstream always returns the top one); ` +
+            `winner ${one_.topic?.slug}/${many.topic?.slug}/${strict.topic?.slug}`
+        );
+        if (one_.topics.length !== 1) failures.push('gist: topK=1 returned more than one');
+        if (one_.topic?.slug !== many.topic?.slug) failures.push('gist: topK changed the winner');
+        if (strict.topics.length !== 1) {
+          failures.push(`gist: threshold 1 returned ${strict.topics.length} topics`);
+        }
+        if (strict.threshold !== 1) failures.push('gist: an explicit threshold was not echoed back');
+
+        // Blank input is an answer, not an error -- and it never reaches the
+        // model. The two upstream SDKs disagree here; this is the side taken.
+        const blank = await tagger.classify('   ');
+        console.log(
+          `[gist] blank input -> ${blank.topics.length} topics, topic=${blank.topic} ` +
+            '(Kotlin returns none; Swift upstream would name one)'
+        );
+        if (blank.topics.length !== 0) failures.push('gist: blank input produced a topic');
+
+        // The full distribution, which is what a roll-up eats.
+        const distribution = await tagger.scores(GIST_SAMPLES[0]!.text);
+        const slugs = Object.keys(distribution.scores);
+        const inRange = Object.values(distribution.scores).every((v) => v >= 0 && v <= 1);
+        const superset = tagging.topics.every((t) => slugs.includes(t.slug));
+        console.log(
+          `[gist] scores -> ${slugs.length} topics, inRange=${inRange} ` +
+            `coversClassify=${superset} native=${(distribution.processingSec * 1000).toFixed(1)}ms`
+        );
+        if (slugs.length < 30) failures.push(`gist: scores returned ${slugs.length}, expected 36`);
+        if (!inRange) failures.push('gist: a score is outside 0..1');
+        if (!superset) failures.push('gist: classify named a topic scores does not have');
+
+        // The argument guards, which never reach native.
+        for (const bad of [0, -1, 1.5]) {
+          try {
+            await tagger.classify('a', { topK: bad });
+            failures.push(`gist: topK=${bad} was accepted`);
+          } catch (e) {
+            if (!(e instanceof DesertAntError) || e.code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`gist: topK=${bad} raised ${describe(e)}`);
+            }
+          }
+        }
+        for (const bad of [-0.1, 1.1]) {
+          try {
+            await tagger.classify('a', { threshold: bad });
+            failures.push(`gist: threshold=${bad} was accepted`);
+          } catch (e) {
+            if (!(e instanceof DesertAntError) || e.code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`gist: threshold=${bad} raised ${describe(e)}`);
+            }
+          }
+        }
+        console.log('[gist] rejected topK 0/-1/1.5 and threshold -0.1/1.1 with ERR_INVALID_ARGUMENT');
+
+        // The variant asymmetry: two builds on iOS, one on Android, read off the
+        // binary. Asking for a build this platform does not have is refused
+        // before anything downloads.
+        console.log(`[gist] variants here: ${Gist.variants.join('/')} (iOS 2, Android 1)`);
+        if (!Gist.variants.includes('english')) {
+          try {
+            Gist.create({ variant: 'english' });
+            failures.push('gist: the english variant was created on a platform without it');
+          } catch (e) {
+            const code = e instanceof DesertAntError ? e.code : 'not a DesertAntError';
+            console.log(`[gist] english variant -> ${code} (expected off iOS)`);
+            if (code !== 'ERR_UNSUPPORTED_PLATFORM') {
+              failures.push(`gist: the english refusal raised ${code}`);
+            }
+          }
+        }
+
+        // And the join, on the twelve lines Clips ranks: twelve distributions
+        // rolled up into what the whole thing is about, by a function that runs
+        // no model at all.
+        const t1 = Date.now();
+        const posts = [];
+        for (const line of SAMPLE_TRANSCRIPT) {
+          posts.push({ topics: (await tagger.scores(line)).scores });
+        }
+        const rolled = channelTopics(posts);
+        console.log(
+          `[gist] channelTopics over ${posts.length} transcript lines in ${Date.now() - t1}ms -> ` +
+            rolled.map((t) => `${t.slug} ${(t.share * 100).toFixed(1)}% x${t.postCount}`).join(', ')
+        );
+        const shareRanked = rolled.every((t, i) => i === 0 || t.share <= rolled[i - 1]!.share);
+        const shareTotal = rolled.reduce((sum, t) => sum + t.share, 0);
+        const withinTopN = rolled.length <= Gist.defaultRollupOptions.topN;
+        const aboveFloor = rolled.every((t) => t.share >= Gist.defaultRollupOptions.floor);
+        const counted = rolled.every((t) => t.postCount >= 0 && t.postCount <= posts.length);
+        console.log(
+          `[gist] rollup ranked=${shareRanked} withinTopN=${withinTopN} aboveFloor=${aboveFloor} ` +
+            `postCountsSane=${counted} sumOfShares=${shareTotal.toFixed(3)} (<=1)`
+        );
+        if (!shareRanked) failures.push('gist: channel topics are not in descending share order');
+        if (!withinTopN) failures.push(`gist: rollup returned ${rolled.length} over topN`);
+        if (!aboveFloor) failures.push('gist: a channel topic is below the share floor');
+        if (!counted) failures.push('gist: a channel topic counts more posts than there are');
+        if (shareTotal > 1.0001) failures.push(`gist: shares sum to ${shareTotal}`);
+
+        // minPosts: two posts do not describe a channel, and upstream says so by
+        // returning nothing rather than by being confident about two.
+        const tooFew = channelTopics(posts.slice(0, 2));
+        console.log(`[gist] two posts -> ${tooFew.length} channel topics (expected 0)`);
+        if (tooFew.length !== 0) failures.push(`gist: two posts gave ${tooFew.length} topics`);
+
+        setAbout(rolled);
+      }
+    } catch (e) {
+      console.log(`[gist] self-test FAILED: ${describe(e)}`);
+      failures.push(`gist: ${describe(e)}`);
+    }
+
     // --- Uhm. The only model here that is loaded by the time a self-test can run
     //     without anyone tapping anything, so this leg is the one that always has
     //     something to say.
@@ -1627,7 +2001,7 @@ export default function App() {
       <Text style={styles.subtitle}>
         Clear cleans it, Ear names the language, Voz reads it, Clips cuts it, Uhm finds
         the ums — and Tongue names the language again, from the words rather than the
-        sound
+        sound, while Gist says what those words are about
       </Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -2249,6 +2623,178 @@ export default function App() {
           </>
         ) : null}
       </View>
+
+      <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Gist</Text>
+
+        {gistState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Gist.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {gistState === 'absent' ? (
+          <>
+            <Text style={styles.note}>
+              Type a headline and Gist names what it is about, from a fixed
+              36-topic taxonomy, in 101 languages with no language setting to pass
+              in. The multilingual build is about 74 MB — the download is the
+              expensive part of this model, not the inference — so it waits for a
+              tap rather than arriving on mount.
+            </Text>
+            {/* Read off the native binary, not off Platform.OS: two builds on
+                iOS, one on Android, because the Kotlin constructor takes no
+                variant. Locked once a model is loaded — a variant selects which
+                files get downloaded, so switching means another download. */}
+            {Gist.variants.length > 1 ? (
+              <View style={styles.phrases}>
+                {Gist.variants.map((option) => (
+                  <Pressable
+                    key={option}
+                    onPress={() => setGistVariant(option)}
+                    style={({ pressed }) => [
+                      styles.phrase,
+                      option === gistVariant && styles.phraseSelected,
+                      pressed && styles.buttonPressed,
+                    ]}>
+                    <Text
+                      style={[
+                        styles.phraseText,
+                        option === gistVariant && styles.phraseTextSelected,
+                      ]}>
+                      {option === 'english' ? 'english (~15 MB)' : 'multilingual (~74 MB)'}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
+            ) : null}
+            <Button
+              label={gistVariant === 'english' ? 'Prepare Gist (~15 MB)' : 'Prepare Gist (~74 MB)'}
+              onPress={() => void prepareGist()}
+              disabled={busy !== null}
+              tone="ghost"
+            />
+          </>
+        ) : null}
+
+        {gistState === 'loading' ? (
+          <Text style={styles.note}>
+            Preparing — about {gistVariant === 'english' ? '15' : '74'} MB if it is
+            not already here.
+          </Text>
+        ) : null}
+
+        {gistState === 'ready' ? (
+          <>
+            <Text style={styles.note}>
+              Multi-label, so two or three topics is the ordinary answer rather
+              than a tie. The top topic always comes back even when nothing clears
+              the model’s threshold — a text always has a nearest topic, and the
+              score is what says how near.
+            </Text>
+            <TextInput
+              value={topic}
+              onChangeText={setTopic}
+              placeholder="How to start a podcast with just your iPhone"
+              autoCorrect={false}
+              autoCapitalize="none"
+              style={styles.input}
+            />
+            {/* One subject in four languages, then two that are not about
+                podcasting at all. The first four are the 101-language claim
+                made tappable: no language is passed in, so the top topic
+                surviving translation is the model rather than a keyword table. */}
+            <View style={styles.phrases}>
+              {GIST_PHRASES.map((sample) => (
+                <Pressable
+                  key={sample}
+                  onPress={() => setTopic(sample)}
+                  style={({ pressed }) => [styles.phrase, pressed && styles.buttonPressed]}>
+                  <Text style={styles.phraseText}>{sample}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </>
+        ) : null}
+
+        {tagged ? (
+          <>
+            <Row label="Topics" value={`${tagged.topics.length}`} />
+            <Row label="Latency" value={gistMs === null ? '—' : `${gistMs} ms`} />
+            <Row
+              label="Model"
+              value={`${tagged.variant} ${tagged.modelRevision ?? ''}`.trim()}
+            />
+            {tagged.topics.length === 0 ? (
+              <Text style={styles.note}>
+                Nothing to read — blank input is an answer here rather than an
+                error, and it never reaches the weights.
+              </Text>
+            ) : (
+              <View style={styles.words}>
+                {tagged.topics.map((entry, index) => (
+                  <View key={`${index}-${entry.slug}`} style={styles.filler}>
+                    <Text style={styles.wordText}>{entry.name}</Text>
+                    <Text style={styles.wordTime}>{entry.score.toFixed(3)}</Text>
+                  </View>
+                ))}
+              </View>
+            )}
+            {tagged.topics.length === 1 ? (
+              <Text style={styles.note}>
+                One topic, so this may be the nearest topic rather than a
+                confident one — the top one is returned either way. Two or more
+                would mean every one of them cleared the threshold.
+              </Text>
+            ) : null}
+          </>
+        ) : null}
+
+        {/* The join with Clips, on the same twelve lines: one model ranks the
+            moments worth cutting, the other says what the thing is about. The
+            roll-up itself runs no model — it is pure arithmetic, bound from
+            upstream rather than reimplemented here. */}
+        {gistState === 'ready' ? (
+          <>
+            <Text style={styles.sectionTitle}>What the sample transcript is about</Text>
+            <Text style={styles.note}>
+              Twelve lines, one distribution each, rolled up into channel-level
+              topics. Clips ranks which of these lines are worth cutting; this
+              says what they are collectively about, which is the other half of
+              describing a piece of content.
+            </Text>
+            <Button
+              label="Read the transcript"
+              onPress={() => void runAbout()}
+              disabled={busy !== null}
+              tone="ghost"
+            />
+          </>
+        ) : null}
+
+        {about ? (
+          about.length === 0 ? (
+            <Text style={styles.note}>
+              Nothing cleared the share floor, or there were fewer than{' '}
+              {Gist.defaultRollupOptions.minPosts} posts — which is upstream
+              declining to describe a channel from too little rather than being
+              confident about it.
+            </Text>
+          ) : (
+            <View style={styles.words}>
+              {about.map((entry, index) => (
+                <View key={`${index}-${entry.slug}`} style={styles.filler}>
+                  <Text style={styles.wordText}>{entry.slug}</Text>
+                  <Text style={styles.wordTime}>
+                    {(entry.share * 100).toFixed(0)}% · {entry.postCount} line
+                    {entry.postCount === 1 ? '' : 's'}
+                  </Text>
+                </View>
+              ))}
+            </View>
+          )
+        ) : null}
+      </View>
     </ScrollView>
   );
 }
@@ -2317,6 +2863,41 @@ const TONGUE_PHRASES = [
   '안녕하세요',
   'που είναι ο σταθμός',
   'これをください',
+];
+
+/**
+ * One subject in four languages, for the Gist self-test.
+ *
+ * Not an answer key -- the 36 taxonomy slugs come down with the weights and are
+ * upstream's to rename, so hardcoding one here would be testing this package's
+ * memory rather than the model. The assertion is agreement *between* these four:
+ * no language is ever passed in, so a top topic that survives translation is the
+ * 101-language claim, and a keyword table could not fake it.
+ *
+ * Four rather than two because two agreeing is a coin flip, and the leg allows at
+ * most two distinct answers across the four -- multi-label scoring genuinely can
+ * put "starting a podcast" between technology and the creator economy depending
+ * on the phrasing, and failing the run for that would be asserting a taxonomy.
+ */
+const GIST_SAMPLES = [
+  { code: 'en', text: 'How to start a podcast with just your iPhone' },
+  { code: 'es', text: 'Cómo empezar un podcast solo con tu iPhone' },
+  { code: 'de', text: 'Wie du nur mit deinem iPhone einen Podcast startest' },
+  { code: 'ja', text: 'iPhoneだけでポッドキャストを始める方法' },
+] as const;
+
+/**
+ * The buttons under the Gist field: the four translations above, then two that
+ * are about something else entirely.
+ *
+ * The last two are there so the row is not all one topic -- a tagger that
+ * answered "technology" to everything would look perfect against the first four
+ * alone.
+ */
+const GIST_PHRASES = [
+  ...GIST_SAMPLES.map((sample) => sample.text),
+  'Why our index fund beat the hedge fund over ten years',
+  'The best one-pan salmon recipe for a weeknight',
 ];
 
 /**
