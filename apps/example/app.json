@@ -29,7 +29,8 @@
       "@desert-ant-labs/react-native-emo",
       "@desert-ant-labs/react-native-ear",
       "@desert-ant-labs/react-native-tongue",
-      "@desert-ant-labs/react-native-gist"
+      "@desert-ant-labs/react-native-gist",
+      "@desert-ant-labs/react-native-redact"
     ],
     "scheme": "clearexample"
   }

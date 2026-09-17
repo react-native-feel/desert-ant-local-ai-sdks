@@ -1,0 +1,12 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+  <!-- The weights are fetched from Hugging Face on first use -- ~25 MB for the
+       LiteRT export, which is twice the Apple one and still among the smaller
+       downloads here. Everything else is on-device; no storage permission is
+       needed because the SDK only ever reads paths the app already owns, and
+       Redact's input is a string rather than a file.
+
+       Worth saying out loud for this model in particular: the INTERNET
+       permission is for the one-time model download and nothing else. No text
+       given to `redaction` ever leaves the process. -->
+  <uses-permission android:name="android.permission.INTERNET" />
+</manifest>

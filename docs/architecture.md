@@ -642,6 +642,171 @@ whole thing is about — the two halves of describing a piece of content, from t
 same twelve lines, with one model that needs no audio and another that needs no
 weights for its roll-up.
 
+## What Desert Ant ships for Redact (v3.1.0)
+
+| Platform | Form | Notes |
+| --- | --- | --- |
+| Swift | SPM product `Redact` in `desert-ant-core` | A ~12 MB `redact.mlmodelc` plus two sidecars: `redact_tokenizer.bin` (a compact SentencePiece vocab) and `labels.json` (the BIOES id → label map). No `@available` and no `osFloor`, so its floor is the package's `iOS 17`. |
+| Kotlin | `ai.desertant:redact:3.1.0` on Maven Central | Plain AAR; `ai.desertant:core` comes transitively. `redact.tflite` is ~25 MB — twice the Apple export, same model, same revision. |
+| JavaScript | `@desert-ant-labs/redact` | LiteRT.js in the browser, a prebuilt native core in Node. **Neither is usable from React Native.** |
+
+Fifth model with both halves, after Clear, Emo, Ear and Gist, so `isSupported`
+means what it means for those four: off Apple it is a statement about the
+*device*, not the catalog. `ai.desertant:redact` binds the shared native core
+through JNI and `RedactNative.ensureLoaded()` loads `libRedactAndroid.so`, LiteRT
+ships `arm64-v8a` and `x86_64`, and `unsupportedReason` is computed natively
+because only the Android half knows which ABIs the device reported.
+
+It is the only model in this family that is **two detectors rather than one**, and
+that shows up in the API in a way none of the others do. `Sources/Redact/Model.swift`
+runs a six-layer multilingual BIOES token classifier (XLM-R lineage, ~23 M
+parameters, a fixed 256-token window with stride 64) over the text. In front of it,
+`Deterministic.swift` is a pure-stdlib layer of regexes and real checksums — Luhn,
+ISO-13616 IBAN, ISO-7064, per-country national IDs — that **owns** twelve
+structured labels outright:
+
+```swift
+static let owned: Set<String> = [
+    "EMAIL", "URL", "IP_ADDRESS", "CREDIT_CARD", "SSN",
+    "BANK_ACCOUNT", "ROUTING_NUMBER", "TAX_ID", "GOVERNMENT_ID", "PASSPORT",
+    "DRIVERS_LICENSE", "IMEI",
+]
+```
+
+Those spans are reported at confidence exactly `1.0` and are not scored by the
+model at all, so `minimumConfidence` — which is the only knob upstream exposes —
+trims names, cities and streets and cannot touch a card or an IBAN. The types say
+so, because the alternative is a caller raising the threshold to be safer and
+being surprised by which half moved.
+
+The obvious next step from that — "so `confidence === 1` tells me it was
+checksum-validated" — is **wrong**, and the simulator disproved it in one tap. A
+confident neural `GIVEN_NAME` comes back at exactly `1.0` too: a saturated softmax
+rounds there in a `Double` once the runner-up logit is ~40 below, and several of
+upstream's address post-processing stages (`attachBuildingNumbers`,
+`attachStateCodes`, `redactSecondaryAddress`) construct their spans through
+`Span(start, end, label)`, whose `score` parameter defaults to `1.0`. So the
+implication runs one way only: deterministic ⇒ 1.0, never 1.0 ⇒ deterministic.
+The **label** is what says how a detection was found.
+
+Which raises the question of whether this package should export the owned set so
+a caller can branch on it, and the answer is no, for Ear's and Gist's reason:
+`Deterministic.owned` is `internal` upstream on both platforms, and a copy here
+would be right until the next revision moved one label across the line and then
+quietly wrong. `RedactionItem.confidence` says all of this in the types instead.
+
+### The result is reversible, and that is the whole product
+
+Every other text model here answers a question. This one performs a
+*transformation* that has to be undoable: mask the text, send the masked text
+somewhere it should not see personal data, put the originals back into what comes
+out. Upstream models that as a `Redaction` struct with a `restore(_:)` method on
+both platforms, with bracket-delimited numbered placeholders (`[EMAIL_1]`,
+`[EMAIL_2]`, …) chosen so that no placeholder is a prefix of another and
+restoration is order-independent.
+
+A struct with a method does not cross the bridge, so `restore` is a **free
+function** here, and it is **ported rather than bound** — the opposite of the call
+this repo made for Gist's `channelTopics`, on purpose. `channelTopics` is
+probability arithmetic over a few hundred numbers where a third implementation
+could differ subtly and nothing would flag it. `restore` is a loop over
+`String.replacing(_:with:)` in Swift and `String.replace` in Kotlin, both of which
+replace every literal occurrence: one behaviour, four lines, no judgement.
+Porting it buys something real, too — the call needs no model, no handle, and no
+trip back across the bridge carrying the personal data that was just brought over
+it.
+
+### Offsets, because `Range<String.Index>` is not a wire type
+
+`Redaction.Item.range` is a `Range<String.Index>` in Swift and cannot be encoded.
+Upstream's own FFI binding already answers this: `Binding.swift` writes
+`item.range.lowerBound.utf16Offset(in: text)` and the upper bound as two `u32`s,
+and `ai.desertant:redact`'s `RedactionItem` carries `start` and `end` directly. So
+this package reports the same two numbers rather than inventing a third
+representation, and because UTF-16 code units are exactly what
+`String.prototype.slice` indexes, `text.slice(item.start, item.end) === item.original`
+holds in JavaScript with no conversion anywhere.
+
+### A typo is refused, because upstream's binding drops it
+
+`Options.labels` narrows what gets redacted. Upstream's cross-language binding
+resolves the names with `Set(names.compactMap(Label.init(rawValue:)))`, which
+**drops** a name it does not recognise. That is the wrong failure for this
+option in two directions at once: one misspelled label silently widens the
+redaction past what the caller asked for, and a set of nothing but misspellings
+produces an empty set, which redacts *nothing*. Neither is visible from the
+result.
+
+So all three layers refuse. TypeScript validates against `Redact.labels`, which is
+read off the binary; the Apple half throws `InvalidLabelException`; the Kotlin half
+checks `Labels.ALL`. `labels: []` is refused too, so the empty array has exactly
+one meaning on the wire — "use the model's default set" — rather than two.
+`minimumConfidence` outside `0..1` is refused for the same reason, where upstream
+would quietly clamp it: a clamped threshold is a redaction policy that is not the
+one that was asked for.
+
+### Blank input: no disagreement to settle, so a decision instead
+
+Gist's blank-input guard exists because the two upstream SDKs disagreed and one
+side had to be picked. Here neither guards it, so returning the text unchanged
+with no items and without loading the model is straightforwardly this package's
+decision, taken on both platforms together.
+
+It is a safe one — the deterministic recognizers match nothing in whitespace and
+the tagger has no token to label, so the answer is provably the input — and it
+buys the thing this model is actually used for: a text field wired straight to
+`redaction` costs nothing while it is empty, on a device that has never downloaded
+the weights.
+
+### Display names are Swift-only, so the map is the API
+
+`Label.displayName` turns `IP_ADDRESS` into "IP address" and exists only in Swift;
+`ai.desertant:redact`'s whole `Labels` object is two sets of bare strings. This is
+the same shape as Gist's `english` variant and Ear's `supportedLanguages`, and it
+gets the same treatment: `Redact.labelDisplayNames` is read off the binary and is
+all 22 entries on iOS and empty on Android, so a UI gates on the map rather than
+on `Platform.OS`, and `Redact.displayName` refuses with
+`ERR_UNSUPPORTED_PLATFORM` where there are none.
+
+Deriving one from the slug was the alternative and is worse than absent.
+Title-casing produces "Drivers License", "Imei", "Ssn", "Org" and "Ip Address"
+where upstream says "Driver's license", "IMEI", "SSN", "Organisation" and "IP
+address" — and a wrong display name is invisible in exactly the place it matters,
+which is a privacy UI telling someone what was masked.
+
+### SwiftUI also has a `Label`
+
+Redact's category enum is spelled `Label`. So is SwiftUI's view, and any file
+importing `ExpoModulesCore` gets SwiftUI transitively through its `ExpoSwiftUI`
+sources, so the bare name does not compile:
+
+```
+error: 'Label' is ambiguous for type lookup in this context
+note: found this candidate (Sources/Redact/Label.swift:5:13)
+note: found this candidate (SwiftUI.Label:2:15)
+```
+
+`Redact.Label` is not the fix. The module is named `Redact` and so is the class
+inside it, so a module-qualified spelling resolves to the class and then fails to
+find a member type on it — the same collision Gist's `channelTopics` hit from the
+other direction, where a `@JS` member shadowed a free function of the same name
+and needed a file-scope hop to reach it. Here the answer is
+`ios/RedactLabel.swift`: one `typealias PIILabel = Label` in a file whose import
+list is exactly `import Redact`, where there is no SwiftUI in scope to be
+ambiguous with.
+
+### Where Redact sits next to the others
+
+At the **end** of the chain rather than beside it, and it is the first model here
+that is about what happens to content *after* the others are done with it. Clear
+cleans a recording, Ear names its language, Voz turns it into a transcript, Clips
+ranks the moments and Gist says what it is about — and a transcript is exactly the
+artifact an app then forwards to a summarizer, writes to a log, or attaches to a
+support ticket. Redact is the step that takes the people out of it first.
+
+That makes the Voz join the honest one to build, and the example app builds it:
+whatever the microphone heard, masked before it can go anywhere.
+
 ## Is Expo Modules 2.0 real, and is it enough?
 
 Real, and iOS-only. In `expo-modules-core@57.0.17` — current stable —
@@ -1280,6 +1445,103 @@ calls plus five native `channelTopics`** through the example app with no other
 model touched, and the process stayed up. Evidence for the split shape, not proof
 of it — a race that did not fire is not a race that cannot.
 
+### Redact, end to end
+
+Driven on an iOS 26 simulator (iPhone 17 Pro Max) with a dev build, as the
+**ninth** pod in an app that already carried eight.
+
+The module binds and every `@JS` property reads before anything touches a model,
+including the two that are not scalars:
+
+```
+[redact] isSupported=true nativeCore=3.1.0 revision=v0.4.0 repo=desert-ant-labs/redact
+         minConfidence=0.6 labels=22 default=21 displayNames=22
+[redact] displayName(IP_ADDRESS)="IP address" displayName(ORG)="Organisation"
+```
+
+`labels` is a `[String]` off a property getter and `labelDisplayNames` a
+`[String: String]` off another -- both synchronous, both encoded on the JavaScript
+thread by construction, which is the shape Gist established and the one this
+package was written to from the start. The two display names are the pair that
+proves they are read rather than derived: no title-casing of a slug produces
+"IP address" or "Organisation".
+
+**Loading** cost **49.9 s** cold (~12 MB plus the Core ML session build) and
+**39.3-46.7 s** on three later launches with the weights already on disk -- every
+one of those measured while Emo, Ear and Uhm were building their own sessions on
+the same mount, so they are an upper bound under contention rather than a
+session-build figure.
+
+**One sentence of nothing but contact details**, which is the case this model
+exists for:
+
+```
+in   Email Anna Kovács at anna.kovacs@example.com or call +36 1 234 5678; her card is 4111 1111 1111 1111.
+out  Email [GIVEN_NAME_1] [SURNAME_1] at [EMAIL_1] or call [PHONE_1]; her card is [CREDIT_CARD_1].
+
+GIVEN_NAME   "Anna"                     1.000  @6..10
+SURNAME      "Kovács"                   1.000  @11..17
+EMAIL        "anna.kovacs@example.com"  1.000  @21..44
+PHONE        "+36 1 234 5678"           0.920  @53..67
+CREDIT_CARD  "4111 1111 1111 1111"      1.000  @81..100
+```
+
+`restore` returns the input character for character, every sample in every run,
+including the label-narrowed and threshold-raised variants. Items are ordered,
+non-overlapping, uniquely placeheld, present in the output and absent from it as
+originals, and `text.slice(start, end) === original` for all of them.
+
+**Latency** is **620-641 ms** natively for the first redaction after a load and
+**574-584 ms end to end from JavaScript** in steady state over five measurements;
+the 745-character sample transcript takes **464-477 ms**. Unlike the audio models
+there is no warm/cold cliff -- the windowed 256-token pass dominates and is roughly
+linear in length. These are simulator CPU numbers on a six-layer transformer,
+which is the shape where the missing Neural Engine costs most in this family.
+
+**Four of the 27 languages**, one person's details, no language passed in: English
+and Spanish find the same five spans identically; German labels the imperative
+*Schreib* as a `SURNAME` and misses the card; Hungarian finds the inflected dative
+`Annának` correctly and catches only `+36` of the phone number. Recorded rather
+than smoothed over -- upstream's 88.8% / 99.6% is a distribution, not a promise
+about any particular string, and four sentences are four sentences.
+
+**The negative case matters as much**, and both came back untouched: the
+deliberately clean sample sentence (0 items, 576 ms) and the 134-word transcript
+this app also ranks with Clips and tags with Gist (0 items).
+
+**Three consecutive self-test runs ended `[selftest] all prepared models
+passed`**, and `~/Library/Logs/DiagnosticReports` gained no new crash report
+across those three plus a fourth interactive session. Same caveat as Gist's:
+evidence for the `Void`-returning shape, not proof.
+
+#### Two upstream behaviours found by tapping a sample
+
+**A deterministic `IP_ADDRESS` can lose to the address post-processing.** The same
+IP in the same position, two sentences:
+
+```
+"The server at 192.168.1.14 is down; ping bob.smith@acme.co.uk or SSN 123-45-6789."
+  -> "The server at [IP_ADDRESS_1] is down; ping [EMAIL_1] or SSN [SSN_1]."   (3 items, all 1.000)
+
+"The box at 192.168.1.14 logged in from https://example.com."
+  -> "The box at [BUILDING_NUMBER_1].168.1.14 logged in from [URL_1]."        (2 items)
+```
+
+The second masks only the first octet, as a `BUILDING_NUMBER`, and leaves
+`.168.1.14` in the text. It reproduces with and without a trailing IMEI.
+`Pipeline.resolve` drops an ML span that conflicts with a deterministic one on a
+different label, so from the outside this looks like `attachBuildingNumbers` /
+`redactUsStreet` running *after* that resolution rather than before it. There is no
+public API to work around it with, which is the same position Clear's AAC crash
+left this repo in: report it and say so.
+
+**A `Deterministic.owned` label can arrive with a sub-1 score.** That sentence's
+IMEI came back at **0.900**. Together with confident neural spans saturating to
+exactly 1.0, it is why this package asserts nothing about provenance from either
+`confidence` or `label` and why the self-test logs those numbers rather than
+checking them -- an earlier draft of the leg asserted "checksum-owned implies
+1.000" and this is what disproved it.
+
 ## Why not Nitro Modules
 
 Nitro would work. It buys nothing here:
@@ -1347,6 +1609,22 @@ document where the missing capability is a whole *model build*:
 | Blank input | Empty tagging, no load | Empty tagging, no load | Kotlin's own guard; the Apple half was given the same one deliberately — upstream Swift would name a topic with nothing behind it. |
 | Verified | Yes, on a simulator | **No — not even compiled**; no Android SDK on the machine | Every other package here at least builds on Android. |
 
+Redact's is the only table here whose missing capability is cosmetic rather than
+functional — and the only one where a *third* row is a refusal this package adds
+that neither upstream SDK makes:
+
+| | iOS | Android | Why |
+| --- | --- | --- | --- |
+| `labelDisplayNames` | All 22 | `{}` | `Label.displayName` is a Swift computed property; `ai.desertant:redact`'s `Labels` is two sets of bare strings. `Redact.displayName` throws `ERR_UNSUPPORTED_PLATFORM` rather than title-casing a slug. |
+| `ProgressEvent.fraction` | A real fraction | `0` entering a phase, `1` leaving it | Kotlin `Redact.download()` takes no progress handler. |
+| `isSupported` | Always true | False on an ABI LiteRT does not ship | The Core ML export has no device constraint; the LiteRT one has two ABIs and a `libRedactAndroid.so` behind JNI. |
+| Download size | ~12 MB (`redact.mlmodelc`) | ~25 MB (`redact.tflite`) | Two exports of one model at one revision. |
+| `modelRevision` / `modelRepo` | Read from the catalog | Constants in the module | `ai.desertant:redact` publishes `Redact`, `Redaction`, `RedactionItem`, `Options`, `Labels` and `RedactException`, and nothing to read them from. |
+| `defaultMinimumConfidence` | Mirrored | Mirrored | `0.6` is a default argument in a Swift initializer and a Kotlin data class, so neither platform can read it. `labels` and `defaultLabels` *are* read. |
+| An unknown label name | `ERR_INVALID_ARGUMENT` | `ERR_INVALID_ARGUMENT` | Neither upstream SDK refuses; both silently drop it. Refusing on both is this package's decision, because a dropped label widens a redaction invisibly. |
+| Blank input | Text unchanged, no load | Text unchanged, no load | Neither upstream SDK guards it. Same decision, taken on both halves together. |
+| Verified | Yes, on a simulator | **No — not even compiled**; no Android SDK on the machine | Same position as Gist. |
+
 Tongue's table is the only one where the *Apple* column is the constrained one,
 and the only one with no progress row at all -- it emits none:
 
@@ -1365,7 +1643,7 @@ and the only one with no progress row at all -- it emits none:
 - **iOS 18.0 deployment target.** Above Expo's 16.4 default; the config plugin
   raises it. Drops iOS 16 and 17 devices.
 - **Xcode 26 / Swift 6.2** on whatever builds the app, EAS included.
-- **`arm64-v8a` + `x86_64` only**, for Clear, Emo and Ear. The config plugin
+- **`arm64-v8a` + `x86_64` only**, for Clear, Emo, Ear, Gist and Redact. The config plugin
   narrows `abiFilters`; `Clear.isSupported` answers honestly if something slips
   through. Tongue imposes none of this and its plugin writes nothing, so an app
   that installs Tongue alone keeps every ABI.
@@ -1418,6 +1696,17 @@ a `module.modulemap` by scanning its include paths. `packages/gist/ios/DesertAnt
 carries the line and the reasoning. It names another package's source layout,
 which is the part to dislike; it is also the narrowest fix available from a
 podspec, which CocoaPods evaluates before the SPM package is resolved at all.
+
+Redact inherits that same swift-numerics coupling and nothing new of its own.
+`Sources/Redact/Model.swift` imports `RealModule` for `Double.exp` in the BIOES
+softmax — two lines, for the same portability reason Gist has — and `Package.swift`
+gives its target `.product(name: "RealModule", package: "swift-numerics")` exactly
+as it gives Gist's. So `packages/redact/ios/DesertAntRedact.podspec` carries the
+same `SWIFT_INCLUDE_PATHS` entry, and the failure without it is the identical
+`missing required module '_NumericsShims'`. Worth stating as a rule rather than as
+two incidents: **any desert-ant-core product that depends on swift-numerics needs
+that line**, and the way to know before building is to read the `models` array in
+`Package.swift` rather than to wait for the error.
 
 The other Tongue coupling is the one that is currently unsatisfiable:
 `DESERT_ANT_PRODUCTS` in the same podspec must gain `'Tongue'` the moment

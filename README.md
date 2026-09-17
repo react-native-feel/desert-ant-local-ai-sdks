@@ -5,16 +5,17 @@ on-device models. Desert Ant ships Swift, Kotlin and JavaScript/WebAssembly SDKs
 from [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core); this
 repository is the React Native one they do not.
 
-Eight models so far. Five of them compose into one pipeline: **Clear** cleans a
+Nine models so far. Five of them compose into one pipeline: **Clear** cleans a
 recording up — denoise, dereverb, loudness-normalize — **Ear** names the language
 it is in, **Voz** reads it back as a transcript with word-level timestamps,
 **Clips** picks the moments worth cutting, and **Uhm** finds every "um" in the
-same audio without reading a word of it. The other three read text rather than
+same audio without reading a word of it. The other four read text rather than
 audio: **Emo** takes a phrase and gives back the emoji that fit it, **Tongue**
 takes three words and names the language they are in — the same question Ear
-answers, from the other kind of evidence — and **Gist** takes a headline or a
+answers, from the other kind of evidence — **Gist** takes a headline or a
 post and names what it is *about*, from a fixed 36-topic taxonomy across 101
-languages. Entirely offline.
+languages, and **Redact** finds the people in a piece of text and masks them,
+reversibly, before it goes anywhere. Entirely offline.
 
 ```ts
 import { Clear } from '@desert-ant-labs/react-native-clear';
@@ -25,6 +26,7 @@ import { Emo } from '@desert-ant-labs/react-native-emo';
 import { Ear } from '@desert-ant-labs/react-native-ear';
 import { Tongue } from '@desert-ant-labs/react-native-tongue';
 import { Gist, channelTopics } from '@desert-ant-labs/react-native-gist';
+import { Redact, restore } from '@desert-ant-labs/react-native-redact';
 
 const { uri } = await (await Clear.load()).enhance({ uri: recording.uri });
 
@@ -55,6 +57,10 @@ const { topics } = await gist.classify('How to start a podcast with your iPhone'
 const scored = await Promise.all(moments.map((m) => gist.scores(m.text)));
 channelTopics(scored.map((s) => ({ topics: s.scores })));
 // [{ slug: 'technology', share: 0.14, postCount: 10 }] — what the whole thing is about
+
+const masked = await (await Redact.load()).redaction(words.map((w) => w.text).join(' '));
+masked.redactedText;   // '… [GIVEN_NAME_1] … [EMAIL_1] …' — safe to send somewhere
+restore(masked, summaryFromAnLLM);   // the originals put back, on device
 ```
 
 Ear sits ahead of Voz rather than beside it, and that is the point of it: Voz does
@@ -96,6 +102,17 @@ in the whole family that needs no model at all: pure arithmetic, bound from
 upstream rather than reimplemented, so it answers on a device that has never
 downloaded a weight.
 
+Redact is the last step rather than another question, and it is the only model
+here that changes the text instead of describing it. A transcript is exactly the
+artifact an app then forwards to a summarizer, writes to a log, or attaches to a
+support ticket — so Redact takes the people out of it first, replacing every name,
+address, email, card and national ID with a numbered placeholder, and hands back
+the mapping needed to put them all back afterwards. The mapping never leaves the
+device; `restore` needs no model and no network. It is also the only model here
+that is two detectors rather than one: a six-layer multilingual token classifier
+for names and places, and a checksum layer in front of it that owns cards, IBANs,
+SSNs and the rest outright.
+
 ## Packages
 
 | Package | What it is |
@@ -108,34 +125,39 @@ downloaded a weight.
 | [`@desert-ant-labs/react-native-emo`](packages/emo) | The Emo model: short text in, ranked emoji with confidences out, 22 languages. iOS + Android. |
 | [`@desert-ant-labs/react-native-tongue`](packages/tongue) | The Tongue model: three words in, the language they are in out, across 84. 2 MB bundled, nothing downloaded. **Android; the Apple half is written and blocked on an upstream product export.** |
 | [`@desert-ant-labs/react-native-gist`](packages/gist) | The Gist model: text in, ranked topics from a fixed 36-topic taxonomy out, 101 languages. Plus a channel roll-up that needs no model. iOS + Android. |
+| [`@desert-ant-labs/react-native-redact`](packages/redact) | The Redact model: text in, the same text with every person masked by a numbered placeholder out — plus the mapping to put them back. 27 languages. iOS + Android. |
 | [`@desert-ant-labs/react-native-core`](packages/core) | Types, error codes and lifecycle contracts shared by every model SDK here — and the single native bridge to the `desert-ant-core` Swift package. |
-| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue and Gist — and a roll-up of what the sample transcript is about — on a dev build. |
+| [`apps/example`](apps/example) | Record → enhance → identify the language → transcribe → rank highlights → find the fillers, plus a text field each for Emo, Tongue, Gist and Redact — a roll-up of what the sample transcript is about, and the same transcript with its people masked — on a dev build. |
 
 ## How it is built
 
 The native work is **not** a reimplementation. Each package is a thin Expo module
 over Desert Ant's own platform SDKs:
 
-- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear` and `Gist` products of the `desert-ant-core`
+- **iOS** links the `Clear`, `Voz`, `Clips`, `Uhm`, `Emo`, `Ear`, `Gist` and `Redact` products of the `desert-ant-core`
   Swift package, pulled in through React Native's `spm_dependency` bridge — that
   package ships as SPM only, with no podspec and no XCFramework. The bridge is
   declared exactly once, by the `DesertAntCore` pod, because two pods each
   linking the same package duplicates its thirteen shared objects and fails to
-  link; see [`packages/core`](packages/core#the-desertantcore-pod). Gist is the
+  link; see [`packages/core`](packages/core#the-desertantcore-pod). Gist was the
   first product in that list with a *transitive C module* — its channel roll-up
   imports swift-numerics' `RealModule`, which needs `_NumericsShims` — so its
-  podspec is also the first to put a SwiftPM checkout on `SWIFT_INCLUDE_PATHS`.
+  podspec was the first to put a SwiftPM checkout on `SWIFT_INCLUDE_PATHS`.
+  Redact is the second and needs the identical line, for `Double.exp` in its
+  BIOES softmax: any `desert-ant-core` product that depends on swift-numerics
+  needs it, which is now a rule rather than an incident.
   **Tongue is
   the one model not in that list**, and not by choice: desert-ant-core v3.1.0
   declares a `Tongue` product and never adds it to the manifest's `products:`
   array, so naming it fails the build rather than the import. Its Apple sources
   are written and guarded by `#if canImport(Tongue)`.
 - **Android** depends on `ai.desertant:clear`, `ai.desertant:emo`,
-  `ai.desertant:ear` and `ai.desertant:gist` from Maven Central, which bring
+  `ai.desertant:ear`, `ai.desertant:gist` and `ai.desertant:redact` from Maven
+  Central, which bring
   LiteRT and the shared native core with them, and on `ai.desertant:tongue`, which
   brings **nothing** — it is a pure-Kotlin port of the same frozen specification
   the Swift target implements, with no NDK and no `.so`, so it is the only model
-  here with no ABI constraint on Android. Those five are the only models with an
+  here with no ABI constraint on Android. Those six are the only models with an
   Android half: **Voz**
   drives Core ML directly and
   upstream ships no artifact for it at all, **Clips** has LiteRT files declared
@@ -185,9 +207,24 @@ finance headline with Personal Finance & Investing at 0.800 and a recipe with
 Food & Cooking at 0.915, and rolls the sample transcript's twelve lines up into
 technology 13.9%, business 12.7%, self-improvement 6.8% and news-politics 5.2%.
 Steady-state tagging is 9–11 ms end to end from JavaScript, and twelve lines
-scored and rolled up cost 74–88 ms. Its Android half is the one in this repo that
-has **not even been compiled** — there is no Android SDK on the machine this was
-built on. Each package's
+scored and rolled up cost 74–88 ms. Redact is verified end to end on a simulator
+as the ninth pod in the same app: it downloads ~12 MB and builds a Core ML session,
+masks a sentence of contact details into
+`Email [GIVEN_NAME_1] [SURNAME_1] at [EMAIL_1] or call [PHONE_1]; her card is [CREDIT_CARD_1].`,
+and `restore` gives the input back character for character — on every sample, in
+every run, including the label-narrowed and threshold-raised variants. One
+redaction costs 574–584 ms end to end from JavaScript and the 134-word sample
+transcript 464–477 ms. English and Spanish find the same five spans; German and
+Hungarian each miss the card, and German labels an imperative verb as a surname —
+recorded rather than smoothed over. Two sentences that should come back untouched
+do. Two upstream behaviours are worth reporting and are written up: a
+checksum-validated `IP_ADDRESS` can lose to the address post-processing and leave
+three of its four octets in the text, and a label the deterministic layer owns can
+arrive with a sub-1 confidence — so neither field reads as provenance. Gist's and
+Redact's Android halves are the two in this repo that have **not even been
+compiled** — there is no usable Android SDK on the machine this was built on, and
+the older packages' "Android compiles but has not been run" is itself an
+unverified claim that is being corrected separately. Each package's
 README says exactly what was and was not exercised.
 
 ## Requirements
@@ -196,17 +233,17 @@ README says exactly what was and was not exercised.
 | --- | --- |
 | Expo SDK | 57+ (`expo-modules-core` 57 is where the 2.0 macros live) |
 | React Native | 0.75+ for `spm_dependency`; 0.83 in the example |
-| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue or Gist alone |
+| iOS | **18.0+** with Clear or Clips (their Core ML artifacts' floors); 17.0+ for Voz, Uhm, Emo, Ear, Tongue, Gist or Redact alone |
 | Xcode | 26 (`desert-ant-core` is `swift-tools-version: 6.2`) |
-| Android | API 24+; `arm64-v8a` and `x86_64` only for Clear, Emo, Ear and Gist — Tongue needs no native library and runs on any ABI |
+| Android | API 24+; `arm64-v8a` and `x86_64` only for Clear, Emo, Ear, Gist and Redact — Tongue needs no native library and runs on any ABI |
 | Expo Go | Not supported — these are native modules, so use a dev build |
 
 Each package's bundled config plugin raises the iOS deployment target — and
-Clear's, Emo's, Ear's and Gist's also narrow the Android ABIs to the two LiteRT
-ships — so add
+Clear's, Emo's, Ear's, Gist's and Redact's also narrow the Android ABIs to the two
+LiteRT ships — so add
 whichever packages you use to `plugins` in your app config. The plugins only ever
-raise, and the four that touch `build.gradle` defer to each other's block, so they
-compose (there is a test that asserts it over all 24 orderings). Tongue's touches `build.gradle` not at all, deliberately: it has no
+raise, and the five that touch `build.gradle` defer to each other's block, so they
+compose (there is a test that asserts it over all 120 orderings). Tongue's touches `build.gradle` not at all, deliberately: it has no
 native library, so narrowing an app's ABIs on its behalf would take away devices
 it can serve.
 

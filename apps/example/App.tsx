@@ -13,6 +13,11 @@ import {
   type ChannelTopic,
   type Tagging,
 } from '@desert-ant-labs/react-native-gist';
+import {
+  Redact,
+  restore,
+  type Redaction,
+} from '@desert-ant-labs/react-native-redact';
 import { Tongue, type Detection as TextDetection } from '@desert-ant-labs/react-native-tongue';
 import { Uhm, type UhmResult } from '@desert-ant-labs/react-native-uhm';
 import { Voz, type Transcript } from '@desert-ant-labs/react-native-voz';
@@ -91,6 +96,7 @@ export default function App() {
   const ear = useRef<Ear | null>(null);
   const tongue = useRef<Tongue | null>(null);
   const gist = useRef<Gist | null>(null);
+  const redact = useRef<Redact | null>(null);
 
   const [ready, setReady] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
@@ -196,6 +202,23 @@ export default function App() {
   // moments and another naming the subject.
   const [about, setAbout] = useState<ChannelTopic[] | null>(null);
 
+  // Redact is ~12 MB for the Core ML export, which puts it between Emo's 5 and
+  // Uhm's 45 -- so it loads on mount like Clear, Emo and Ear rather than behind a
+  // tap, and `loading` is the honest starting state.
+  const [redactState, setRedactState] = useState<ModelState>(
+    Redact.isSupported ? 'loading' : 'unsupported'
+  );
+  const [secret, setSecret] = useState('');
+  const [redacted, setRedacted] = useState<Redaction | null>(null);
+  // Measured around the call as well as reported natively, for the same reason
+  // Ear's and Gist's are: `redacted.processingSec` is what the model cost and
+  // this is what the caller waited for.
+  const [redactMs, setRedactMs] = useState<number | null>(null);
+  // The round trip, proved rather than asserted: the redacted text put back
+  // through `restore` should be the input again, character for character. Null
+  // until a redaction has been asked for.
+  const [roundTrip, setRoundTrip] = useState<boolean | null>(null);
+
   // Logged before anything else touches either model: reading these proves both
   // native modules resolved and their `@JS` properties are bound, which is the
   // failure most likely to be silent.
@@ -243,6 +266,14 @@ export default function App() {
         `topK=${Gist.defaultTopK} variants=${Gist.variants.join('/')} ` +
         `default=${Gist.defaultVariant} rollup=${JSON.stringify(Gist.defaultRollupOptions)}` +
         `${Gist.unsupportedReason ? ` reason=${Gist.unsupportedReason}` : ''}`
+    );
+    console.log(
+      `[redact] isSupported=${Redact.isSupported} nativeCore=${Redact.nativeCoreVersion} ` +
+        `revision=${Redact.modelRevision} repo=${Redact.modelRepo} ` +
+        `minConfidence=${Redact.defaultMinimumConfidence} ` +
+        `labels=${Redact.labels.length} default=${Redact.defaultLabels.length} ` +
+        `displayNames=${Object.keys(Redact.labelDisplayNames).length}` +
+        `${Redact.unsupportedReason ? ` reason=${Redact.unsupportedReason}` : ''}`
     );
   }, []);
 
@@ -324,6 +355,12 @@ export default function App() {
       // read, so there is nothing to justify and nothing to ask permission for.
       if (Tongue.isSupported) void prepareTongue();
 
+      // Redact is ~12 MB on Apple. It loads on mount for the same reason Emo and
+      // Ear do -- small enough not to ask about -- and for one more: the way this
+      // model is meant to be used is on text as it is typed, so a field that has
+      // to wait for a tap before it will mask anything is the wrong demo of it.
+      if (Redact.isSupported) void prepareRedact();
+
       // Voz only loads itself if its weights are already here. `create()` touches
       // no network, so asking is free.
       if (cancelled || !Voz.isSupported) return;
@@ -377,6 +414,8 @@ export default function App() {
       tongue.current = null;
       gist.current?.release();
       gist.current = null;
+      redact.current?.release();
+      redact.current = null;
     };
   }, []);
 
@@ -680,6 +719,135 @@ export default function App() {
       setBusy(null);
     }
   }, []);
+
+  /**
+   * Get Redact ready: ~12 MB for the Core ML export and a session build in a
+   * second or two.
+   *
+   * Like Emo and Ear it never announces itself through `busy` -- it is small
+   * enough that a global "preparing" banner would be gone before it was read.
+   */
+  const prepareRedact = useCallback(async () => {
+    if (redact.current) return;
+    setRedactState('loading');
+    try {
+      const t0 = Date.now();
+      const model = await Redact.load();
+      redact.current = model;
+      setRedactState('ready');
+      console.log(`[redact] ready in ${Date.now() - t0}ms downloaded=${model.isDownloaded()}`);
+      // Asked once, after loading, because it is the one thing this SDK can
+      // answer on iOS and cannot on Android: `Label.displayName` is a Swift
+      // computed property with no Kotlin equivalent, so the refusal is exercised
+      // here on whichever platform refuses.
+      try {
+        console.log(
+          `[redact] displayName(IP_ADDRESS)="${Redact.displayName('IP_ADDRESS')}" ` +
+            `displayName(ORG)="${Redact.displayName('ORG')}"`
+        );
+      } catch (e) {
+        console.log(`[redact] display names unavailable: ${describe(e)}`);
+      }
+    } catch (e) {
+      console.log(`[redact] prepare FAILED: ${describe(e)}`);
+      setError(describe(e));
+      setRedactState('absent');
+    }
+  }, []);
+
+  /**
+   * Mask whatever is in the Redact field, and check the round trip.
+   *
+   * Debounced at 150 ms like Emo's and Gist's rather than called per keystroke
+   * like Tongue's -- it is a promise over a windowed transformer pass, so the
+   * timer is worth its own latency, and the number printed beside the result is
+   * the evidence either way.
+   *
+   * `restore` runs on every result, not just in the self-test, because the round
+   * trip is the product rather than a property of it: what this model is *for* is
+   * handing the masked text to something else and putting the originals back into
+   * what comes out. Restoring the redacted text into itself should give back
+   * exactly what was typed, and the UI says whether it did.
+   */
+  const runRedact = useCallback(async (text: string) => {
+    const model = redact.current;
+    if (!model) return;
+    if (text.trim().length === 0) {
+      setRedacted(null);
+      setRedactMs(null);
+      setRoundTrip(null);
+      return;
+    }
+    try {
+      const t0 = Date.now();
+      const result = await model.redaction(text);
+      setRedactMs(Date.now() - t0);
+      setRedacted(result);
+      setRoundTrip(restore(result, result.redactedText) === text);
+    } catch (e) {
+      console.log(`[redact] redaction FAILED: ${describe(e)}`);
+      setError(describe(e));
+      // The same Fast Refresh hazard Emo, Tongue and Gist hit, for the same
+      // reason: this is the fourth model called from a timer rather than from a
+      // tap, so it is the fourth that can outlive its native half during
+      // development.
+      redact.current?.release();
+      redact.current = null;
+      void prepareRedact();
+    }
+  }, [prepareRedact]);
+
+  // Debounce the field into `runRedact`. The cleanup cancels the pending timer on
+  // every keystroke, so only the last one in a burst reaches the model.
+  useEffect(() => {
+    if (redactState !== 'ready') return;
+    const timer = setTimeout(() => void runRedact(secret), 150);
+    return () => clearTimeout(timer);
+  }, [secret, redactState, runRedact]);
+
+  /**
+   * The join with Voz: mask the transcript of the recording just made.
+   *
+   * This is the honest pairing for this model rather than a contrived one. Voz
+   * turns a recording into text, and text is exactly where personal data stops
+   * being hard to find and starts being easy to leak -- a transcript is the thing
+   * an app sends to a summarizer, stores in a log, or attaches to a support
+   * ticket. So the chain Clear -> Ear -> Voz already builds ends here: whatever
+   * the microphone heard, masked before it can go anywhere.
+   *
+   * Falls back to the sample transcript when there is no recording, which is the
+   * usual case on a simulator with no Voz weights. Both are real text with real
+   * offsets; only one of them came from a microphone.
+   */
+  const runRedactTranscript = useCallback(async () => {
+    const model = redact.current;
+    if (!model) return;
+    const fromVoz = transcript?.text?.trim();
+    const source = fromVoz && fromVoz.length > 0 ? fromVoz : SAMPLE_TRANSCRIPT.join(' ');
+    setError(null);
+    setBusy('Masking the transcript');
+    try {
+      const t0 = Date.now();
+      const result = await model.redaction(source);
+      const elapsed = Date.now() - t0;
+      setSecret(source);
+      setRedacted(result);
+      setRedactMs(elapsed);
+      setRoundTrip(restore(result, result.redactedText) === source);
+      console.log(
+        `[redact] ${fromVoz ? 'Voz transcript' : 'sample transcript'} ` +
+          `(${source.length} chars) masked in ${elapsed}ms -> ${result.items.length} items` +
+          (result.items.length > 0
+            ? `: ${result.items.map((i) => `${i.label} "${i.original}"`).join(', ')}`
+            : '')
+      );
+    } catch (e) {
+      console.log(`[redact] transcript FAILED: ${describe(e)}`);
+      setError(describe(e));
+    } finally {
+      setBusy(null);
+    }
+  }, [transcript]);
 
   /**
    * Name the language of whatever is in the Tongue field.
@@ -1713,6 +1881,262 @@ export default function App() {
       failures.push(`gist: ${describe(e)}`);
     }
 
+    // --- Redact. The fourth text model, and the one that reads a string for a
+    //     different reason than the other three: not which emoji, not which
+    //     language, not what it is about, but what in it is a person.
+    //
+    //     Nothing here asserts which labels a given sentence produces. The
+    //     taxonomy and the weights are upstream's, and an answer key written
+    //     here would be a fixture of this package's opinion rather than of the
+    //     model's behaviour -- and a redaction benchmark run on four sentences
+    //     would be worse than no benchmark. What is asserted is the shape, and
+    //     the one thing that has to be exactly true for this model to be usable
+    //     at all: the round trip. Mask, hand the masked text to something else,
+    //     put the originals back -- and get the input again, character for
+    //     character.
+    try {
+      const masker = redact.current;
+      if (!masker) {
+        console.log('[redact] self-test skipped — model not prepared');
+      } else {
+        const source = REDACT_SAMPLES[0]!.text;
+        const t0 = Date.now();
+        const result = await masker.redaction(source);
+        console.log(
+          `[redact] redaction ok in ${Date.now() - t0}ms — ${result.items.length} items, ` +
+            `revision=${result.modelRevision} native=${(result.processingSec * 1000).toFixed(1)}ms`
+        );
+        console.log(`[redact]   in  "${source}"`);
+        console.log(`[redact]   out "${result.redactedText}"`);
+        result.items.forEach((item) =>
+          console.log(
+            `[redact]   ${item.label.padEnd(16)} "${item.original}" -> ${item.placeholder} ` +
+              `conf ${item.confidence.toFixed(3)} @${item.start}..${item.end}`
+          )
+        );
+
+        // The invariants. Ordered, non-overlapping, sliceable, bounded, and every
+        // placeholder actually in the output.
+        const ordered = result.items.every((it, i) => i === 0 || it.start >= result.items[i - 1]!.end);
+        const slices = result.items.every((it) => source.slice(it.start, it.end) === it.original);
+        const bounded = result.items.every((it) => it.confidence >= 0 && it.confidence <= 1);
+        const placed = result.items.every((it) => result.redactedText.includes(it.placeholder));
+        const uniquePlaceholders =
+          new Set(result.items.map((it) => it.placeholder)).size === result.items.length;
+        const gone = result.items.every((it) => !result.redactedText.includes(it.original));
+        if (!ordered) failures.push('redact: items are not in document order, or they overlap');
+        if (!slices) failures.push('redact: an offset pair does not slice its own original back out');
+        if (!bounded) failures.push('redact: a confidence is outside 0..1');
+        if (!placed) failures.push('redact: a placeholder is missing from the redacted text');
+        if (!uniquePlaceholders) failures.push('redact: two items share a placeholder');
+        if (!gone) failures.push('redact: an original survived into the redacted text');
+        if (result.items.length === 0) {
+          failures.push('redact: a sentence of nothing but contact details produced no items');
+        }
+        console.log(
+          `[redact] ordered=${ordered} slices=${slices} bounded=${bounded} placed=${placed} ` +
+            `unique=${uniquePlaceholders} originalsGone=${gone}`
+        );
+
+        // The round trip, which is the product. Restoring the redacted text into
+        // itself has to give back the input exactly.
+        const back = restore(result, result.redactedText);
+        const exact = back === source;
+        console.log(`[redact] restore(redactedText) === input -> ${exact}`);
+        if (!exact) failures.push('redact: the round trip did not reproduce the input');
+
+        // And the way it is actually used: a "reply" that mentions the
+        // placeholders comes back naming the real people.
+        const reply = result.items.map((it) => it.placeholder).join(' / ');
+        const filled = restore(result, reply);
+        const allBack = result.items.every((it) => filled.includes(it.original));
+        console.log(`[redact] restore into a reply -> "${filled}" (all originals back: ${allBack})`);
+        if (!allBack) failures.push('redact: restore left a placeholder in a reply');
+
+        // Confidence and provenance, reported and NOT asserted -- which is the
+        // interesting part of this leg.
+        //
+        // The tempting assertion is "a checksum-owned label always comes back at
+        // exactly 1". Two runs on this simulator disproved both directions of it.
+        // A confident neural GIVEN_NAME comes back at exactly 1.000, because a
+        // saturated softmax rounds there in a Double and because several of
+        // upstream's address post-processing stages build spans through
+        // `Span(start, end, label)`, whose `score` defaults to 1.0. And an IMEI
+        // -- which IS in `Deterministic.owned` -- came back at 0.900 from the
+        // identifiers sample below, because the hybrid resolver can relabel an
+        // ML span into an owned label and keep its score.
+        //
+        // So neither field reads as provenance, and a self-test that asserted
+        // otherwise would be pinning a coincidence. What is logged is the shape
+        // of the distribution; what is asserted is only that every score is a
+        // probability, which is checked above.
+        const OWNED = ['EMAIL', 'URL', 'IP_ADDRESS', 'CREDIT_CARD', 'SSN', 'BANK_ACCOUNT',
+          'ROUTING_NUMBER', 'TAX_ID', 'GOVERNMENT_ID', 'PASSPORT', 'DRIVERS_LICENSE', 'IMEI'];
+        const deterministic = result.items.filter((it) => OWNED.includes(it.label));
+        const exactlyOne = result.items.filter((it) => it.confidence === 1);
+        console.log(
+          `[redact] ${deterministic.length} checksum-owned labels here, ` +
+            `${exactlyOne.length} items at exactly 1.000 — the second number is the larger one, ` +
+            'so a score of 1 is not a claim about how a span was found'
+        );
+
+        // Narrowing the label set narrows the output and nothing else.
+        const emailOnly = await masker.redaction(source, { labels: ['EMAIL'] });
+        const onlyEmails = emailOnly.items.every((it) => it.label === 'EMAIL');
+        console.log(
+          `[redact] labels:['EMAIL'] -> ${emailOnly.items.length} items ` +
+            `(${emailOnly.items.map((i) => i.label).join(', ') || 'none'}), onlyEmails=${onlyEmails}`
+        );
+        if (!onlyEmails) failures.push('redact: a narrowed label set produced another label');
+        if (emailOnly.items.length > result.items.length) {
+          failures.push('redact: narrowing the labels produced more items');
+        }
+        if (restore(emailOnly, emailOnly.redactedText) !== source) {
+          failures.push('redact: the narrowed redaction did not round-trip');
+        }
+
+        // ORG is detected and not redacted by default, which is upstream's rule
+        // and the one asymmetry in the taxonomy worth showing. Logged rather than
+        // asserted: whether this particular sentence has a company in it is the
+        // model's opinion, not this test's.
+        const withOrg = await masker.redaction(REDACT_SAMPLES[0]!.text, {
+          labels: [...Redact.defaultLabels, 'ORG'],
+        });
+        console.log(
+          `[redact] default labels ${Redact.defaultLabels.length} (no ORG) -> ${result.items.length} items; ` +
+            `+ORG -> ${withOrg.items.length} items ` +
+            `(${withOrg.items.filter((i) => i.label === 'ORG').length} of them ORG)`
+        );
+        if (Redact.defaultLabels.includes('ORG')) {
+          failures.push('redact: ORG is in the default label set');
+        }
+        if (!Redact.labels.includes('ORG')) failures.push('redact: ORG is not in the full label set');
+
+        // The confidence floor applies to the neural half only, and the claim
+        // worth asserting is the one that follows from that rather than the one
+        // that sounds like it: a floor of 1 cannot drop a checksum-owned
+        // detection, because a checksum is not a score. It can *keep* a neural
+        // detection scoring just under 1 -- upstream's own filter is not a strict
+        // inequality against a rounded number -- so asserting "everything left is
+        // exactly 1" would be asserting a coincidence.
+        const identity = (it: { label: string; start: number }) => `${it.label}@${it.start}`;
+        const strict = await masker.redaction(source, { minimumConfidence: 1 });
+        const surviving = new Set(strict.items.map(identity));
+        const checksumsKept = deterministic.every((it) => surviving.has(identity(it)));
+        const lowest = strict.items.reduce((min, it) => Math.min(min, it.confidence), 1);
+        // Logged, not asserted, for the reason above: an owned label can arrive
+        // with a sub-1 score, so "a floor of 1 cannot drop a checksum" is not an
+        // invariant either. The monotonicity below is.
+        console.log(
+          `[redact] minimumConfidence 1 -> ${strict.items.length} items ` +
+            `(was ${result.items.length}), every checksum-owned detection kept: ${checksumsKept}, ` +
+            `lowest surviving confidence ${lowest.toFixed(3)}`
+        );
+        if (strict.items.length > result.items.length) {
+          failures.push('redact: raising the confidence floor produced more items');
+        }
+        if (restore(strict, strict.redactedText) !== source) {
+          failures.push('redact: the strict redaction did not round-trip');
+        }
+
+        // Blank input is an answer, not an error, and it never reaches the
+        // weights.
+        const blank = await masker.redaction('   ');
+        console.log(
+          `[redact] blank input -> ${blank.items.length} items, text unchanged: ` +
+            `${blank.redactedText === '   '}`
+        );
+        if (blank.items.length !== 0) failures.push('redact: blank input produced an item');
+        if (blank.redactedText !== '   ') failures.push('redact: blank input came back changed');
+
+        // One person's contact details in four languages, with no language passed
+        // in. Not an accuracy claim -- four sentences are four sentences -- but a
+        // model that only worked in English would show it here.
+        for (const sample of REDACT_SAMPLES) {
+          const one = await masker.redaction(sample.text);
+          console.log(
+            `[redact]   ${sample.code} ${one.items.length} items: ` +
+              (one.items.map((i) => `${i.label}="${i.original}"`).join(', ') || 'none')
+          );
+          if (restore(one, one.redactedText) !== sample.text) {
+            failures.push(`redact: the ${sample.code} redaction did not round-trip`);
+          }
+        }
+
+        // The argument guards, which never reach native. Upstream clamps an
+        // out-of-range confidence and silently drops an unknown label name; both
+        // are refusals here.
+        for (const bad of [-0.1, 1.1]) {
+          try {
+            await masker.redaction('a', { minimumConfidence: bad });
+            failures.push(`redact: minimumConfidence=${bad} was accepted`);
+          } catch (e) {
+            if (!(e instanceof DesertAntError) || e.code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`redact: minimumConfidence=${bad} raised ${describe(e)}`);
+            }
+          }
+        }
+        for (const bad of [[], ['EMIAL']] as const) {
+          try {
+            await masker.redaction('a', { labels: bad as never });
+            failures.push(`redact: labels=${JSON.stringify(bad)} was accepted`);
+          } catch (e) {
+            if (!(e instanceof DesertAntError) || e.code !== 'ERR_INVALID_ARGUMENT') {
+              failures.push(`redact: labels=${JSON.stringify(bad)} raised ${describe(e)}`);
+            }
+          }
+        }
+        console.log(
+          '[redact] rejected minimumConfidence -0.1/1.1, an empty label list and a misspelled ' +
+            'label with ERR_INVALID_ARGUMENT'
+        );
+
+        // Display names: iOS has them, Android does not, and the refusal is the
+        // interesting half.
+        const names = Object.keys(Redact.labelDisplayNames).length;
+        console.log(
+          `[redact] ${names} display names here (iOS ${Redact.labels.length}, Android 0)`
+        );
+        if (names === 0) {
+          try {
+            Redact.displayName('EMAIL');
+            failures.push('redact: displayName answered on a platform with no display names');
+          } catch (e) {
+            const code = e instanceof DesertAntError ? e.code : 'not a DesertAntError';
+            console.log(`[redact] displayName -> ${code} (expected off iOS)`);
+            if (code !== 'ERR_UNSUPPORTED_PLATFORM') {
+              failures.push(`redact: the display-name refusal raised ${code}`);
+            }
+          }
+        } else if (names !== Redact.labels.length) {
+          failures.push(`redact: ${names} display names for ${Redact.labels.length} labels`);
+        }
+
+        // And the join: the transcript Voz produced, or the sample one when there
+        // is no recording. A transcript is exactly the artifact an app forwards
+        // to a summarizer or files with a support ticket, which is where this
+        // model belongs in the chain.
+        const spoken = transcript?.text?.trim();
+        const longText = spoken && spoken.length > 0 ? spoken : SAMPLE_TRANSCRIPT.join(' ');
+        const t1 = Date.now();
+        const masked = await masker.redaction(longText);
+        console.log(
+          `[redact] ${spoken ? 'Voz transcript' : 'sample transcript'} ` +
+            `(${longText.length} chars, ${longText.split(/\s+/).length} words) in ` +
+            `${Date.now() - t1}ms -> ${masked.items.length} items` +
+            (masked.items.length > 0
+              ? `: ${masked.items.map((i) => `${i.label} "${i.original}"`).join(', ')}`
+              : ' (nothing personal in it, which is the right answer for this one)')
+        );
+        if (restore(masked, masked.redactedText) !== longText) {
+          failures.push('redact: the transcript redaction did not round-trip');
+        }
+      }
+    } catch (e) {
+      console.log(`[redact] self-test FAILED: ${describe(e)}`);
+      failures.push(`redact: ${describe(e)}`);
+    }
+
     // --- Uhm. The only model here that is loaded by the time a self-test can run
     //     without anyone tapping anything, so this leg is the one that always has
     //     something to say.
@@ -1991,7 +2415,11 @@ export default function App() {
     if (failures.length > 0) setError(failures.join('\n'));
     setBusy(null);
     setProgress(null);
-  }, []);
+    // `transcript` is the one piece of state this closure reads rather than
+    // reaching for through a ref, because the Redact leg masks the transcript Voz
+    // produced when there is one. Every other leg works from a ref, a constant or
+    // a file it writes itself, which is what keeps the dependency list to one.
+  }, [transcript]);
 
   const audioToTranscribe = enhancedUri ?? originalUri;
 
@@ -2001,7 +2429,8 @@ export default function App() {
       <Text style={styles.subtitle}>
         Clear cleans it, Ear names the language, Voz reads it, Clips cuts it, Uhm finds
         the ums — and Tongue names the language again, from the words rather than the
-        sound, while Gist says what those words are about
+        sound, Gist says what those words are about, and Redact takes the people out
+        of them before they go anywhere
       </Text>
 
       {error ? <Text style={styles.error}>{error}</Text> : null}
@@ -2795,6 +3224,121 @@ export default function App() {
           )
         ) : null}
       </View>
+
+      <View style={styles.metrics}>
+        <Text style={styles.sectionTitle}>Redact</Text>
+
+        {redactState === 'unsupported' ? (
+          <Text style={styles.note}>
+            {Redact.unsupportedReason ?? 'Not available on this device.'}
+          </Text>
+        ) : null}
+
+        {redactState === 'loading' ? (
+          <Text style={styles.note}>Preparing — about 12 MB if it is not already here.</Text>
+        ) : null}
+
+        {redactState === 'absent' ? (
+          <Button
+            label="Prepare Redact (~12 MB)"
+            onPress={() => void prepareRedact()}
+            disabled={busy !== null}
+            tone="ghost"
+          />
+        ) : null}
+
+        {redactState === 'ready' ? (
+          <>
+            <Text style={styles.note}>
+              Type anything with a name, an email, a phone number or a card in it
+              and Redact replaces each one with a numbered placeholder, in 27
+              languages with no language setting to pass in. The mapping back to
+              the originals stays here; the masked text is the part that is safe
+              to send somewhere.
+            </Text>
+            <TextInput
+              value={secret}
+              onChangeText={setSecret}
+              placeholder="Email Anna Kovács at anna.kovacs@example.com"
+              autoCorrect={false}
+              autoCapitalize="none"
+              multiline
+              style={styles.input}
+            />
+            {/* One person's details in four languages, then an address, a set of
+                machine identifiers, and one sentence with nothing personal in it
+                — which is the one to watch, because a false positive corrupts
+                the text whatever reads it next. */}
+            <View style={styles.phrases}>
+              {REDACT_PHRASES.map((sample) => (
+                <Pressable
+                  key={sample}
+                  onPress={() => setSecret(sample)}
+                  style={({ pressed }) => [styles.phrase, pressed && styles.buttonPressed]}>
+                  <Text style={styles.phraseText}>{sample}</Text>
+                </Pressable>
+              ))}
+            </View>
+          </>
+        ) : null}
+
+        {redacted ? (
+          <>
+            <Text style={styles.transcript}>
+              {redacted.redactedText.length > 0 ? redacted.redactedText : '(nothing)'}
+            </Text>
+            <Row label="Found" value={`${redacted.items.length}`} />
+            <Row label="Latency" value={redactMs === null ? '—' : `${redactMs} ms`} />
+            <Row
+              label="Round trip"
+              value={roundTrip === null ? '—' : roundTrip ? 'exact' : 'MISMATCH'}
+            />
+            <Row label="Revision" value={redacted.modelRevision ?? '—'} />
+            {redacted.items.length === 0 ? (
+              <Text style={styles.note}>
+                Nothing personal in it — which for this model is a result rather
+                than a miss. Not masking ordinary words matters as much as
+                catching real ones.
+              </Text>
+            ) : (
+              <View style={styles.words}>
+                {redacted.items.map((item, index) => (
+                  <View key={`${index}-${item.placeholder}`} style={styles.filler}>
+                    {/* The display name where the platform has one, and the label
+                        itself where it does not. Never derived from the slug:
+                        upstream's own names include "IMEI", "SSN" and
+                        "IP address", none of which title-casing produces. */}
+                    <Text style={styles.wordText}>
+                      {Redact.labelDisplayNames[item.label] ?? item.label}
+                    </Text>
+                    {/* The number, not a word. An early version of this row
+                        said "checksum" for a confidence of exactly 1 — and the
+                        simulator disproved it in one tap: a confident neural
+                        GIVEN_NAME saturates to 1.0 as well. What a detection was
+                        found by is its label, not its score. */}
+                    <Text style={styles.wordTime}>
+                      {item.placeholder} · {item.confidence.toFixed(3)}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            )}
+          </>
+        ) : null}
+
+        {/* The join with Voz, on whatever the microphone heard: a transcript is
+            exactly the artifact an app forwards to a summarizer or files with a
+            support ticket, so it is where this model belongs in the chain. Falls
+            back to the sample transcript when there is no recording. */}
+        {redactState === 'ready' ? (
+          <Button
+            label={transcript ? 'Mask the transcript' : 'Mask the sample transcript'}
+            onPress={() => void runRedactTranscript()}
+            disabled={busy !== null}
+            tone="ghost"
+          />
+        ) : null}
+      </View>
     </ScrollView>
   );
 }
@@ -2898,6 +3442,63 @@ const GIST_PHRASES = [
   ...GIST_SAMPLES.map((sample) => sample.text),
   'Why our index fund beat the hedge fund over ten years',
   'The best one-pan salmon recipe for a weeknight',
+];
+
+/**
+ * One person's contact details, in four of Redact's 27 languages.
+ *
+ * Not an answer key -- which labels these produce is the model's opinion and
+ * upstream's taxonomy, and four sentences are not a benchmark. What they are for
+ * is the round trip: every one of them is masked and restored, and the assertion
+ * is that the restored text is the input again, character for character, which
+ * is a property no amount of taxonomy drift can change.
+ *
+ * The card number is 4111 1111 1111 1111, the Luhn-valid number every payment
+ * processor publishes as a test value, so nothing here is anyone's data. The
+ * email is on `example.com`, which is reserved by RFC 2606 for exactly this.
+ */
+const REDACT_SAMPLES = [
+  {
+    code: 'en',
+    text:
+      'Email Anna Kovács at anna.kovacs@example.com or call +36 1 234 5678; ' +
+      'her card is 4111 1111 1111 1111.',
+  },
+  {
+    code: 'es',
+    text:
+      'Escribe a Anna Kovács a anna.kovacs@example.com o llama al +36 1 234 5678; ' +
+      'su tarjeta es 4111 1111 1111 1111.',
+  },
+  {
+    code: 'de',
+    text:
+      'Schreib Anna Kovács an anna.kovacs@example.com oder ruf +36 1 234 5678 an; ' +
+      'ihre Karte ist 4111 1111 1111 1111.',
+  },
+  {
+    code: 'hu',
+    text:
+      'Írj Kovács Annának a anna.kovacs@example.com címre, vagy hívd a +36 1 234 5678 ' +
+      'számot; a kártyája 4111 1111 1111 1111.',
+  },
+] as const;
+
+/**
+ * The buttons under the Redact field: the four translations above, then three
+ * that exercise other parts of the taxonomy -- a postal address, a set of
+ * machine identifiers, and one sentence with no personal data in it at all.
+ *
+ * The last is the one worth having. Precision matters as much as recall here,
+ * because a false positive corrupts the text whatever reads it next, and a
+ * masker that redacted something in this sentence would be doing damage rather
+ * than work.
+ */
+const REDACT_PHRASES = [
+  ...REDACT_SAMPLES.map((sample) => sample.text),
+  'Ship it to Dr. Maria Silva, 42 Rue de la Paix, Apt 3B, 75002 Paris.',
+  'The box at 192.168.1.14 logged in from https://example.com with IMEI 490154203237518.',
+  'The deployment finished at noon and the dashboard looks fine.',
 ];
 
 /**
