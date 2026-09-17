@@ -35,6 +35,22 @@ import type { ProgressEvent, Transcript } from './types';
  */
 export interface NativeVozModel extends SharedObject<{ progress: (event: ProgressEvent) => void }> {
   isDownloaded(): boolean;
+  /**
+   * Hand over the transcript computed for `jobId`, and forget it.
+   *
+   * Synchronous, and that is the point rather than an optimization. An async
+   * native function's return value is encoded after its last suspension, and on
+   * iOS that lands on the cooperative thread pool rather than the JavaScript
+   * thread -- which corrupts the Hermes heap and segfaults the process, usually
+   * somewhere else entirely and some time later. A synchronous native function
+   * encodes inside the host call, on the JavaScript thread, by construction.
+   *
+   * Keyed by job id rather than a single slot, so two concurrent calls on one
+   * model cannot take each other's answer. Throws `ERR_INFERENCE_FAILED` if
+   * nothing is waiting, which can only happen if it is called without a
+   * completed call for that id.
+   */
+  takeTranscript(jobId: string): Transcript;
 }
 
 interface DesertAntVozModule extends NativeModule {
@@ -52,7 +68,7 @@ interface DesertAntVozModule extends NativeModule {
 
   download(model: NativeVozModel, jobId: string): Promise<void>;
   load(model: NativeVozModel, jobId: string): Promise<void>;
-  transcribeFile(model: NativeVozModel, path: string, jobId: string): Promise<Transcript>;
+  transcribeFile(model: NativeVozModel, path: string, jobId: string): Promise<void>;
   /**
    * Mono `samples` at `sampleRate`, resampled natively if it is not the model's.
    *
@@ -65,7 +81,7 @@ interface DesertAntVozModule extends NativeModule {
     samples: Float32Array,
     sampleRate: number,
     jobId: string
-  ): Promise<Transcript>;
+  ): Promise<void>;
 }
 
 export default requireOptionalNativeModule<DesertAntVozModule>('DesertAntVoz');

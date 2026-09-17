@@ -133,6 +133,32 @@ Desert Ant models raise: `ERR_MODEL_UNAVAILABLE`, `ERR_MODEL_LOAD_FAILED`,
 - **100 languages**, from an xlm-roberta-base trunk. Unlike Voz, this one is not
   narrow.
 
+## Every async call returns nothing, on purpose
+
+`findClips`, the native half of `find`, is `@JS async` functions that return `Void` and stash the result on
+the shared object under the caller's job id; the result comes back through a
+**synchronous** `takeClips`. `src/Clips.ts` makes both calls, so the public API above never
+sees the seam.
+
+That is the fourth Expo Modules 2.0 limit in `docs/architecture.md`, and the
+short version is that **a `@JS async` function does its last work on the wrong
+thread**. `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs
+jobs "synchronously without hopping to the proper thread" and says so in its own
+doc comment, so once the call suspends on real work the closure the
+`@ExpoModule` macro generated resumes on
+`com.apple.root.user-initiated-qos.cooperative`. Two things it does from there
+touch the Hermes runtime without the JavaScript thread: it encodes the return
+value, and it destroys the owning copy of the call's *arguments* that
+`createAsyncFunction` handed it. The downstream symptom is
+`HadesGC::youngGenCollection` killing the process later and blaming nothing.
+
+Returning `Void` removes the first of those. It does not remove the second --
+`ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+nothing at all -- so every async function here also lands back on the JavaScript
+thread before it returns, through the `onJavaScriptThread` helper at the bottom
+of `ios/ClipsModule.swift`. Both halves, the crash reports behind them and what could not
+be settled are in `docs/architecture.md`.
+
 ## Verified
 
 Driven on an iOS 26.4 simulator with a Release build, alongside Clear and Voz:

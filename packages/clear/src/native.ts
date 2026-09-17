@@ -74,28 +74,41 @@ interface DesertAntClearModule extends NativeModule {
 
   download(model: NativeClearModel, jobId: string): Promise<void>;
   load(model: NativeClearModel, jobId: string): Promise<void>;
+  /**
+   * Resolves to nothing. The metrics are collected with `takeMetrics`.
+   *
+   * The `Promise<void>` is the point. An async native function's return value is
+   * encoded after its last suspension, and on iOS that happens on the
+   * cooperative thread pool rather than the JavaScript thread -- which corrupts
+   * the Hermes heap and segfaults the process, usually somewhere else entirely.
+   * `Clear.enhance` makes both calls, so the public API is unaffected.
+   */
   enhanceFile(
     model: NativeClearModel,
     inputPath: string,
     outputPath: string,
     options: NativeEnhanceOptions,
     jobId: string
-  ): Promise<NativeFileMetrics>;
+  ): Promise<void>;
   /**
-   * Returns the metrics only. The audio is collected separately with
-   * `takeEnhancedAudio`, because returning a `SharedObject` from an async native
-   * function segfaults on iOS (expo-modules-core 57) while the same return from
-   * a synchronous one is fine. `Clear.enhanceSamples` makes both calls, so the
-   * public API is unaffected.
+   * Resolves to nothing, for the same reason `enhanceFile` does. The audio is
+   * collected with `takeEnhancedAudio` and the metrics with `takeMetrics`,
+   * because returning a `SharedObject` from an async native function segfaults
+   * on iOS (expo-modules-core 57) while the same return from a synchronous one
+   * is fine. `Clear.enhanceSamples` makes all three calls, so the public API is
+   * unaffected.
    */
   enhanceBuffer(
     model: NativeClearModel,
     input: NativeClearAudio,
     options: NativeEnhanceOptions,
     jobId: string
-  ): Promise<NativeFileMetrics>;
+  ): Promise<void>;
   /** Collect the buffer `enhanceBuffer` produced for `jobId`. Once per job. */
   takeEnhancedAudio(model: NativeClearModel, jobId: string): NativeClearAudio;
+  /** Collect the metrics `enhanceFile` or `enhanceBuffer` produced for `jobId`.
+   *  Synchronous, and so encoded on the JavaScript thread. Once per job. */
+  takeMetrics(model: NativeClearModel, jobId: string): NativeFileMetrics;
 }
 
 export default requireNativeModule<DesertAntClearModule>('DesertAntClear');

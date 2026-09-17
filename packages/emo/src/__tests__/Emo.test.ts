@@ -14,6 +14,9 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
   const listeners: Listener[] = [];
   const model = {
     isDownloaded: jest.fn(() => true),
+    // The async half resolves to nothing; the result is collected
+    // synchronously. See `native.ts`.
+    takeSuggestions: jest.fn(() => suggestions()),
     release: jest.fn(),
     addListener: jest.fn((_event: string, listener: Listener) => {
       listeners.push(listener);
@@ -37,7 +40,7 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
       defaultLimit: 3,
       createModel: jest.fn(() => model),
       load: jest.fn(async () => undefined),
-      suggest: jest.fn(async () => suggestions()),
+      suggest: jest.fn(async () => undefined),
       ...overrides,
     },
   };
@@ -262,7 +265,8 @@ describe('suggest', () => {
 
 describe('best', () => {
   it('asks for one and unwraps it', async () => {
-    const native = fakeNative({ suggest: jest.fn(async () => [suggestions()[0]]) });
+    const native = fakeNative();
+    native.model.takeSuggestions.mockReturnValue([suggestions()[0]!]);
     const Emo = load(native.module);
     const emo = await Emo.load();
 

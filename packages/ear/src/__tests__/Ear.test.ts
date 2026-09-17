@@ -37,6 +37,9 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
   const listeners: Listener[] = [];
   const model = {
     isDownloaded: jest.fn(() => true),
+    // The async half resolves to nothing; the result is collected
+    // synchronously. See `native.ts`.
+    takeDetection: jest.fn(() => detection()),
     languages: jest.fn(() => ['en', 'pt', 'es']),
     release: jest.fn(),
     addListener: jest.fn((_event: string, listener: Listener) => {
@@ -61,8 +64,8 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
       reliableMargin: 0.25,
       createModel: jest.fn(() => model),
       load: jest.fn(async () => undefined),
-      identifyFile: jest.fn(async () => detection()),
-      identifySamples: jest.fn(async () => detection()),
+      identifyFile: jest.fn(async () => undefined),
+      identifySamples: jest.fn(async () => undefined),
       loadLanguages: jest.fn(async () => undefined),
       ...overrides,
     },
@@ -193,7 +196,7 @@ describe('identify', () => {
     // Deliberately inconsistent with the margin: a high confidence and a wide
     // gap, still marked unreliable, which is what a Nordic answer looks like.
     // Nothing here second-guesses it.
-    native.module.identifyFile.mockResolvedValueOnce(
+    native.model.takeDetection.mockReturnValueOnce(
       detection({
         language: 'sv',
         confidence: 0.88,

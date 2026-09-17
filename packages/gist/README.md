@@ -201,38 +201,33 @@ string, so nothing can fail to decode.
 
 ## Every async call returns nothing, on purpose
 
-This package's native surface has an unusual shape: `classify` and `scores` are
-`@JS async` functions that return `Void` and store their result on the shared
-object under the caller's job id, and the result is read back through a
-**synchronous** `takeTagging` / `takeDistribution`.
+`classify` and `scores` are `@JS async` functions that return `Void` and stash the result on
+the shared object under the caller's job id; the result comes back through a
+**synchronous** `takeTagging` / `takeDistribution`. `src/Gist.ts` makes both calls, so the public API above never
+sees the seam.
 
-It is the fourth Expo Modules 2.0 limit this repo has had to design around. **A
-`@JS async` function's return value can be encoded off the JavaScript thread**,
-which segfaults the runtime — the crash lands on
-`com.apple.root.user-initiated-qos.cooperative` rather than on
-`com.facebook.react.runtime.JavaScript`, and `@JavaScriptActor` does not prevent
-it, because the return value is encoded *after* the actor hop the annotation
-governs. Ear hit it returning `[String]`; the same investigation found Clear
-hitting it through `Record.encode`, so "arrays of primitives only" is the wrong
-reading. It is a race, so it survives a first call and a second and then takes
-the process down, and the damage it does to the Hermes heap surfaces later and
-somewhere else entirely.
+That is the fourth Expo Modules 2.0 limit in `docs/architecture.md`, and the
+short version is that **a `@JS async` function does its last work on the wrong
+thread**. `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs
+jobs "synchronously without hopping to the proper thread" and says so in its own
+doc comment, so once the call suspends on real work the closure the
+`@ExpoModule` macro generated resumes on
+`com.apple.root.user-initiated-qos.cooperative`. Two things it does from there
+touch the Hermes runtime without the JavaScript thread: it encodes the return
+value, and it destroys the owning copy of the call's *arguments* that
+`createAsyncFunction` handed it. The downstream symptom is
+`HadesGC::youngGenCollection` killing the process later and blaming nothing.
 
-`docs/architecture.md` draws the general rule out of those two: split "do the
-work" from "hand the result over" whenever the result is large or its encoding is
-not a single scalar. Gist returns the largest results in this family — `scores` is
-the whole 36-topic taxonomy — so the rule applies here without any judgement about
-how many records is too many, and both calls are split rather than one of them.
-A synchronous `@JS` member runs on the JavaScript thread by construction.
+Returning `Void` removes the first of those. It does not remove the second --
+`ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+nothing at all -- so every async function here also lands back on the JavaScript
+thread before it returns, through the `onJavaScriptThread` helper at the bottom
+of `ios/GistModule.swift`. Both halves, the crash reports behind them and what could not
+be settled are in `docs/architecture.md`.
 
-The job id is what makes it safe rather than merely lucky: results are keyed by
-it and removed on read, so two concurrent `classify` calls on one model cannot
-take each other's answer.
-
-`channelTopics` is synchronous for the same reason on top of the obvious one. It
-is arithmetic over a few hundred numbers, and a synchronous return cannot hit the
-hazard at all.
-
+Kotlin has no encode-on-the-wrong-thread hazard. The Android half holds the
+result anyway, so that the TypeScript above it stays one implementation rather
+than two.
 ## Verified
 
 Driven on an iOS 26 simulator (iPhone 17 Pro Max) with a dev build, alongside
@@ -356,10 +351,19 @@ Thread: com.apple.root.user-initiated-qos.cooperative
   DesertAntExample closure #2 in EmoModule._decorateModule(object:in:)
 ```
 
-Both are async returns being encoded off the JavaScript thread — Clear's is the
-defect this repo already had documented and queued, and Emo's is a second
-instance of the same one, found here. Neither is Gist's, and the first of them
-was recorded by a crash that predates this package being in the binary at all.
+Neither is Gist's, and the first was recorded by a crash that predates this
+package being in the binary at all.
+
+They are not, however, the same defect twice, which is what this was originally
+written to say. Clear's is the async **return** being encoded off the JavaScript
+thread. Emo's `closure #2` is its second `@JS` function, which is `load` —
+`suggest` is `#3` — and `load` returns `Void`, so there is nothing there to
+encode. What is being destroyed on the cooperative thread is the call's
+**arguments**: the owning `JavaScriptValuesBuffer` that `createAsyncFunction`
+copied for the async body, running `~jsi::Value()` on a shared object and a job
+id. Returning `Void` does not fix that half, which is why every async function in
+this family now also lands back on the JavaScript thread before it returns. The
+full account, and what could not be settled, is in `docs/architecture.md`.
 
 A Gist-only session then ran **three `classify` calls and sixty `scores` calls
 plus five native `channelTopics`** through the example app's UI with no other

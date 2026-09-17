@@ -229,9 +229,11 @@ export class Emo {
       return [];
     }
     const native = toNativeOptions(options);
-    return this.run(undefined, (jobId) =>
-      Emo.requireNative().suggest(this.native, text, native, jobId)
-    );
+    return this.run(undefined, async (jobId) => {
+      await Emo.requireNative().suggest(this.native, text, native, jobId);
+      // Collected separately, and synchronously -- see `native.ts`.
+      return this.native.takeSuggestions(jobId);
+    });
   }
 
   /**

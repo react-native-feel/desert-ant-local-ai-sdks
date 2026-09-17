@@ -239,40 +239,33 @@ string, so nothing can fail to decode.
 
 ## Every async call returns nothing, on purpose
 
-This package's native surface has an unusual shape: `redaction` is a `@JS async`
-function that returns `Void` and stores its result on the shared object under the
-caller's job id, and the result is read back through a **synchronous**
-`takeRedaction`.
+`redaction` is `@JS async` functions that return `Void` and stash the result on
+the shared object under the caller's job id; the result comes back through a
+**synchronous** `takeRedaction`. `src/Redact.ts` makes both calls, so the public API above never
+sees the seam.
 
-It is the fourth Expo Modules 2.0 limit this repo has had to design around. **A
-`@JS async` function's return value can be encoded off the JavaScript thread**,
-which segfaults the runtime — the crash lands on
-`com.apple.root.user-initiated-qos.cooperative` rather than on
-`com.facebook.react.runtime.JavaScript`, and `@JavaScriptActor` does not prevent
-it, because the return value is encoded *after* the actor hop the annotation
-governs. It has now been reproduced in four packages: Ear returning `[String]`,
-Clear in `Record.encode`, Emo in `JavaScriptValuesBuffer.deinit` on an array of
-records, with `HadesGC::youngGenCollection` killing the process later as the
-downstream symptom. "Small values are safe" is not a reading anyone should still
-be holding.
+That is the fourth Expo Modules 2.0 limit in `docs/architecture.md`, and the
+short version is that **a `@JS async` function does its last work on the wrong
+thread**. `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs
+jobs "synchronously without hopping to the proper thread" and says so in its own
+doc comment, so once the call suspends on real work the closure the
+`@ExpoModule` macro generated resumes on
+`com.apple.root.user-initiated-qos.cooperative`. Two things it does from there
+touch the Hermes runtime without the JavaScript thread: it encodes the return
+value, and it destroys the owning copy of the call's *arguments* that
+`createAsyncFunction` handed it. The downstream symptom is
+`HadesGC::youngGenCollection` killing the process later and blaming nothing.
 
-`docs/architecture.md` draws the general rule out of those: split "do the work"
-from "hand the result over" whenever the result is large or its encoding is not a
-single scalar. A redaction is three strings and three numbers per detection and a
-paragraph of contact details carries a dozen detections, so the rule applies here
-without any judgement about how many records is too many. A synchronous `@JS`
-member runs on the JavaScript thread by construction.
+Returning `Void` removes the first of those. It does not remove the second --
+`ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+nothing at all -- so every async function here also lands back on the JavaScript
+thread before it returns, through the `onJavaScriptThread` helper at the bottom
+of `ios/RedactModule.swift`. Both halves, the crash reports behind them and what could not
+be settled are in `docs/architecture.md`.
 
-The job id is what makes it safe rather than merely lucky: results are keyed by
-it and removed on read, so two concurrent `redaction` calls on one model cannot
-take each other's answer. For this model that removal is worth naming twice —
-what is sitting in that dictionary is the caller's personal data in the clear, so
-it is removed as it is read and `release()` drops the rest immediately rather than
-leaving it to a collector.
-
-`restore` is synchronous for the same reason on top of the obvious one. It is
-string substitution, and a synchronous return cannot hit the hazard at all.
-
+Kotlin has no encode-on-the-wrong-thread hazard. The Android half holds the
+result anyway, so that the TypeScript above it stays one implementation rather
+than two.
 ## SwiftUI also has a `Label`
 
 `ios/RedactLabel.swift` is one typealias in a file with one import, and both

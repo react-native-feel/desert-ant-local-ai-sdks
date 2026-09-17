@@ -121,9 +121,17 @@ export class Clear {
     this.assertAlive();
     const inputPath = toPath(options.uri);
     const outputPath = options.outputUri ? toPath(options.outputUri) : defaultOutputPath(inputPath);
-    const { outputPath: written, ...metrics } = await this.run(options.onProgress, (jobId) =>
-      NativeClear.enhanceFile(this.native, inputPath, outputPath, toNativeOptions(options), jobId)
-    );
+    const { outputPath: written, ...metrics } = await this.run(options.onProgress, async (jobId) => {
+      await NativeClear.enhanceFile(
+        this.native,
+        inputPath,
+        outputPath,
+        toNativeOptions(options),
+        jobId
+      );
+      // Collected separately, and synchronously -- see `native.ts`.
+      return NativeClear.takeMetrics(this.native, jobId);
+    });
     // Trust the native side over the request: iOS re-encodes a non-WAV input as
     // WAV, so the extension it wrote may not be the one that was asked for.
     return { ...metrics, uri: toUri(written || outputPath) };
@@ -172,11 +180,12 @@ export class Clear {
       input = NativeClear.createAudio(channels.length, frameCount, sampleRate);
       channels.forEach((channel, index) => input!.write(index, channel));
 
-      const metrics = await this.run(options.onProgress, (jobId) => {
+      const metrics = await this.run(options.onProgress, async (jobId) => {
         lastJobId = jobId;
-        return NativeClear.enhanceBuffer(this.native, input!, toNativeOptions(options), jobId);
+        await NativeClear.enhanceBuffer(this.native, input!, toNativeOptions(options), jobId);
+        // Collected separately, and synchronously -- see `native.ts`.
+        return NativeClear.takeMetrics(this.native, jobId);
       });
-      // Collected separately, and synchronously -- see `native.ts`.
       output = NativeClear.takeEnhancedAudio(this.native, lastJobId);
 
       const out: Float32Array[] = [];

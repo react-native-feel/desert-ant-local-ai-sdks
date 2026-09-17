@@ -23,6 +23,7 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
   let variant: ModelVariant
   private let progressGate = ProgressGate()
   private let pending = PendingOutputs()
+  private let pendingMetrics = PendingMetrics()
 
   /// Emitted while `download`, `enhanceFile` and `enhanceBuffer` run. Throttled
   /// to ~20 Hz -- the model reports per chunk, which is far more often than a
@@ -185,6 +186,30 @@ final class ClearModelObject: SharedObject, @unchecked Sendable {
     return audio
   }
 
+  /// Hold the metrics for a job until JavaScript collects them.
+  ///
+  /// The same two-call shape the buffer has, and for the newer of the two
+  /// reasons. `enhanceFile` and `enhanceBuffer` used to *return* `ClearMetrics`,
+  /// and a `@JS async` function's return value is encoded after its last
+  /// suspension -- which, because `@JavaScriptActor` does not hop, is on the
+  /// cooperative pool rather than the JavaScript thread. Three of this repo's
+  /// crash reports are that encode: `Record.encode(_:in:)` and
+  /// `ClearMetrics.toObject(appContext:)` under
+  /// `closure #6 in ClearModule._decorateModule` on
+  /// `com.apple.root.user-initiated-qos.cooperative`.
+  ///
+  /// Non-async so the lock is taken in a synchronous context.
+  func stashMetrics(_ metrics: ClearMetrics, for jobId: String) {
+    pendingMetrics.put(metrics, for: jobId)
+  }
+
+  func takeStashedMetrics(_ jobId: String) throws -> ClearMetrics {
+    guard let metrics = pendingMetrics.take(jobId) else {
+      throw MissingOutputException(jobId)
+    }
+    return metrics
+  }
+
   // MARK: - Progress
 
   private static func name(of phase: Clear.Phase) -> String {
@@ -223,6 +248,25 @@ private final class PendingOutputs: @unchecked Sendable {
     lock.lock()
     defer { lock.unlock() }
     return outputs.removeValue(forKey: jobId)
+  }
+}
+
+/// Metrics waiting to be collected. Lock-guarded for the same reason
+/// `PendingOutputs` is: a synchronous `@JS` function drains it without hopping.
+private final class PendingMetrics: @unchecked Sendable {
+  private let lock = NSLock()
+  private var metrics: [String: ClearMetrics] = [:]
+
+  func put(_ value: ClearMetrics, for jobId: String) {
+    lock.lock()
+    defer { lock.unlock() }
+    metrics[jobId] = value
+  }
+
+  func take(_ jobId: String) -> ClearMetrics? {
+    lock.lock()
+    defer { lock.unlock() }
+    return metrics.removeValue(forKey: jobId)
   }
 }
 

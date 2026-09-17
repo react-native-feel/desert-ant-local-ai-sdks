@@ -103,10 +103,13 @@ final class RedactModelObject: SharedObject, @unchecked Sendable {
   /// `com.facebook.react.runtime.JavaScript`, and `@JavaScriptActor` on the
   /// function does not prevent it -- the return value is encoded after the actor
   /// hop the annotation governs. Ear hit it returning `[String]`, Clear through
-  /// `Record.encode`, Emo through `JavaScriptValuesBuffer.deinit` on an array of
-  /// records; the downstream symptom is `HadesGC::youngGenCollection` killing the
-  /// process later and blaming nothing. Four sites, so "small values are safe" is
-  /// not a reading anyone should still be holding.
+  /// `Record.encode` and `ClearMetrics.toObject`; the downstream symptom is
+  /// `HadesGC::youngGenCollection` killing the process later and blaming nothing.
+  /// "Small values are safe" is not a reading anyone should still be holding.
+  ///
+  /// And nor is "the return value is the only hazard": the same closure destroys
+  /// the call's *arguments* on the same thread, which is what `onJavaScriptThread`
+  /// in RedactModule.swift is for. See docs/architecture.md, limit 4.
   ///
   /// A redaction is three strings and three numbers per detection, and a
   /// paragraph of contact details carries a dozen detections, so this is on the

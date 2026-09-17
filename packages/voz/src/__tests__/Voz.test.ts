@@ -13,6 +13,9 @@ function fakeNative() {
   const listeners: Listener[] = [];
   const model = {
     isDownloaded: jest.fn(() => true),
+    // The async half resolves to nothing; the transcript is collected
+    // synchronously. See `native.ts`.
+    takeTranscript: jest.fn(() => transcript()),
     release: jest.fn(),
     addListener: jest.fn((_event: string, listener: Listener) => {
       listeners.push(listener);
@@ -34,8 +37,8 @@ function fakeNative() {
       createModel: jest.fn(() => model),
       download: jest.fn(async () => undefined),
       load: jest.fn(async () => undefined),
-      transcribeFile: jest.fn(async () => transcript()),
-      transcribeSamples: jest.fn(async () => transcript()),
+      transcribeFile: jest.fn(async () => undefined),
+      transcribeSamples: jest.fn(async () => undefined),
     },
   };
 }

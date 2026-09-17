@@ -21,6 +21,26 @@
 // kills the process -- does not reach this module either: Uhm's results are
 // spans, so nothing here ever has to hand a Swift-allocated buffer back to
 // JavaScript.
+//
+// The fourth is the one that shaped this file, and it is bigger than it reads.
+// **A `@JS async` function does its last work on the wrong thread.**
+// `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs jobs
+// "synchronously without hopping to the proper thread", by its own doc comment,
+// so after the first suspension the closure the `@ExpoModule` macro generated
+// resumes on `com.apple.root.user-initiated-qos.cooperative` -- and it does two
+// things there that touch Hermes. It encodes the return value, and it destroys
+// the owning copy of the call's *arguments* that `createAsyncFunction` handed it
+// (`JavaScriptValuesBuffer.deinit` -> `~jsi::Value()` per argument).
+//
+// Hence both halves of the arrangement below. Every `@JS async` function returns
+// `Void` and hands its result over through a synchronous `take...`, which takes
+// care of the encode; and every one of them lands back on the JavaScript thread
+// before returning, through `onJavaScriptThread` at the bottom of this file,
+// which takes care of the teardown. Returning `Void` alone does not:
+// `ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+// nothing at all. The crash reports, the closure numbering that reads them, and
+// what could not be settled are in docs/architecture.md under "Expo Modules 2.0
+// limits".
 
 import DesertAnt
 import ExpoModulesCore
@@ -87,13 +107,19 @@ public final class UhmModule: Module {
   @JS
   @JavaScriptActor
   func load(_ model: UhmModelObject, _ jobId: String) async throws {
-    try await model.load(jobId: jobId)
+    try await onJavaScriptThread(appContext) {
+      try await model.load(jobId: jobId)
+    }
   }
 
-  /// Find the fillers in the audio (or video) file at `path`.
+  /// Find the fillers in the audio (or video) file at `path`, and hold the result
+  /// on the shared object under `jobId`.
   ///
   /// The primary API. The audio never crosses the JS boundary, and what comes
   /// back is a handful of spans however long the recording is.
+  ///
+  /// Returns nothing on purpose; `takeResult` hands the record over
+  /// synchronously. See the note at the top of this file.
   @JS
   @JavaScriptActor
   func analyzeFile(
@@ -101,8 +127,11 @@ public final class UhmModule: Module {
     _ path: String,
     _ options: UhmAnalyzeOptions,
     _ jobId: String
-  ) async throws -> UhmResult {
-    try await model.analyzeFile(path: path, options: options, jobId: jobId)
+  ) async throws {
+    try await onJavaScriptThread(appContext) {
+      let result = try await model.analyzeFile(path: path, options: options, jobId: jobId)
+      model.stash(result, for: jobId)
+    }
   }
 
   /// Find the fillers in mono samples already in memory.
@@ -120,15 +149,18 @@ public final class UhmModule: Module {
     _ sampleRate: Double,
     _ options: UhmAnalyzeOptions,
     _ jobId: String
-  ) async throws -> UhmResult {
-    let mono = [Float](
-      UnsafeBufferPointer(
-        start: samples.rawPointer.assumingMemoryBound(to: Float.self),
-        count: samples.length
+  ) async throws {
+    try await onJavaScriptThread(appContext) {
+      let mono = [Float](
+        UnsafeBufferPointer(
+          start: samples.rawPointer.assumingMemoryBound(to: Float.self),
+          count: samples.length
+        )
       )
-    )
-    return try await model.analyzeSamples(
-      mono, sampleRate: sampleRate, options: options, jobId: jobId)
+      let result = try await model.analyzeSamples(
+        mono, sampleRate: sampleRate, options: options, jobId: jobId)
+      model.stash(result, for: jobId)
+    }
   }
 
   // MARK: - Transcript reconciliation
@@ -155,5 +187,67 @@ public final class UhmModule: Module {
       fillers: fillers.map { $0.asDetection() },
       options: options.resolved()
     ).map(uhmWord(from:))
+  }
+}
+
+// MARK: - Landing a `@JS async` call back on the JavaScript thread
+
+/// Run `body`, then put the rest of this `@JS async` call back on the JavaScript
+/// thread before returning to `createAsyncFunction`.
+///
+/// **`@JavaScriptActor` does not hop.** Its executor is
+/// `JavaScriptExecutor.enqueue { job.runSynchronously(on:) }`, and
+/// expo-modules-jsi's own doc comment says so: it "executes jobs *synchronously*
+/// without hopping to the proper thread ... running these jobs on the JavaScript
+/// thread must be ensured externally". So the annotation is an assertion, not a
+/// hop: the moment a `@JS async` function suspends on real work, its continuation
+/// resumes on `com.apple.root.user-initiated-qos.cooperative`.
+///
+/// Two things then happen there, inside the closure the `@ExpoModule` macro
+/// generated, and both touch Hermes without the runtime's lock:
+///
+/// 1. the return value is encoded (`Record.encode`, `Array<String>.encode`), and
+/// 2. the **arguments** are destroyed. `createAsyncFunction` hands the closure an
+///    *owning* copy of the argument buffer, so leaving it runs
+///    `JavaScriptValuesBuffer.deinit` -> `jsi::Value::~Value()` once per argument.
+///    Every argument that is a JS string or object -- a `@Record`, an array, a
+///    `Float32Array`, and the `SharedObject` every entry point here takes first --
+///    is a pointer into the Hermes heap being released off-thread.
+///
+/// (1) is why every `@JS async` function in this package returns `Void`. (2) is
+/// not fixed by that, which is what `ShapesModule.load` proved by crashing in
+/// `JavaScriptValuesBuffer.deinit` while returning nothing at all.
+///
+/// Awaiting this last fixes both: `runtime.schedule` runs its block on the
+/// JavaScript thread, and resuming a `@JavaScriptActor` continuation from inside
+/// that block runs the continuation *right there* -- the same non-hopping
+/// executor, used the other way round. The generated closure therefore encodes
+/// and tears down on the JavaScript thread.
+///
+/// A lost runtime is not an error here: if there is no runtime there is nothing
+/// left to protect, and the call's own result still has to be delivered.
+@JavaScriptActor
+private func onJavaScriptThread(
+  _ appContext: AppContext?,
+  _ body: @JavaScriptActor () async throws -> Void
+) async throws {
+  do {
+    try await body()
+  } catch {
+    await hopToJavaScriptThread(appContext)
+    throw error
+  }
+  await hopToJavaScriptThread(appContext)
+}
+
+@JavaScriptActor
+private func hopToJavaScriptThread(_ appContext: AppContext?) async {
+  guard let appContext, let runtime = try? appContext.runtime else {
+    return
+  }
+  await withCheckedContinuation { continuation in
+    runtime.schedule {
+      continuation.resume()
+    }
   }
 }

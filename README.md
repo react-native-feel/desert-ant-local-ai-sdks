@@ -301,6 +301,15 @@ Modules rather than Nitro, what the buffer-marshaling constraint is and how it i
 resolved, which platform differences are real, and the four Expo Modules 2.0
 limits that only showed up against a real toolchain and a real phone.
 
+The fourth of those limits shapes every native file here, so it is worth knowing
+before reading one. **A `@JS async` function does its last work on the wrong
+thread**: `@JavaScriptActor` is an assertion rather than a hop, so once such a
+call suspends on real work the closure the macro generated resumes on a
+cooperative-pool thread, and it both encodes its return value and destroys the
+call's arguments from there. Every `@JS async` function in this repo therefore
+returns `Void` and hands its result over through a synchronous `take…`, and every
+one of them lands back on the JavaScript thread before it returns.
+
 **Status:** Clear is verified end to end on iOS on an iPhone 16 (iOS 26.3.1).
 Clips is verified end to end on a simulator — it downloads, loads, and returns
 ranked non-overlapping clips with playable spans from a real transcript. Uhm is

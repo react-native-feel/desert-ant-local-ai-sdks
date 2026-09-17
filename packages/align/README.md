@@ -302,24 +302,29 @@ which is what makes it unmisconfigurable from JavaScript.
 
 ## Every async call returns nothing, on purpose
 
-`transcribe` on the native side is `@JS async ... async throws` returning
-**`Void`**. The transcript comes back through a synchronous `takeTranscript` on
-the shared object.
+`transcribe` is `@JS async` functions that return `Void` and stash the result on
+the shared object under the caller's job id; the result comes back through a
+**synchronous** `takeTranscript`. `src/Align.ts` makes both calls, so the public API above never
+sees the seam.
 
-That is the fourth Expo Modules 2.0 limit this repo has had to design around: a
-`@JS async` function's return value can be encoded **off** the JavaScript thread
-and segfault the runtime, on `com.apple.root.user-initiated-qos.cooperative`
-rather than on `com.facebook.react.runtime.JavaScript`, and `@JavaScriptActor`
-does not prevent it. Ear hit it on `[String]`, Clear in `Record.encode`, Emo in
-`JavaScriptValuesBuffer.deinit` on an array of `@Record`s.
+That is the fourth Expo Modules 2.0 limit in `docs/architecture.md`, and the
+short version is that **a `@JS async` function does its last work on the wrong
+thread**. `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs
+jobs "synchronously without hopping to the proper thread" and says so in its own
+doc comment, so once the call suspends on real work the closure the
+`@ExpoModule` macro generated resumes on
+`com.apple.root.user-initiated-qos.cooperative`. Two things it does from there
+touch the Hermes runtime without the JavaScript thread: it encodes the return
+value, and it destroys the owning copy of the call's *arguments* that
+`createAsyncFunction` handed it. The downstream symptom is
+`HadesGC::youngGenCollection` killing the process later and blaming nothing.
 
-An `AlignedTranscript` is Emo's exact shape at a larger scale — an array of
-`@Record`s inside a `@Record`, one entry per word, so a minute of speech is a
-couple of hundred of them. A synchronous `@JS` member runs on the JavaScript
-thread by construction, which is where the encode has to happen. Same shape as
-`packages/shapes`' `takeRecognition`, `packages/redact`'s `takeRedaction` and
-`packages/gist`'s `takeTagging`.
-
+Returning `Void` removes the first of those. It does not remove the second --
+`ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+nothing at all -- so every async function here also lands back on the JavaScript
+thread before it returns, through the `onJavaScriptThread` helper at the bottom
+of `ios/AlignModule.swift`. Both halves, the crash reports behind them and what could not
+be settled are in `docs/architecture.md`.
 ## Apple's assets must be reserved before they can be asked about
 
 Found by getting it wrong. `AssetInventory.assetInstallationRequest(supporting:)`

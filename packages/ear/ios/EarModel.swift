@@ -157,9 +157,16 @@ final class EarModelObject: SharedObject, @unchecked Sendable {
   ///
   /// Returning `Void` from the async half removes the encode entirely, and a
   /// synchronous `@JS` member runs on the JavaScript thread by construction, so
-  /// the array is encoded where it must be. Uhm and Emo never hit this because
-  /// nothing they return asynchronously is an array of a bare primitive: their
-  /// results are `@Record`s, which encode through `toObject` instead.
+  /// the array is encoded where it must be. Every other asynchronous call in this
+  /// package -- `identifyFile`, `identifySamples` -- now has the same shape, with
+  /// `takeDetection` as its synchronous half: "records encode through `toObject`
+  /// instead" was exposure rather than immunity, and Clear's crash reports name
+  /// `Record.encode` and `ClearMetrics.toObject` directly.
+  ///
+  /// It is also only half the defect. The same generated closure destroys the
+  /// call's *arguments* on the same wrong thread, which no return type can help
+  /// with; `onJavaScriptThread` in EarModule.swift is the other half. See
+  /// docs/architecture.md, limit 4.
   ///
   /// Loads first for the same reason the identify paths do: the list is a sidecar
   /// that comes down with the weights, so asking for it on a cold model is a
@@ -261,6 +268,44 @@ final class EarModelObject: SharedObject, @unchecked Sendable {
       self?.onProgress(
         EarProgressEvent(jobId: jobId, phase: "loadingModel", fraction: fraction))
     }
+  }
+
+  // MARK: - Results waiting to be collected
+
+  /// Results waiting to be handed over, keyed by the job that produced them.
+  ///
+  /// Keyed rather than a single slot so two concurrent calls on one model cannot
+  /// take each other's answer -- the same reason every entry point in this family
+  /// carries a job id. Entries are removed on read, so nothing accumulates; a job
+  /// whose caller threw before reading leaves one behind, which dies with the
+  /// model.
+  private let resultsLock = NSLock()
+  private var detections: [String: EarDetection] = [:]
+
+  /// Non-async so the lock is taken in a synchronous context: `NSLock.lock()` is
+  /// unavailable from an asynchronous one, and holding it across an `await` is
+  /// what that rule exists to prevent.
+  func stash(_ value: EarDetection, for jobId: String) {
+    resultsLock.lock()
+    defer { resultsLock.unlock() }
+    detections[jobId] = value
+  }
+
+  /// Hand over the result computed for `jobId`, and forget it.
+  ///
+  /// Synchronous, and that is the point rather than an optimization: a
+  /// synchronous `@JS` member's return value is encoded inside the host call, on
+  /// the JavaScript thread, by construction. The asynchronous half returns
+  /// `Void` so that nothing is encoded on the cooperative pool. See the note on
+  /// `takeDetection` in the module.
+  @JS
+  func takeDetection(_ jobId: String) throws -> EarDetection {
+    resultsLock.lock()
+    defer { resultsLock.unlock() }
+    guard let value = detections.removeValue(forKey: jobId) else {
+      throw InferenceFailedException("no result is waiting for job \(jobId)")
+    }
+    return value
   }
 }
 

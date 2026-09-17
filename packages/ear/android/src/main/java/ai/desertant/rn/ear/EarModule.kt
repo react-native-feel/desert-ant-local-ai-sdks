@@ -59,7 +59,7 @@ class EarModule : Module() {
         path: String,
         options: EarIdentifyOptions,
         jobId: String ->
-      model.identifyFile(path, options, model.progressEmitter(jobId))
+      model.stash(jobId, model.identifyFile(path, options, model.progressEmitter(jobId)))
     }
 
     AsyncFunction("identifySamples") Coroutine {
@@ -68,7 +68,10 @@ class EarModule : Module() {
         sampleRate: Double,
         options: EarIdentifyOptions,
         jobId: String ->
-      model.identifySamples(samples, sampleRate, options, model.progressEmitter(jobId))
+      model.stash(
+        jobId,
+        model.identifySamples(samples, sampleRate, options, model.progressEmitter(jobId)),
+      )
     }
 
     /**
@@ -94,6 +97,13 @@ class EarModule : Module() {
       Events("progress")
 
       Function("isDownloaded") { model: EarModelObject -> model.isDownloaded() }
+      // The detection comes back through a synchronous call. On the Apple side
+      // that is forced -- an async return value is encoded off the JavaScript
+      // thread and corrupts the Hermes heap -- and Kotlin matches it so one
+      // TypeScript file drives both.
+      Function("takeDetection") { model: EarModelObject, jobId: String ->
+        model.takeDetection(jobId)
+      }
       // The Apple half reads its cached list here. This one never gets the
       // chance -- `loadLanguages` above refuses first -- but it is defined so the
       // shape of the shared object matches src/native.ts on both platforms, and

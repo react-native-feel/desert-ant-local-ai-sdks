@@ -21,15 +21,25 @@
 // the process -- does not reach this module: nothing here hands a Swift-allocated
 // buffer back to JavaScript.
 //
-// The fourth does, and it is the one that shaped this file. **Every `@JS async`
-// function below returns `Void`**, because an async return value can be encoded
-// off the JavaScript thread and segfault the runtime. It has been reproduced in
-// four packages -- Ear on `[String]`, Clear in `Record.encode`, Emo in
-// `JavaScriptValuesBuffer.deinit` -- so it is a property of the toolchain rather
-// than of any one result's size, and this model's result carries a `[Double]`,
-// which is the same shape of value that took Ear down. The recognition comes back
-// through the shared object's synchronous `takeRecognition`. See the long note on
-// `ShapesModelObject.recognize`.
+// The fourth is the one that shaped this file, and it is bigger than it reads.
+// **A `@JS async` function does its last work on the wrong thread.**
+// `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs jobs
+// "synchronously without hopping to the proper thread", by its own doc comment,
+// so after the first suspension the closure the `@ExpoModule` macro generated
+// resumes on `com.apple.root.user-initiated-qos.cooperative` -- and it does two
+// things there that touch Hermes. It encodes the return value, and it destroys
+// the owning copy of the call's *arguments* that `createAsyncFunction` handed it
+// (`JavaScriptValuesBuffer.deinit` -> `~jsi::Value()` per argument).
+//
+// Hence both halves of the arrangement below. Every `@JS async` function returns
+// `Void` and hands its result over through a synchronous `take...`, which takes
+// care of the encode; and every one of them lands back on the JavaScript thread
+// before returning, through `onJavaScriptThread` at the bottom of this file,
+// which takes care of the teardown. Returning `Void` alone does not:
+// `ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+// nothing at all. The crash reports, the closure numbering that reads them, and
+// what could not be settled are in docs/architecture.md under "Expo Modules 2.0
+// limits".
 
 import DesertAnt
 import ExpoModulesCore
@@ -125,7 +135,9 @@ public final class ShapesModule: Module {
   @JS
   @JavaScriptActor
   func load(_ model: ShapesModelObject, _ jobId: String) async throws {
-    try await model.load(jobId: jobId)
+    try await onJavaScriptThread(appContext) {
+      try await model.load(jobId: jobId)
+    }
   }
 
   /// Recognize the stroke in `coordinates` and hold the result on the shared
@@ -147,6 +159,70 @@ public final class ShapesModule: Module {
     _ options: ShapesRecognizeOptions,
     _ jobId: String
   ) async throws {
-    try await model.recognize(coordinates: coordinates, options: options, jobId: jobId)
+    try await onJavaScriptThread(appContext) {
+      try await model.recognize(coordinates: coordinates, options: options, jobId: jobId)
+    }
+  }
+}
+
+// MARK: - Landing a `@JS async` call back on the JavaScript thread
+
+/// Run `body`, then put the rest of this `@JS async` call back on the JavaScript
+/// thread before returning to `createAsyncFunction`.
+///
+/// **`@JavaScriptActor` does not hop.** Its executor is
+/// `JavaScriptExecutor.enqueue { job.runSynchronously(on:) }`, and
+/// expo-modules-jsi's own doc comment says so: it "executes jobs *synchronously*
+/// without hopping to the proper thread ... running these jobs on the JavaScript
+/// thread must be ensured externally". So the annotation is an assertion, not a
+/// hop: the moment a `@JS async` function suspends on real work, its continuation
+/// resumes on `com.apple.root.user-initiated-qos.cooperative`.
+///
+/// Two things then happen there, inside the closure the `@ExpoModule` macro
+/// generated, and both touch Hermes without the runtime's lock:
+///
+/// 1. the return value is encoded (`Record.encode`, `Array<String>.encode`), and
+/// 2. the **arguments** are destroyed. `createAsyncFunction` hands the closure an
+///    *owning* copy of the argument buffer, so leaving it runs
+///    `JavaScriptValuesBuffer.deinit` -> `jsi::Value::~Value()` once per argument.
+///    Every argument that is a JS string or object -- a `@Record`, an array, a
+///    `Float32Array`, and the `SharedObject` every entry point here takes first --
+///    is a pointer into the Hermes heap being released off-thread.
+///
+/// (1) is why every `@JS async` function in this package returns `Void`. (2) is
+/// not fixed by that, which is what `ShapesModule.load` proved by crashing in
+/// `JavaScriptValuesBuffer.deinit` while returning nothing at all.
+///
+/// Awaiting this last fixes both: `runtime.schedule` runs its block on the
+/// JavaScript thread, and resuming a `@JavaScriptActor` continuation from inside
+/// that block runs the continuation *right there* -- the same non-hopping
+/// executor, used the other way round. The generated closure therefore encodes
+/// and tears down on the JavaScript thread.
+///
+/// A lost runtime is not an error here: if there is no runtime there is nothing
+/// left to protect, and the call's own result still has to be delivered.
+@JavaScriptActor
+private func onJavaScriptThread(
+  _ appContext: AppContext?,
+  _ body: @JavaScriptActor () async throws -> Void
+) async throws {
+  do {
+    try await body()
+  } catch {
+    await hopToJavaScriptThread(appContext)
+    throw error
+  }
+  await hopToJavaScriptThread(appContext)
+}
+
+@JavaScriptActor
+private func hopToJavaScriptThread(_ appContext: AppContext?) async {
+  guard let appContext, let runtime = try? appContext.runtime else {
+    return
+  }
+  await withCheckedContinuation { continuation in
+    runtime.schedule {
+      continuation.resume()
+    }
   }
 }

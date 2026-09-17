@@ -156,6 +156,36 @@ That list has 23 entries and upstream calls it 22 languages — Chinese Simplifi
 and Traditional are two scripts of one. The Swift doc comment says 23 and the
 model page says 22 for that reason; neither is wrong.
 
+## Every async call returns nothing, on purpose
+
+`suggest` is `@JS async` functions that return `Void` and stash the result on
+the shared object under the caller's job id; the result comes back through a
+**synchronous** `takeSuggestions`. `src/Emo.ts` makes both calls, so the public API above never
+sees the seam.
+
+That is the fourth Expo Modules 2.0 limit in `docs/architecture.md`, and the
+short version is that **a `@JS async` function does its last work on the wrong
+thread**. `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs
+jobs "synchronously without hopping to the proper thread" and says so in its own
+doc comment, so once the call suspends on real work the closure the
+`@ExpoModule` macro generated resumes on
+`com.apple.root.user-initiated-qos.cooperative`. Two things it does from there
+touch the Hermes runtime without the JavaScript thread: it encodes the return
+value, and it destroys the owning copy of the call's *arguments* that
+`createAsyncFunction` handed it. The downstream symptom is
+`HadesGC::youngGenCollection` killing the process later and blaming nothing.
+
+Returning `Void` removes the first of those. It does not remove the second --
+`ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+nothing at all -- so every async function here also lands back on the JavaScript
+thread before it returns, through the `onJavaScriptThread` helper at the bottom
+of `ios/EmoModule.swift`. Both halves, the crash reports behind them and what could not
+be settled are in `docs/architecture.md`.
+
+Kotlin has no encode-on-the-wrong-thread hazard. The Android half holds the
+result anyway, so that the TypeScript above it stays one implementation rather
+than two.
+
 ## Verified
 
 Driven on an iOS 26.4 simulator (iPhone 17 Pro Max) with a dev build, alongside

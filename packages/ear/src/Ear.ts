@@ -259,9 +259,11 @@ export class Ear {
       throw invalid('identify needs a `uri`: a file:// URI or a path to audio');
     }
     const native = toNativeOptions(options);
-    return this.run(options.onProgress, (jobId) =>
-      Ear.requireNative().identifyFile(this.native, toPath(options.uri), native, jobId)
-    );
+    return this.run(options.onProgress, async (jobId) => {
+      await Ear.requireNative().identifyFile(this.native, toPath(options.uri), native, jobId);
+      // Collected separately, and synchronously -- see `native.ts`.
+      return this.native.takeDetection(jobId);
+    });
   }
 
   /**
@@ -288,9 +290,11 @@ export class Ear {
       throw invalid(`'${String(sampleRate)}' is not a sample rate; expected a positive number`);
     }
     const native = toNativeOptions(options);
-    return this.run(options.onProgress, (jobId) =>
-      Ear.requireNative().identifySamples(this.native, mono, sampleRate, native, jobId)
-    );
+    return this.run(options.onProgress, async (jobId) => {
+      await Ear.requireNative().identifySamples(this.native, mono, sampleRate, native, jobId);
+      // Collected separately, and synchronously -- see `native.ts`.
+      return this.native.takeDetection(jobId);
+    });
   }
 
   /**

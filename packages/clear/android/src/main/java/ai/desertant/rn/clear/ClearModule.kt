@@ -65,7 +65,10 @@ class ClearModule : Module() {
         outputPath: String,
         options: ClearEnhanceOptions,
         jobId: String ->
-      model.enhanceFile(inputPath, outputPath, options, model.progressEmitter(jobId))
+      model.stashMetrics(
+        jobId,
+        model.enhanceFile(inputPath, outputPath, options, model.progressEmitter(jobId)),
+      )
     }
 
     AsyncFunction("enhanceBuffer") Coroutine {
@@ -73,7 +76,21 @@ class ClearModule : Module() {
         input: ClearAudioObject,
         options: ClearEnhanceOptions,
         jobId: String ->
-      model.enhanceBuffer(input, options, model.progressEmitter(jobId))
+      val audio = model.enhanceBuffer(input, options, model.progressEmitter(jobId))
+      model.stashAudio(jobId, audio)
+      model.stashMetrics(jobId, audio.metrics)
+    }
+
+    // Both halves of an enhancement come back through synchronous calls. On the
+    // Apple side that is forced -- an async return value is encoded off the
+    // JavaScript thread and corrupts the Hermes heap -- and Kotlin matches it so
+    // one TypeScript file drives both.
+    Function("takeEnhancedAudio") { model: ClearModelObject, jobId: String ->
+      model.takeEnhancedAudio(jobId)
+    }
+
+    Function("takeMetrics") { model: ClearModelObject, jobId: String ->
+      model.takeMetrics(jobId)
     }
 
     // MARK: - State

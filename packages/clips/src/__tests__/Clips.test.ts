@@ -14,6 +14,9 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
   const listeners: Listener[] = [];
   const model = {
     isDownloaded: jest.fn(() => true),
+    // The async half resolves to nothing; the result is collected
+    // synchronously. See `native.ts`.
+    takeClips: jest.fn(() => [clip()]),
     release: jest.fn(),
     addListener: jest.fn((_event: string, listener: Listener) => {
       listeners.push(listener);
@@ -35,7 +38,7 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
       defaultLimit: 10,
       createModel: jest.fn(() => model),
       load: jest.fn(async () => undefined),
-      findClips: jest.fn(async () => [clip()]),
+      findClips: jest.fn(async () => undefined),
       sentencesFromWords: jest.fn(() => [
         { text: 'One two.', start: 0, end: 1 },
         { text: 'Three four.', start: 1, end: 2 },

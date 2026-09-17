@@ -250,25 +250,33 @@ the TypeScript surface takes `{ x, y }` objects and so cannot produce one.
 
 ## Every async call returns nothing, on purpose
 
-`recognize` is a `Promise<void>`. The recognition comes back from
-`takeRecognition(jobId)`, which is **synchronous**.
+`recognize` is `@JS async` functions that return `Void` and stash the result on
+the shared object under the caller's job id; the result comes back through a
+**synchronous** `takeRecognition`. `src/Shapes.ts` makes both calls, so the public API above never
+sees the seam.
 
-That is a workaround for a real crash, reproduced in four packages in this repo
-before this one was written: a `@JS async` function's return value can be encoded
-**off the JavaScript thread**, and the process segfaults on
-`com.apple.root.user-initiated-qos.cooperative` rather than on
-`com.facebook.react.runtime.JavaScript`. `@JavaScriptActor` does not prevent it —
-the value is encoded after the actor hop the annotation governs. Ear hit it
-returning `[String]`, Clear through `Record.encode`, Emo through
-`JavaScriptValuesBuffer.deinit`; the downstream symptom is
+That is the fourth Expo Modules 2.0 limit in `docs/architecture.md`, and the
+short version is that **a `@JS async` function does its last work on the wrong
+thread**. `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs
+jobs "synchronously without hopping to the proper thread" and says so in its own
+doc comment, so once the call suspends on real work the closure the
+`@ExpoModule` macro generated resumes on
+`com.apple.root.user-initiated-qos.cooperative`. Two things it does from there
+touch the Hermes runtime without the JavaScript thread: it encodes the return
+value, and it destroys the owning copy of the call's *arguments* that
+`createAsyncFunction` handed it. The downstream symptom is
 `HadesGC::youngGenCollection` killing the process later and blaming nothing.
 
-A `ShapesRecognition` carries a `number[]`, which is the same *shape* of value
-that took Ear down, so the split here is not a precaution taken from a distance.
-A synchronous `@JS` member runs on the JavaScript thread by construction, so the
-record is encoded where it has to be. `src/Shapes.ts` hides both halves; do not
-"simplify" them back into one call.
+Returning `Void` removes the first of those. It does not remove the second --
+`ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+nothing at all -- so every async function here also lands back on the JavaScript
+thread before it returns, through the `onJavaScriptThread` helper at the bottom
+of `ios/ShapesModule.swift`. Both halves, the crash reports behind them and what could not
+be settled are in `docs/architecture.md`.
 
+Kotlin has no encode-on-the-wrong-thread hazard. The Android half holds the
+result anyway, so that the TypeScript above it stays one implementation rather
+than two.
 ## The wire is flat; the API is a union
 
 `Shape` is a Swift enum with associated values and a Kotlin sealed class. Neither

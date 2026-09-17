@@ -9,12 +9,16 @@
 //
 // A card is two short strings, which is the smallest result in this family by a
 // wide margin and nowhere near the shapes that took Ear, Emo and Clear down. It
-// goes through `takeCard` anyway. The limit has now been reproduced on a bare
-// `[String]`, on `Record.encode`, and on `JavaScriptValuesBuffer.deinit`, in five
-// separate packages; treating it as a property of the toolchain rather than of a
-// result's size is what the other three packages written this session concluded,
-// and a package that made itself the exception would be betting on a crash being
-// about size when the evidence says it is about thread.
+// goes through `takeCard` anyway. The limit has been reproduced on a bare
+// `[String]` and on `Record.encode`/`ClearMetrics.toObject`; treating it as a
+// property of the toolchain rather than of a result's size is what the other
+// packages written this session concluded, and a package that made itself the
+// exception would be betting on a crash being about size when the evidence says
+// it is about thread.
+//
+// The `JavaScriptValuesBuffer.deinit` crashes are a different half of the same
+// defect -- the call's *arguments* torn down on the same wrong thread -- and no
+// return type fixes those. `onJavaScriptThread` in TitleModule.swift does.
 
 import ExpoModulesCore
 import Foundation

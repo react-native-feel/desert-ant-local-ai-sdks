@@ -188,6 +188,44 @@ final class UhmModelObject: SharedObject, @unchecked Sendable {
       self?.onProgress(UhmProgressEvent(jobId: jobId, phase: phase, fraction: fraction))
     }
   }
+
+  // MARK: - Results waiting to be collected
+
+  /// Results waiting to be handed over, keyed by the job that produced them.
+  ///
+  /// Keyed rather than a single slot so two concurrent calls on one model cannot
+  /// take each other's answer -- the same reason every entry point in this family
+  /// carries a job id. Entries are removed on read, so nothing accumulates; a job
+  /// whose caller threw before reading leaves one behind, which dies with the
+  /// model.
+  private let resultsLock = NSLock()
+  private var results: [String: UhmResult] = [:]
+
+  /// Non-async so the lock is taken in a synchronous context: `NSLock.lock()` is
+  /// unavailable from an asynchronous one, and holding it across an `await` is
+  /// what that rule exists to prevent.
+  func stash(_ value: UhmResult, for jobId: String) {
+    resultsLock.lock()
+    defer { resultsLock.unlock() }
+    results[jobId] = value
+  }
+
+  /// Hand over the result computed for `jobId`, and forget it.
+  ///
+  /// Synchronous, and that is the point rather than an optimization: a
+  /// synchronous `@JS` member's return value is encoded inside the host call, on
+  /// the JavaScript thread, by construction. The asynchronous half returns
+  /// `Void` so that nothing is encoded on the cooperative pool. See the note on
+  /// `takeResult` in the module.
+  @JS
+  func takeResult(_ jobId: String) throws -> UhmResult {
+    resultsLock.lock()
+    defer { resultsLock.unlock() }
+    guard let value = results.removeValue(forKey: jobId) else {
+      throw InferenceFailedException("no result is waiting for job \(jobId)")
+    }
+    return value
+  }
 }
 
 /// Rate-limits progress so a fine-grained callback does not become a hop onto the

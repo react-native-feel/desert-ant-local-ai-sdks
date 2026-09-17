@@ -268,6 +268,25 @@ error a caller can act on. `TongueModel.swift` therefore searches the loaded
 bundles for the two files itself, which is a superset of what `Bundle.module`
 checks, and raises `ERR_MODEL_UNAVAILABLE` when it finds nothing.
 
+## The one async call returns nothing, and `detect` is not async at all
+
+`load` is the only `@JS async` function in this package and it returns `Void`
+anyway; `detect` is a **synchronous** `@JS` function, which is the safe shape as
+well as the fast one.
+
+That is not just tidiness. The fourth Expo Modules 2.0 limit in
+`docs/architecture.md` is that **a `@JS async` function does its last work on the
+wrong thread**: `@JavaScriptActor` is not a hop -- `expo-modules-jsi`'s executor
+runs jobs "synchronously without hopping to the proper thread" and says so in its
+own doc comment -- so after the first suspension the generated closure resumes on
+`com.apple.root.user-initiated-qos.cooperative` and both encodes its return value
+and destroys the call's arguments from there. A synchronous `@JS` function never
+leaves the JavaScript thread, so `detect` is outside all of it.
+
+`load` still lands back on the JavaScript thread before it returns, through the
+`onJavaScriptThread` helper at the bottom of `ios/TongueModule.swift`, because the
+argument-teardown half of that defect does not care what a function returns.
+
 ## Verified
 
 Driven on an iOS 26.4 simulator (iPhone 17 Pro Max) with a dev build, alongside

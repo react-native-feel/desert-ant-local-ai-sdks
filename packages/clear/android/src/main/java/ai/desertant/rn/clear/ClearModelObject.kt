@@ -90,10 +90,45 @@ class ClearModelObject(
     )
   }
 
+  // MARK: - Results waiting to be collected
+  //
+  // Kotlin has no encode-on-the-wrong-thread hazard to design around; it holds
+  // the results anyway so that the TypeScript above it is one implementation
+  // rather than two. See `ClearModule.enhanceFile` on the Apple side for why
+  // the async half there returns nothing.
+
+  private val results = Any()
+  private val metrics = HashMap<String, Map<String, Any?>>()
+  private val buffers = HashMap<String, ClearAudioObject>()
+
+  fun stashMetrics(jobId: String, value: Map<String, Any?>) {
+    synchronized(results) { metrics[jobId] = value }
+  }
+
+  /** The metrics held for [jobId], removed as they are read. */
+  fun takeMetrics(jobId: String): Map<String, Any?> = synchronized(results) {
+    metrics.remove(jobId)
+      ?: throw InferenceFailedException("no metrics are waiting for job $jobId")
+  }
+
+  fun stashAudio(jobId: String, value: ClearAudioObject) {
+    synchronized(results) { buffers[jobId] = value }
+  }
+
+  /** The enhanced buffer held for [jobId], removed as it is read. */
+  fun takeEnhancedAudio(jobId: String): ClearAudioObject = synchronized(results) {
+    buffers.remove(jobId)
+      ?: throw InferenceFailedException("no audio is waiting for job $jobId")
+  }
+
   @Synchronized
   fun release() {
     if (released) return
     released = true
+    synchronized(results) {
+      metrics.clear()
+      buffers.clear()
+    }
     clear.close()
   }
 

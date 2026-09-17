@@ -5,9 +5,10 @@
 //
 // What matters is *where* these are encoded: everything in this file is handed to
 // JavaScript from a synchronous member, never returned from a `@JS async`
-// function. `AlignTranscript` is an array of `@Record`s inside a `@Record`, which
-// is exactly the shape that took Emo's process down through
-// `JavaScriptValuesBuffer.deinit`. See AlignModel.swift.
+// function. `AlignTranscript` is an array of `@Record`s inside a `@Record`, and
+// the largest result in this family after Clear's audio. See AlignModel.swift --
+// and note that the `JavaScriptValuesBuffer.deinit` crashes are the *argument*
+// half of that defect, which no return type fixes.
 
 import Align
 import ExpoModulesCore

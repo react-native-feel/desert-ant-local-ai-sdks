@@ -10,9 +10,12 @@
 //   * A `@JS init` cannot throw, so construction is `createModel`.
 //   * A `@SharedObject` must not come back from a `@JS async` function, so
 //     `createModel` is synchronous.
-//   * A `@JS async` function's return value can be encoded off the JavaScript
-//     thread, so **both** async functions below return `Void` and the card comes
-//     back through the shared object's synchronous `takeCard`.
+//   * A `@JS async` function does its last work on the wrong thread, so **both**
+//     async functions below return `Void` and the card comes back through the
+//     shared object's synchronous `takeCard` -- and both also land back on the
+//     JavaScript thread before returning, through `onJavaScriptThread` at the
+//     bottom of this file, because the same closure destroys the call's
+//     *arguments* there too.
 //
 // MARK: - The MLX trait, which is why this package does half of what it says
 //
@@ -263,7 +266,9 @@ public final class TitleModule: Module {
   @JS
   @JavaScriptActor
   func prepare(_ model: TitleModelObject, _ jobId: String) async throws {
-    try await model.prepare(jobId: jobId)
+    try await onJavaScriptThread(appContext) {
+      try await model.prepare(jobId: jobId)
+    }
   }
 
   /// Write a title and a description for `text`, holding the card on the shared
@@ -279,6 +284,70 @@ public final class TitleModule: Module {
   @JS
   @JavaScriptActor
   func describe(_ model: TitleModelObject, _ text: String, _ jobId: String) async throws {
-    try await model.describe(text: text, jobId: jobId)
+    try await onJavaScriptThread(appContext) {
+      try await model.describe(text: text, jobId: jobId)
+    }
+  }
+}
+
+// MARK: - Landing a `@JS async` call back on the JavaScript thread
+
+/// Run `body`, then put the rest of this `@JS async` call back on the JavaScript
+/// thread before returning to `createAsyncFunction`.
+///
+/// **`@JavaScriptActor` does not hop.** Its executor is
+/// `JavaScriptExecutor.enqueue { job.runSynchronously(on:) }`, and
+/// expo-modules-jsi's own doc comment says so: it "executes jobs *synchronously*
+/// without hopping to the proper thread ... running these jobs on the JavaScript
+/// thread must be ensured externally". So the annotation is an assertion, not a
+/// hop: the moment a `@JS async` function suspends on real work, its continuation
+/// resumes on `com.apple.root.user-initiated-qos.cooperative`.
+///
+/// Two things then happen there, inside the closure the `@ExpoModule` macro
+/// generated, and both touch Hermes without the runtime's lock:
+///
+/// 1. the return value is encoded (`Record.encode`, `Array<String>.encode`), and
+/// 2. the **arguments** are destroyed. `createAsyncFunction` hands the closure an
+///    *owning* copy of the argument buffer, so leaving it runs
+///    `JavaScriptValuesBuffer.deinit` -> `jsi::Value::~Value()` once per argument.
+///    Every argument that is a JS string or object -- a `@Record`, an array, a
+///    `Float32Array`, and the `SharedObject` every entry point here takes first --
+///    is a pointer into the Hermes heap being released off-thread.
+///
+/// (1) is why every `@JS async` function in this package returns `Void`. (2) is
+/// not fixed by that, which is what `ShapesModule.load` proved by crashing in
+/// `JavaScriptValuesBuffer.deinit` while returning nothing at all.
+///
+/// Awaiting this last fixes both: `runtime.schedule` runs its block on the
+/// JavaScript thread, and resuming a `@JavaScriptActor` continuation from inside
+/// that block runs the continuation *right there* -- the same non-hopping
+/// executor, used the other way round. The generated closure therefore encodes
+/// and tears down on the JavaScript thread.
+///
+/// A lost runtime is not an error here: if there is no runtime there is nothing
+/// left to protect, and the call's own result still has to be delivered.
+@JavaScriptActor
+private func onJavaScriptThread(
+  _ appContext: AppContext?,
+  _ body: @JavaScriptActor () async throws -> Void
+) async throws {
+  do {
+    try await body()
+  } catch {
+    await hopToJavaScriptThread(appContext)
+    throw error
+  }
+  await hopToJavaScriptThread(appContext)
+}
+
+@JavaScriptActor
+private func hopToJavaScriptThread(_ appContext: AppContext?) async {
+  guard let appContext, let runtime = try? appContext.runtime else {
+    return
+  }
+  await withCheckedContinuation { continuation in
+    runtime.schedule {
+      continuation.resume()
+    }
   }
 }

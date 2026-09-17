@@ -326,13 +326,16 @@ final class AlignModelObject: SharedObject, @unchecked Sendable {
   /// `com.facebook.react.runtime.JavaScript`, and `@JavaScriptActor` on the
   /// function does not prevent it -- the return value is encoded after the actor
   /// hop the annotation governs. Ear hit it returning `[String]`, Clear through
-  /// `Record.encode`, Emo through `JavaScriptValuesBuffer.deinit` on an array of
-  /// `@Record`s, and Redact, Gist and Shapes designed around it from the start.
+  /// `Record.encode`, and Redact, Gist and Shapes designed around it from the start.
   /// An `AlignTranscript` is **an array of `@Record`s inside a `@Record`**, which
-  /// is Emo's exact shape and the largest result in this family after Clear's
-  /// audio -- a minute of speech is a couple of hundred `AlignWord`s. So the
-  /// async half returns `Void` and `takeTranscript` is synchronous, which puts
-  /// the encode on the JavaScript thread by construction.
+  /// is the largest result in this family after Clear's audio -- a minute of
+  /// speech is a couple of hundred `AlignWord`s. So the async half returns `Void`
+  /// and `takeTranscript` is synchronous, which puts the encode on the JavaScript
+  /// thread by construction.
+  ///
+  /// That is necessary and not sufficient: the same closure destroys the call's
+  /// *arguments* on the same thread, which is what `onJavaScriptThread` in
+  /// AlignModule.swift is for. See docs/architecture.md, limit 4.
   ///
   /// The two halves of the work are timed separately because they belong to
   /// different vendors. `processingSec` covers Apple's recognition as well;

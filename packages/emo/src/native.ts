@@ -38,6 +38,22 @@ export interface NativeSuggestOptions {
  */
 export interface NativeEmoModel extends SharedObject<{ progress: (event: ProgressEvent) => void }> {
   isDownloaded(): boolean;
+  /**
+   * Hand over the suggestions computed for `jobId`, and forget it.
+   *
+   * Synchronous, and that is the point rather than an optimization. An async
+   * native function's return value is encoded after its last suspension, and on
+   * iOS that lands on the cooperative thread pool rather than the JavaScript
+   * thread -- which corrupts the Hermes heap and segfaults the process, usually
+   * somewhere else entirely and some time later. A synchronous native function
+   * encodes inside the host call, on the JavaScript thread, by construction.
+   *
+   * Keyed by job id rather than a single slot, so two concurrent calls on one
+   * model cannot take each other's answer. Throws `ERR_INFERENCE_FAILED` if
+   * nothing is waiting, which can only happen if it is called without a
+   * completed call for that id.
+   */
+  takeSuggestions(jobId: string): EmoSuggestion[];
 }
 
 interface DesertAntEmoModule extends NativeModule {
@@ -78,7 +94,7 @@ interface DesertAntEmoModule extends NativeModule {
     text: string,
     options: NativeSuggestOptions,
     jobId: string
-  ): Promise<EmoSuggestion[]>;
+  ): Promise<void>;
 }
 
 export default requireOptionalNativeModule<DesertAntEmoModule>('DesertAntEmo');

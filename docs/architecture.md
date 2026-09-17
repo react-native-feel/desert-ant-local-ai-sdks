@@ -1514,64 +1514,283 @@ toolchain and a real phone, and each one moved the design.
    neither success nor failure, and the app was gone. This is why `enhanceBuffer`
    returns metrics and `takeEnhancedAudio` hands over the audio.
 
-4. **A `@JS async` function's return value can be encoded off the JavaScript
-   thread, which segfaults.** Found by Ear, and it generalizes limit 3 rather
-   than sitting beside it. `supportedLanguages` returned `[String]`; the crash is
-   inside `Array<String>.encode(_:in:)` on
-   `com.apple.root.user-initiated-qos.cooperative` rather than on
-   `com.facebook.react.runtime.JavaScript`:
+4. **A `@JS async` function does its last work on the wrong thread.** Ear found
+   this as "the return value is encoded off the JavaScript thread", which is true
+   and is half of it. The other half took another five crash reports to see, and
+   the whole of it is readable in three files of `expo-modules-jsi` 57.1.0.
 
-   ```
-   Thread: com.apple.root.user-initiated-qos.cooperative
-     hermesvm         createStringFromUtf8(...)
-     ExpoModulesJSI   static Array<A>.encode(_:in:)
-     DesertAntExample closure #5 in EarModule._decorateModule(object:in:)
-   ```
+   `JavaScriptRuntime.createAsyncFunction` is the bridge every `@JS async`
+   function is bound through, and it is short enough to quote entire:
 
-   `@JavaScriptActor` on the function does not prevent it: the return value is
-   encoded after the actor hop the annotation governs.
-
-   Three things make it expensive to diagnose. It is a **race**, so it survived a
-   first call and a second before taking the process down. The damage it does to
-   the Hermes runtime **surfaces later and elsewhere** -- the first two crashes
-   seen here were inside an unrelated progress event, one in
-   `EventEmitter::emitEvent` and one in `EarProgressEvent.toObject`, which sent
-   the investigation after the event emitter for an hour. And the **narrow
-   reading is wrong**: the same run then crashed Clear the same way, in
-   `Record.encode(_:in:)` off the same thread, so this is not "arrays of
-   primitives only".
-
-   ```
-   Thread: com.apple.root.user-initiated-qos.cooperative
-     ExpoModulesCore  static Record.encode(_:in:)
-     DesertAntExample closure #6 in ClearModule._decorateModule(object:in:)
+   ```swift
+   return createFunction(name) { this, arguments in
+     let promise = try JavaScriptPromise(self)
+     // Arguments buffer needs to be copied to ensure safe async access.
+     let argumentsRef = arguments.copy().ref()
+     self.schedule {                                  // -> JavaScript thread
+       do {
+         let result = try await function(this, argumentsRef.take())
+         promise.resolve(result)
+       } catch { promise.reject(error) }
+     }
+     return promise.asValue()
+   }
    ```
 
-   That is the concrete explanation for something this repo had already recorded
-   as folklore -- "Clear's in-memory path hangs on this simulator". It does not
-   hang; it races, and loses.
+   `function` is the closure the `@ExpoModule` macro generated: the
+   `closure #N in XModule._decorateModule(object:in:)` that every crash report in
+   this round names. It is `@JavaScriptActor`-isolated, and **that annotation does
+   not hop threads**:
 
-   Ear's fix is to take the encode off the async path entirely: `loadLanguages`
-   returns `Void` and the array is read back through a **synchronous** `@JS`
-   member, which runs on the JavaScript thread by construction. That is a general
-   shape and not a special case -- for any async call whose result is large or
-   whose encoding is not a single scalar, splitting "do the work" from "hand the
-   result over" is the safe arrangement here.
+   ```swift
+   internal class JavaScriptExecutor: SerialExecutor, @unchecked Sendable {
+     func enqueue(_ job: UnownedJob) {
+       job.runSynchronously(on: self.asUnownedSerialExecutor())
+     }
+   ```
 
-   Why five model packages did not hit it earlier is a matter of exposure rather
-   than immunity: Uhm and Emo return `@Record`s and small arrays of them, Ear
-   returned 99 strings. Clear had it all along. **Emo has since been caught too**
-   — see "The async-return crash has two more sites" below — so "small arrays of
-   records are fine" was exposure as well, and the rule to design to is the
-   general one: an async call whose result is large, or whose encoding is not a
-   single scalar, should return `Void` and hand the result over synchronously.
-   Gist is the first package here written that way from the start.
+   expo's own doc comment above it says so in as many words -- the executor
+   "executes jobs **synchronously** without hopping to the proper thread", and
+   "running these jobs on the JavaScript thread must be ensured externally". The
+   annotation is an assertion, not a hop, and the only thing that ever checks it
+   is a debug `assert` on `Thread.current.name` reached through `assumeIsolated`.
+
+   So the generated closure *starts* on the JavaScript thread, because `schedule`
+   puts it there, and then resumes after its first real suspension wherever that
+   work finished -- `com.apple.root.user-initiated-qos.cooperative`. Everything it
+   does from that point touches the Hermes runtime from the wrong thread, and
+   there are **two** such things, not one:
+
+   * **The return value is encoded.** The closure owes
+     `createAsyncFunction` an already-encoded `JavaScriptValue`, so
+     `Record.encode`, `Array<String>.encode` and the `toObject(appContext:)`
+     calls under them all run there.
+   * **The arguments are destroyed.** `arguments.copy()` above is an *owning*
+     `JavaScriptValuesBuffer`, moved into the closure as a `consuming` parameter,
+     so leaving the closure runs its `deinit`:
+
+     ```swift
+     deinit {
+       if ownsMemory {
+         bufferPointer.deinitialize()   // ~jsi::Value() once per argument
+         bufferPointer.deallocate()
+       }
+     }
+     ```
+
+     Any argument that is a JavaScript string or object is a pointer into the
+     Hermes heap being released off-thread: a `@Record`, an array, a
+     `Float32Array` (whose `decode` does **not** copy -- it keeps the live
+     `jsi::Object` for the whole body), and the `SharedObject` that every
+     asynchronous entry point in this repo takes as its first argument. Numbers
+     and booleans are trivially destructible and cost nothing.
+
+   `promise.resolve` is the one step in that closure that is safe, and it is safe
+   because it hops on purpose: *"`resolve` is not isolated, so make sure to jump
+   to JS thread"*, and the encodable overload does the encode inside that hop.
+   `EventEmitter.emit` hops the same way, which is what exonerates the `@Event`
+   path -- see below.
+
+   ### The evidence, and what the closure numbers say
+
+   Fourteen crash reports in `~/Library/Logs/DiagnosticReports/DesertAntExample-*.ips`
+   over this round and the last two. Nine are on
+   `com.apple.root.user-initiated-qos.cooperative`, and every one of those has the
+   same three frames under the model's own:
+
+   ```
+   libswift_Concurrency  completeTaskWithClosure(...)
+   ExpoModulesJSI        closure #1 in closure #1 in JavaScriptRuntime.createAsyncFunction(_:_:)
+   DesertAntExample      closure #N in XModule._decorateModule(object:in:)
+   ```
+
+   `N` counts the module's `@JS` **functions** in declaration order; properties are
+   not in that numbering. Two independent checks fix that reading: Ear's crash is
+   `closure #5` inside `Array<String>.encode`, and `supportedLanguages` -- the only
+   `[String]`-returning async function it ever had -- was its fifth function; and
+   Clear's is `closure #6` inside `Record.encode` -> `ClearMetrics.toObject`, and
+   `enhanceBuffer` was its sixth. Read that way the nine fall into two groups:
+
+   | Report | Site | Closure | Which function | Returned |
+   | --- | --- | --- | --- | --- |
+   | 21:36:55, 21:37:21 | `Array<String>.encode` | Ear #5 | `supportedLanguages` | `[String]` |
+   | 21:46:54 | `Record.encode` | Clear #6 | `enhanceBuffer` | `ClearMetrics` |
+   | 06:31:35, 06:48:22 | `ClearMetrics.toObject` | Clear #6 | `enhanceBuffer` | `ClearMetrics` |
+   | 22:54:59 | `JavaScriptValuesBuffer.deinit` | Emo #2 | `load` | **`Void`** |
+   | 07:07:43 | `JavaScriptValuesBuffer.deinit` | Shapes #2 | `load` | **`Void`** |
+   | 07:08:34 | `JavaScriptValuesBuffer.deinit` | Clear #4 | `load` | **`Void`** |
+   | 08:46:36 | `JavaScriptValuesBuffer.deinit` | Clear #4 | `load` | **`Void`** |
+
+   The last of those is **after the fix in this round was built**, and is dealt
+   with separately below. The three before it are the ones that matter, and they
+   are why the working theory -- "async returns are unsafe, arguments are fine"
+   -- was wrong. `load(model, jobId)` returns nothing in all three packages, so
+   there is no return value to encode at all. What is being destroyed on the
+   cooperative thread is the argument buffer: a `jsi::Object` for the shared
+   object and a `jsi::String` for the job id. Shapes is the sharpest case of the
+   three, because Shapes was *written* to the return-`Void` rule from the start
+   and crashed anyway.
+
+   Two earlier notes in this file were wrong and are corrected here. The Emo crash
+   was attributed to `suggest` returning `[EmoSuggestionRecord]`; `closure #2` is
+   `load`, and `suggest` is `#3`. And `ShapesModule.swift` and several package
+   READMEs described the Shapes crash as another instance of the return-encode
+   defect, which it cannot be: Shapes has no async return value to encode.
+
+   The five remaining reports are on `com.facebook.react.runtime.JavaScript` --
+   `EarProgressEvent.toObject`, `ClearProgressEvent.toObject` twice, and
+   `HadesGC::youngGenCollection` blaming nothing at all. Those are the *downstream*
+   symptom: a Hermes heap already corrupted, surfacing at the next thing to walk
+   it. They are not sites, and the two progress events in particular are not
+   evidence against the `@Event` path, which hops before it encodes.
+
+   ### Upstream has already fixed this once, elsewhere
+
+   The old `ModuleDefinition { AsyncFunction(...) }` DSL had the identical hazard
+   and lost it in expo-modules-core **57.0.4**, whose changelog says: *"Concurrent
+   functions now decode `this` and the arguments buffer synchronously inside the
+   host call and schedule only converted native values, so no JSI-owned wrappers
+   are destroyed off the JS thread after the runtime is torn down. (#47716/#47717)"*
+   `ConcurrentFunctionDefinition.swift` does exactly that. `createAsyncFunction`,
+   which is what the 2.0 macros bind through, did not get the fix -- and the macro
+   that generates the closure has a comment conceding the point: *"the buffer
+   escapes into the task anyway."* This is worth reporting upstream; from the
+   outside it looks like #47717 applied to one of two call paths.
+
+   ### What this repo does about it
+
+   Two changes, one per site, and they compose:
+
+   * **Every `@JS async` function returns `Void`.** Results are stashed on the
+     `@SharedObject` under the job id and handed over by a synchronous `@JS`
+     member -- `takeMetrics`, `takeDetection`, `takeSuggestions`, `takeResult`,
+     `takeTranscript`, `takeClips`, alongside the `takeTagging`, `takeRedaction`,
+     `takeRecognition`, `takeTranscript` and `takeCard` that Gist, Redact, Shapes,
+     Align and Title already had. A synchronous `@JS` function's return value is
+     encoded inside the host call, on the JavaScript thread, by construction.
+   * **Every `@JS async` function lands back on the JavaScript thread before it
+     returns**, through a small `onJavaScriptThread(appContext)` wrapper that each
+     module file carries:
+
+     ```swift
+     await withCheckedContinuation { continuation in
+       runtime.schedule { continuation.resume() }
+     }
+     ```
+
+     `runtime.schedule` runs its block on the JavaScript thread, and resuming a
+     `@JavaScriptActor` continuation from inside that block runs the continuation
+     *right there* -- the same non-hopping executor, used the other way round. The
+     generated closure's remaining work, which is the return encode and the
+     argument buffer's `deinit`, therefore happens where it must. It is the one
+     lever available from outside `expo-modules-jsi`: the buffer's ownership and
+     the closure's isolation are both generated code, but *where the body finishes*
+     is not.
+
+   The first of those is the one with a track record. The second is new in this
+   round and is what the argument-buffer site actually needs; it degrades to the
+   old behaviour rather than to an error when the runtime is already gone
+   (`try? appContext.runtime`), which is the right failure for a teardown race.
+
+   ### The audit, so the claim is checkable
+
+   Every `@JS` member across the twelve model packages, counted after the change.
+   `Async` is `@JS async` functions on the module; all of them now return `Void`,
+   and all of them take a `@SharedObject` first argument and a `String` job id, so
+   all of them were exposed to both halves of this defect.
+
+   | Package | `@JS` members | Async (all `Void`) | Async entry points | Synchronous hand-over |
+   | --- | --- | --- | --- | --- |
+   | align | 16 | 3 | `load`, `prepareLocale`, `transcribe` | `takeTranscript` |
+   | clear | 17 | 4 | `download`, `load`, `enhanceFile`, `enhanceBuffer` | `takeEnhancedAudio`, **`takeMetrics`** |
+   | clips | 11 | 2 | `load`, `findClips` | **`takeClips`** |
+   | ear | 15 | 4 | `load`, `identifyFile`, `identifySamples`, `loadLanguages` | `languages`, **`takeDetection`** |
+   | emo | 12 | 2 | `load`, `suggest` | **`takeSuggestions`** |
+   | gist | 17 | 3 | `load`, `classify`, `scores` | `takeTagging`, `takeDistribution` |
+   | redact | 14 | 2 | `load`, `redaction` | `takeRedaction` |
+   | shapes | 11 | 2 | `load`, `recognize` | `takeRecognition` |
+   | title | 22 | 2 | `prepare`, `describe` | `takeCard` |
+   | tongue | 14 | 1 | `load` | -- (`detect` is synchronous) |
+   | uhm | 12 | 3 | `load`, `analyzeFile`, `analyzeSamples` | **`takeResult`** |
+   | voz | 11 | 4 | `download`, `load`, `transcribeFile`, `transcribeSamples` | **`takeTranscript`** |
+
+   Bold is what this round added. Six packages were still returning a value from a
+   `@JS async` function: Clear (`ClearMetrics`, twice), Clips (`[ClipsClip]`), Ear
+   (`EarDetection`, twice), Emo (`[EmoSuggestionRecord]`), Uhm (`UhmResult`,
+   twice) and Voz (`VozTranscript`, twice) -- eleven functions, of which only
+   Clear's and Emo's had been implicated by a crash report. The other four predate
+   the rule rather than disagreeing with it.
+
+   ### What the fix was measured against
+
+   iPhone 17 Pro Max simulator, iOS 26, Debug build, Metro on 8085, with Clear,
+   Emo, Ear, Uhm, Tongue, Gist, Redact, Shapes, Align and Title all loaded. Voz
+   and Clips sit the self-test out on this device -- their weights are 490 MB and
+   288 MB and are not downloaded -- so their changed calls are compiled and bound
+   but not exercised.
+
+   Crash reports in `~/Library/Logs/DiagnosticReports` went **13 before the build
+   to 14**, and the fourteenth is the `08:46:36` report above: the fixed binary,
+   the same site, during its first launch and before any self-test had been run.
+   After that, **seven complete self-test runs back to back**, from 08:52 to
+   09:30, roughly forty minutes of continuous running, and the count stayed at 14.
+
+   That is a weak instrument and it is worth saying how weak: the Redact round got
+   three consecutive clean runs on an unfixed tree and the Title round tripped one
+   crash across its runs, so seven clean runs is consistent with the fix working
+   and also consistent with a quiet afternoon. What it rules out is a *regression*
+   -- the stash-and-take conversion of six packages did not break anything that
+   the self-test reaches. What it does not do is prove the race is gone.
+
+   Observed directly in the UI rather than merely "did not crash": Clear's metrics
+   through the new `takeMetrics` (2.0 s in 358 ms, 6x realtime, -29.4 LUFS), Uhm's
+   six filler spans through `takeResult`, and Gist's channel-topic roll-up.
+   Ear's and Emo's cards were not captured in a snapshot -- the example app's
+   scroll view virtualizes and the accessibility tree would not hold still -- so
+   their changed calls are covered by "the run completed and the process lived"
+   and by the unchanged unit tests, not by a read-back result.
+
+   ### What is not established
+
+   Whether the argument-buffer teardown is a *cause* or only a *place where
+   existing corruption surfaces* cannot be settled from these crash reports. Every
+   session that produced one had also run Clear, Emo, Uhm or Voz returning records
+   asynchronously, so a heap already damaged by the return-encode site is a
+   complete alternative explanation for all three. What the source does settle is
+   that the teardown is genuinely unsynchronized -- an owning
+   `JavaScriptValuesBuffer` running `~jsi::Value()` on a cooperative thread, with
+   no assertion anywhere claiming otherwise -- so it is undefined behaviour on
+   every single asynchronous call in this repo whether or not it is what fired.
+   That is enough to fix; it is not enough to claim the fix is what stopped the
+   crashes rather than the return-`Void` half.
+
+   And there is one report the fix does not account for. `08:46:36` is on the
+   fixed binary, at the same site (`Clear #4`, `load`, `JavaScriptValuesBuffer.deinit`,
+   cooperative thread). It happened during that build's very first launch, while
+   the dev client was being re-pointed at a different Metro port mid-load and had
+   put up a `Cannot find native module 'ExpoLinking'` red box -- a runtime being
+   torn down and rebuilt under a call already in flight. That is precisely the
+   case `onJavaScriptThread` cannot cover: it reads `try? appContext.runtime`, and
+   a lost runtime means there is no scheduler to hop onto, so it returns and the
+   call finishes where it was. Plausible, and **not** proven: nothing here
+   distinguishes "the hop was skipped because the runtime was gone" from "the hop
+   does not work". What can be said is that no run of the self-test on the fixed
+   build has produced one since.
+
+   Also unexplained: the failure rate. It is well under one crash per self-test
+   run -- the Redact round got three consecutive clean runs on an unfixed tree and
+   the Title round tripped one -- so no single run proves anything in either
+   direction, and none of the numbers below should be read as more than they are.
 
 Limits 1 and 2 are compile-time and self-announcing. Limits 3 and 4 are not, and
 they cost most of the debugging in their respective rounds. For limit 3 the first
 fix appeared not to work because the phone was locked, so `expo run:ios` silently
 kept running a stale build. For limit 4 the misdirection was in the crash reports
-themselves: two of the three named a component that was not at fault.
+themselves -- twice over. The first round's reports named a progress event that
+was not at fault; the second round's named `load`, a function with nothing to
+encode, and the obvious reading of that was that the reports were lying again.
+They were not. The thing to read in a report like this is the *thread name* and
+the closure number, and then the generated code they point at.
 
 ### Two pods cannot each bridge the same Swift package
 
@@ -2037,8 +2256,11 @@ over 572 human-labelled posts is upstream's measurement.
 
 ### The async-return crash has two more sites, and neither is Gist's
 
-The full self-test ended twice with the process dying afterwards — once stuck with
-its busy indicator spinning, once gone — and the crash report names
+*Superseded in part -- see limit 4 above, which corrects the second attribution
+here. Kept because the first half is still the record of how the site was found.*
+
+The full self-test ended twice with the process dying afterwards -- once stuck with
+its busy indicator spinning, once gone -- and the crash report names
 `hermes::vm::HadesGC::youngGenCollection` on
 `com.facebook.react.runtime.JavaScript`. That is a corrupted Hermes heap surfacing
 at the next collection: the downstream symptom limit 4 describes, not a site.
@@ -2058,18 +2280,44 @@ Thread: com.apple.root.user-initiated-qos.cooperative
 ```
 
 The first is the Clear defect already recorded above, reproduced by a crash that
-predates Gist being in the binary. The second is **new**: Emo's `suggest` returns
-`[EmoSuggestionRecord]` from a `@JS async` function, and this is that array being
-torn down off the JavaScript thread. The claim in the limit-4 note that "Uhm and
-Emo return `@Record`s and small arrays of them" as an explanation for their not
-hitting it was exposure, not immunity, and now has a counterexample. Emo's fix is
-Ear's and Gist's: return `Void`, hand the result over synchronously. It is not
-made here, because it is not this model's package.
+predates Gist being in the binary. The second was read here as Emo's `suggest`
+returning `[EmoSuggestionRecord]` -- **and that was wrong**. `closure #2` is Emo's
+second `@JS` function, which is `load`; `suggest` is `#3`. `load` returns `Void`
+and has nothing to encode, so this is not the return-encode site at all: it is the
+*argument* buffer being torn down off the JavaScript thread, which is the second
+half of limit 4 and took a Shapes crash with the same signature to see.
 
 A Gist-only session afterwards ran **three `classify` calls and sixty `scores`
 calls plus five native `channelTopics`** through the example app with no other
 model touched, and the process stayed up. Evidence for the split shape, not proof
-of it — a race that did not fire is not a race that cannot.
+of it -- a race that did not fire is not a race that cannot.
+
+### The `@Event` path is not implicated
+
+Worth stating, because three of the crash reports name a progress event and it
+cost an hour of the first round. `ClearProgressEvent.toObject` and
+`EarProgressEvent.toObject` both crashed on
+`com.facebook.react.runtime.JavaScript` -- the right thread -- and they crashed
+there because `EventEmitter.emit` hops before it does anything:
+
+```swift
+runtime.schedule { [weak appContext] in
+  jsPayload = try (~P.self).castToJS(payload, appContext: appContext, in: runtime)
+  ... dispatchEvent(...)
+}
+```
+
+So the payload is encoded and dispatched on the JavaScript thread by
+construction, exactly as `promise.resolve` is, and an event crashing is a report
+of a heap someone else already broke. Each model's `report(_:phase:fraction:)`
+hops for the same reason before touching `onProgress`.
+
+That leaves Ear's `reportProgress` suppression -- not emitting progress for a
+call no caller subscribed to -- as what it always was on the evidence: worth
+doing because an unwanted event is a scheduler hop and a record encode for
+nobody, not because it is unsafe. It has not been propagated to the other
+packages in this round, because the argument for it is cost and the packages
+that would gain most (Clear's ~20 Hz per-chunk progress) already throttle.
 
 ### Redact, end to end
 

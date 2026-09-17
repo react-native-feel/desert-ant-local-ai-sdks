@@ -59,7 +59,7 @@ class EmoModule : Module() {
         text: String,
         options: EmoSuggestOptions,
         jobId: String ->
-      model.suggest(text, options, model.progressEmitter(jobId))
+      model.stash(jobId, model.suggest(text, options, model.progressEmitter(jobId)))
     }
 
     // MARK: - State
@@ -70,6 +70,13 @@ class EmoModule : Module() {
       Events("progress")
 
       Function("isDownloaded") { model: EmoModelObject -> model.isDownloaded() }
+      // The suggestions come back through a synchronous call. On the Apple side
+      // that is forced -- an async return value is encoded off the JavaScript
+      // thread and corrupts the Hermes heap -- and Kotlin matches it so one
+      // TypeScript file drives both.
+      Function("takeSuggestions") { model: EmoModelObject, jobId: String ->
+        model.takeSuggestions(jobId)
+      }
       // No `release` here: `SharedObject` already has one, and defining a second
       // would shadow the built-in that actually detaches the native object.
     }

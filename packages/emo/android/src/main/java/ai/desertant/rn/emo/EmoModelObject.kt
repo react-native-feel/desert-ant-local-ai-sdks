@@ -79,10 +79,31 @@ class EmoModelObject(
     }
   }
 
+  // MARK: - Results waiting to be collected
+  //
+  // Kotlin has no encode-on-the-wrong-thread hazard to design around; it holds
+  // the result anyway so that the TypeScript above it is one implementation
+  // rather than two. See the Apple module for why the async half returns
+  // nothing there.
+
+  private val results = Any()
+  private val pending = HashMap<String, List<Map<String, Any?>>>()
+
+  fun stash(jobId: String, value: List<Map<String, Any?>>) {
+    synchronized(results) { pending[jobId] = value }
+  }
+
+  /** The result held for [jobId], removed as it is read. */
+  fun takeSuggestions(jobId: String): List<Map<String, Any?>> = synchronized(results) {
+    pending.remove(jobId)
+      ?: throw InferenceFailedException("no result is waiting for job $jobId")
+  }
+
   @Synchronized
   fun release() {
     if (released) return
     released = true
+    synchronized(results) { pending.clear() }
     emo.close()
   }
 

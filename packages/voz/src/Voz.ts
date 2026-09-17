@@ -161,9 +161,11 @@ export class Voz {
    */
   async transcribe(options: TranscribeFileOptions): Promise<Transcript> {
     this.assertAlive();
-    return this.run(options.onProgress, (jobId) =>
-      Voz.requireNative().transcribeFile(this.native, toPath(options.uri), jobId)
-    );
+    return this.run(options.onProgress, async (jobId) => {
+      await Voz.requireNative().transcribeFile(this.native, toPath(options.uri), jobId);
+      // Collected separately, and synchronously -- see `native.ts`.
+      return this.native.takeTranscript(jobId);
+    });
   }
 
   /**
@@ -201,9 +203,11 @@ export class Voz {
         MODEL
       );
     }
-    return this.run(options.onProgress, (jobId) =>
-      Voz.requireNative().transcribeSamples(this.native, mono, sampleRate, jobId)
-    );
+    return this.run(options.onProgress, async (jobId) => {
+      await Voz.requireNative().transcribeSamples(this.native, mono, sampleRate, jobId);
+      // Collected separately, and synchronously -- see `native.ts`.
+      return this.native.takeTranscript(jobId);
+    });
   }
 
   /**

@@ -389,20 +389,29 @@ could only ever report `0` and `1` would be a progress bar pretending to be one.
 
 ### Every async call returns nothing, on purpose
 
-Both `prepare` and `describe` are `Promise<void>`; the card comes back through the
-shared object's synchronous `takeCard(jobId)`.
+`describe` is `@JS async` functions that return `Void` and stash the result on
+the shared object under the caller's job id; the result comes back through a
+**synchronous** `takeCard`. `src/Title.ts` makes both calls, so the public API above never
+sees the seam.
 
-A `@JS async` function's return value can be encoded **off** the JavaScript thread,
-which segfaults the runtime — `@JavaScriptActor` does not prevent it, because the
-encode happens after the actor hop the annotation governs. It has been reproduced
-on a bare `[String]` (Ear), in `Record.encode` (Clear), and in
-`JavaScriptValuesBuffer.deinit` on an array of records (Emo), with
-`HadesGC::youngGenCollection` as the delayed symptom that blames nothing.
+That is the fourth Expo Modules 2.0 limit in `docs/architecture.md`, and the
+short version is that **a `@JS async` function does its last work on the wrong
+thread**. `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs
+jobs "synchronously without hopping to the proper thread" and says so in its own
+doc comment, so once the call suspends on real work the closure the
+`@ExpoModule` macro generated resumes on
+`com.apple.root.user-initiated-qos.cooperative`. Two things it does from there
+touch the Hermes runtime without the JavaScript thread: it encodes the return
+value, and it destroys the owning copy of the call's *arguments* that
+`createAsyncFunction` handed it. The downstream symptom is
+`HadesGC::youngGenCollection` killing the process later and blaming nothing.
 
-A card is two short strings and would very likely survive being returned directly.
-It comes back this way anyway: betting that the limit is about size when five
-reproductions say it is about thread is how a package becomes the sixth.
-
+Returning `Void` removes the first of those. It does not remove the second --
+`ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+nothing at all -- so every async function here also lands back on the JavaScript
+thread before it returns, through the `onJavaScriptThread` helper at the bottom
+of `ios/TitleModule.swift`. Both halves, the crash reports behind them and what could not
+be settled are in `docs/architecture.md`.
 ## Verified
 
 Driven on an iOS 26.4 simulator (**iPhone 17 Pro Max**) with a dev build, alongside

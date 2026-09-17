@@ -107,11 +107,16 @@ final class ShapesModelObject: SharedObject, @unchecked Sendable {
   /// `com.facebook.react.runtime.JavaScript`, and `@JavaScriptActor` on the
   /// function does not prevent it -- the return value is encoded after the actor
   /// hop the annotation governs. Ear hit it returning `[String]`, Clear through
-  /// `Record.encode`, Emo through `JavaScriptValuesBuffer.deinit` on an array of
-  /// records, and Redact designed around it from the start. Five sites now, so
-  /// "small values are safe" is not a reading anyone should still be holding --
-  /// and a `ShapesRecognition` carries a `[Double]`, which is the *shape* of the
-  /// value that took Ear down.
+  /// `Record.encode` and `ClearMetrics.toObject`, and Redact designed around it
+  /// from the start. "Small values are safe" is not a reading anyone should still
+  /// be holding -- and a `ShapesRecognition` carries a `[Double]`, which is the
+  /// *shape* of the value that took Ear down.
+  ///
+  /// Returning `Void` is necessary and **not sufficient**, which this model is the
+  /// package that proved: `ShapesModule.load` returns nothing and still crashed in
+  /// `JavaScriptValuesBuffer.deinit`, because the same closure destroys the call's
+  /// *arguments* on the same thread. That half is handled by `onJavaScriptThread`
+  /// in ShapesModule.swift. See docs/architecture.md, limit 4.
   ///
   /// The async half therefore returns `Void`; `takeRecognition` is synchronous
   /// and so runs on the JavaScript thread by construction.

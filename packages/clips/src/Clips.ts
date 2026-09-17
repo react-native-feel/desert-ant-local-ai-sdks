@@ -224,8 +224,8 @@ export class Clips {
       return [];
     }
 
-    return this.run(undefined, (jobId) =>
-      Clips.requireNative().findClips(
+    return this.run(undefined, async (jobId) => {
+      await Clips.requireNative().findClips(
         this.native,
         sentences,
         {
@@ -234,8 +234,10 @@ export class Clips {
           padding,
         },
         jobId
-      )
-    );
+      );
+      // Collected separately, and synchronously -- see `native.ts`.
+      return this.native.takeClips(jobId);
+    });
   }
 
   /**

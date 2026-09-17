@@ -16,6 +16,26 @@
 // Hence `createModel` / `createAudio` instead of `new`, and free functions
 // taking the object instead of methods on it. `src/Clear.ts` hides all of it;
 // the Android half mirrors the same surface with module-level AsyncFunctions.
+//
+// The fourth is the one that shaped this file, and it is bigger than it reads.
+// **A `@JS async` function does its last work on the wrong thread.**
+// `@JavaScriptActor` is not a hop: `expo-modules-jsi`'s executor runs jobs
+// "synchronously without hopping to the proper thread", by its own doc comment,
+// so after the first suspension the closure the `@ExpoModule` macro generated
+// resumes on `com.apple.root.user-initiated-qos.cooperative` -- and it does two
+// things there that touch Hermes. It encodes the return value, and it destroys
+// the owning copy of the call's *arguments* that `createAsyncFunction` handed it
+// (`JavaScriptValuesBuffer.deinit` -> `~jsi::Value()` per argument).
+//
+// Hence both halves of the arrangement below. Every `@JS async` function returns
+// `Void` and hands its result over through a synchronous `take...`, which takes
+// care of the encode; and every one of them lands back on the JavaScript thread
+// before returning, through `onJavaScriptThread` at the bottom of this file,
+// which takes care of the teardown. Returning `Void` alone does not:
+// `ShapesModule.load` crashed in `JavaScriptValuesBuffer.deinit` while returning
+// nothing at all. The crash reports, the closure numbering that reads them, and
+// what could not be settled are in docs/architecture.md under "Expo Modules 2.0
+// limits".
 
 import ExpoModulesCore
 import Clear
@@ -64,7 +84,9 @@ public final class ClearModule: Module {
   @JS
   @JavaScriptActor
   func download(_ model: ClearModelObject, _ jobId: String) async throws {
-    try await model.download(jobId: jobId)
+    try await onJavaScriptThread(appContext) {
+      try await model.download(jobId: jobId)
+    }
   }
 
   /// Build the session now, downloading first if needed. On the first-ever launch
@@ -72,7 +94,9 @@ public final class ClearModule: Module {
   @JS
   @JavaScriptActor
   func load(_ model: ClearModelObject, _ jobId: String) async throws {
-    try await model.load(jobId: jobId)
+    try await onJavaScriptThread(appContext) {
+      try await model.load(jobId: jobId)
+    }
   }
 
   /// Decode `inputPath`, enhance it, and write the result to `outputPath`.
@@ -82,6 +106,13 @@ public final class ClearModule: Module {
   /// boundary at all. The output encoding follows `outputPath`'s extension:
   /// `.wav` is 16-bit PCM, `.m4a`/`.mp4`/`.aac` is AAC, `.caf`/`.aiff` is PCM,
   /// anything else is WAV.
+  ///
+  /// Returns nothing, and the metrics come back through `takeMetrics`. That is
+  /// the fourth Expo Modules 2.0 limit rather than a caching decision: the
+  /// `ClearMetrics` record used to be encoded here, off the JavaScript thread,
+  /// and `Record.encode` on `com.apple.root.user-initiated-qos.cooperative` is
+  /// two of the crash reports that motivated this round. See the note at the
+  /// bottom of this file.
   @JS
   @JavaScriptActor
   func enhanceFile(
@@ -90,13 +121,17 @@ public final class ClearModule: Module {
     _ outputPath: String,
     _ options: ClearEnhanceOptions,
     _ jobId: String
-  ) async throws -> ClearMetrics {
-    try await model.enhanceFile(inputPath: inputPath, outputPath: outputPath,
-                                options: options, jobId: jobId)
+  ) async throws {
+    try await onJavaScriptThread(appContext) {
+      let metrics = try await model.enhanceFile(
+        inputPath: inputPath, outputPath: outputPath, options: options, jobId: jobId)
+      model.stashMetrics(metrics, for: jobId)
+    }
   }
 
-  /// Enhance samples already in memory. Returns the metrics; the audio itself is
-  /// collected with `takeEnhancedAudio`.
+  /// Enhance samples already in memory. Returns nothing: the audio is collected
+  /// with `takeEnhancedAudio` and the metrics with `takeMetrics`, both
+  /// synchronous.
   ///
   /// Second-class next to `enhanceFile`: it exists for audio an app synthesized
   /// or already holds, and it pays a copy in each direction. See ClearAudio.swift.
@@ -110,9 +145,12 @@ public final class ClearModule: Module {
   /// everything before it logged, the probe logged neither success nor failure,
   /// and the app was gone.
   ///
-  /// So the object is built here on the JavaScript actor, parked on the model,
-  /// and collected synchronously. `src/Clear.ts` does both in one
-  /// `enhanceSamples`, so the public API never sees the seam.
+  /// So the object is built here, parked on the model, and collected
+  /// synchronously. The metrics go the same way now, for the *other* half of
+  /// limit 4 -- `ClearMetrics.toObject` under `closure #6 in
+  /// ClearModule._decorateModule` is two of this repo's crash reports.
+  /// `src/Clear.ts` does all three calls in one `enhanceSamples`, so the public
+  /// API never sees the seam.
   @JS
   @JavaScriptActor
   func enhanceBuffer(
@@ -120,17 +158,18 @@ public final class ClearModule: Module {
     _ input: ClearAudioObject,
     _ options: ClearEnhanceOptions,
     _ jobId: String
-  ) async throws -> ClearMetrics {
-    // Read the input's samples here, on the JS actor, rather than inside the
-    // worker: `[[Float]]` is Sendable and a shared object is not.
+  ) async throws {
+    // Read the input's samples here, before the first suspension, rather than
+    // inside the worker: `[[Float]]` is Sendable and a shared object is not.
     let channels = input.channels
     let sampleRate = input.sampleRate
-    let result = try await model.enhance(
-      channels: channels, sampleRate: sampleRate, options: options, jobId: jobId)
-    let audio = ClearAudioObject(result: result, variant: model.variant)
-    model.stash(audio, for: jobId)
-    let metrics = audio.enhancedMetrics
-    return metrics
+    try await onJavaScriptThread(appContext) {
+      let result = try await model.enhance(
+        channels: channels, sampleRate: sampleRate, options: options, jobId: jobId)
+      let audio = ClearAudioObject(result: result, variant: model.variant)
+      model.stash(audio, for: jobId)
+      model.stashMetrics(audio.enhancedMetrics, for: jobId)
+    }
   }
 
   /// Collect the buffer `enhanceBuffer` produced for `jobId`. Synchronous, and
@@ -138,5 +177,79 @@ public final class ClearModule: Module {
   @JS
   func takeEnhancedAudio(_ model: ClearModelObject, _ jobId: String) throws -> ClearAudioObject {
     try model.takeStashed(jobId)
+  }
+
+  /// Collect the metrics `enhanceFile` or `enhanceBuffer` produced for `jobId`.
+  /// Synchronous, and callable exactly once per job.
+  ///
+  /// Synchronous is the whole point: a synchronous `@JS` function's return value
+  /// is encoded inside the host call, on the JavaScript thread, by construction.
+  /// `src/Clear.ts` issues it immediately after the async half, so the public
+  /// API never sees the seam.
+  @JS
+  func takeMetrics(_ model: ClearModelObject, _ jobId: String) throws -> ClearMetrics {
+    try model.takeStashedMetrics(jobId)
+  }
+}
+
+// MARK: - Landing a `@JS async` call back on the JavaScript thread
+
+/// Run `body`, then put the rest of this `@JS async` call back on the JavaScript
+/// thread before returning to `createAsyncFunction`.
+///
+/// **`@JavaScriptActor` does not hop.** Its executor is
+/// `JavaScriptExecutor.enqueue { job.runSynchronously(on:) }`, and
+/// expo-modules-jsi's own doc comment says so: it "executes jobs *synchronously*
+/// without hopping to the proper thread ... running these jobs on the JavaScript
+/// thread must be ensured externally". So the annotation is an assertion, not a
+/// hop: the moment a `@JS async` function suspends on real work, its continuation
+/// resumes on `com.apple.root.user-initiated-qos.cooperative`.
+///
+/// Two things then happen there, inside the closure the `@ExpoModule` macro
+/// generated, and both touch Hermes without the runtime's lock:
+///
+/// 1. the return value is encoded (`Record.encode`, `Array<String>.encode`), and
+/// 2. the **arguments** are destroyed. `createAsyncFunction` hands the closure an
+///    *owning* copy of the argument buffer, so leaving it runs
+///    `JavaScriptValuesBuffer.deinit` -> `jsi::Value::~Value()` once per argument.
+///    Every argument that is a JS string or object -- a `@Record`, an array, a
+///    `Float32Array`, and the `SharedObject` every entry point here takes first --
+///    is a pointer into the Hermes heap being released off-thread.
+///
+/// (1) is why every `@JS async` function in this package returns `Void`. (2) is
+/// not fixed by that, which is what `ShapesModule.load` proved by crashing in
+/// `JavaScriptValuesBuffer.deinit` while returning nothing at all.
+///
+/// Awaiting this last fixes both: `runtime.schedule` runs its block on the
+/// JavaScript thread, and resuming a `@JavaScriptActor` continuation from inside
+/// that block runs the continuation *right there* -- the same non-hopping
+/// executor, used the other way round. The generated closure therefore encodes
+/// and tears down on the JavaScript thread.
+///
+/// A lost runtime is not an error here: if there is no runtime there is nothing
+/// left to protect, and the call's own result still has to be delivered.
+@JavaScriptActor
+private func onJavaScriptThread(
+  _ appContext: AppContext?,
+  _ body: @JavaScriptActor () async throws -> Void
+) async throws {
+  do {
+    try await body()
+  } catch {
+    await hopToJavaScriptThread(appContext)
+    throw error
+  }
+  await hopToJavaScriptThread(appContext)
+}
+
+@JavaScriptActor
+private func hopToJavaScriptThread(_ appContext: AppContext?) async {
+  guard let appContext, let runtime = try? appContext.runtime else {
+    return
+  }
+  await withCheckedContinuation { continuation in
+    runtime.schedule {
+      continuation.resume()
+    }
   }
 }

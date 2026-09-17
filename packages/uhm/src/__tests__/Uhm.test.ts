@@ -14,6 +14,9 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
   const listeners: Listener[] = [];
   const model = {
     isDownloaded: jest.fn(() => true),
+    // The async half resolves to nothing; the result is collected
+    // synchronously. See `native.ts`.
+    takeResult: jest.fn(() => result()),
     release: jest.fn(),
     addListener: jest.fn((_event: string, listener: Listener) => {
       listeners.push(listener);
@@ -35,8 +38,8 @@ function fakeNative(overrides: Record<string, unknown> = {}) {
       fillerTypes: ['uh', 'um', 'hmm', 'and', 'other'],
       createModel: jest.fn(() => model),
       load: jest.fn(async () => undefined),
-      analyzeFile: jest.fn(async () => result()),
-      analyzeSamples: jest.fn(async () => result()),
+      analyzeFile: jest.fn(async () => undefined),
+      analyzeSamples: jest.fn(async () => undefined),
       reconcileWords: jest.fn(() => [{ text: 'so', start: 0, end: 0.3 }]),
       ...overrides,
     },
