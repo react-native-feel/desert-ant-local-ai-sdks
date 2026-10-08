@@ -19,7 +19,7 @@ Pod::Spec.new do |s|
   # resolve the package into a consumer below 17.
   s.platforms      = { :ios => '17.0' }
   s.swift_version  = '6.0'
-  s.source         = { git: 'https://github.com/Desert-Ant-Labs/desert-ant-react-native.git' }
+  s.source         = { git: 'https://github.com/react-native-feel/desert-ant-local-ai-sdks.git' }
   s.static_framework = true
 
   s.dependency 'ExpoModulesCore'
