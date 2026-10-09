@@ -5,6 +5,10 @@ Expo modules over the on-device models in
 [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core): Core ML on
 iOS, LiteRT on Android, no server, no API key.
 
+**Free and open source.** MIT-licensed, with no subscription, no paywall and no usage fees.
+
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE) ![Price: free](https://img.shields.io/badge/price-free-brightgreen)
+
 <table>
   <tr>
     <td>
