@@ -37,6 +37,7 @@ iOS, LiteRT on Android, no server, no API key.
 
 ¹ Title's generation is behind a SwiftPM package trait (`MLX`) that CocoaPods cannot
 enable. The weights download; `describe()` throws `ERR_UNSUPPORTED_PLATFORM`.
+
 ² `desert-ant-core` 3.1.0 declares a `Tongue` product but does not export it.
 
 ## How they compose
@@ -46,24 +47,16 @@ outputs into inputs. Audio models hand you a file or word timings, and text mode
 take any string, including a transcript.
 
 ```mermaid
-flowchart LR
+flowchart TD
   rec([recording]) --> Clear
-  Clear -->|clean audio| Ear
-  Clear -->|clean audio| Voz
-  Clear -->|clean audio| Uhm
-  Clear -->|clean audio| Align
-  Ear -->|language gate| Voz
+  Clear -->|clean audio| Ear & Voz & Uhm & Align
+  Ear -.->|language gate| Voz
   Voz -->|words| Clips
-  Voz -->|text| Gist
-  Voz -->|text| Redact
-  Voz -->|text| Tongue
-  Uhm -->|fillers| cut[Uhm.reconcileWords]
-  Voz -->|words| cut
-  Align -->|refined words| cut
+  Voz -->|transcript| Gist & Redact & Tongue
+  Uhm & Voz & Align -->|timings| cut[Uhm.reconcileWords]
   Clips -->|clip text| Title
-  Clips -->|clip text| Gist
-  Redact -->|safe text| llm([your LLM / logs])
-  llm -->|restore| out([output])
+  Redact -->|masked text| llm([cloud LLM])
+  llm -->|restore| out([result])
 ```
 
 Some combinations:
