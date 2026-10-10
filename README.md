@@ -1,13 +1,17 @@
 # desert-ant-local-ai-sdks
 
-**The React Native SDK for [Desert Ant Labs](https://github.com/Desert-Ant-Labs).**
+**A community React Native SDK for [Desert Ant Labs](https://github.com/Desert-Ant-Labs).**
 Expo modules over the on-device models in
 [`desert-ant-core`](https://github.com/Desert-Ant-Labs/desert-ant-core): Core ML on
 iOS, LiteRT on Android, no server, no API key.
 
-**Free and open source.** MIT-licensed, with no subscription, no paywall and no usage fees.
+**This wrapper is free and open source.** MIT-licensed.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE) ![Price: free](https://img.shields.io/badge/price-free-brightgreen)
+Using models from Desert Ant Labs is free for apps under 100,000 monthly active
+devices per platform, per model, and subject to attribution and the other terms
+of the [license](https://license.desertant.com).
+
+[![SDK license: MIT](https://img.shields.io/badge/SDK-MIT-green)](LICENSE) [![Models: Source-Available](https://img.shields.io/badge/models-Source--Available-blue)](https://license.desertant.com)
 
 <table>
   <tr>
